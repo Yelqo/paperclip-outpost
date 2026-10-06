@@ -214,10 +214,10 @@ index 684e7cc13..8985f9c3a 100644
    // "set-cookie" is normally a response header; keep the request-side
 diff --git a/server/src/realtime/plugin-ws.ts b/server/src/realtime/plugin-ws.ts
 new file mode 100644
-index 000000000..5ea0620eb
+index 000000000..7b1150362
 --- /dev/null
 +++ b/server/src/realtime/plugin-ws.ts
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,132 @@
 +import { execFileSync } from "node:child_process";
 +import { randomUUID } from "node:crypto";
 +import type { Server } from "node:http";
@@ -225,6 +225,7 @@ index 000000000..5ea0620eb
 +import { WebSocketServer, WebSocket } from "ws";
 +import type { Db } from "@paperclipai/db";
 +import { PLUGIN_WEBSOCKET_SDK_VERSION, type PluginWebSocketReply } from "@paperclipai/plugin-sdk";
++import type { HostToWorkerMethods } from "@paperclipai/plugin-sdk";
 +import { pluginRegistryService } from "../services/plugin-registry.js";
 +import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 +import { readBuildCommit } from "../build-commit.js";
@@ -263,11 +264,14 @@ index 000000000..5ea0620eb
 +    admitted++;
 +    // Admission work keeps its permit even after its peer socket closes.
 +    opening++;
-+    let released = false;
-+    const release = () => { if (!released) { released = true; admitted--; } };
-+    socket.once("close", release);
++    let released = false, disconnected = false, admissionSettled = false, inFlight = 0;
++    const release = () => {
++      if (!released && disconnected && admissionSettled && inFlight === 0) {
++        released = true; admitted--;
++      }
++    };
 +    let cleanup = () => {};
-+    socket.once("close", () => cleanup());
++    socket.once("close", () => { disconnected = true; cleanup(); release(); });
 +    void (async () => {
 +      const plugin = await registry.getByKey(match[1]!);
 +      if (socket.destroyed || stopping) { release(); return; }
@@ -275,6 +279,14 @@ index 000000000..5ea0620eb
 +      if (!plugin || plugin.status !== "ready" || !worker || !workers.isRunning(plugin.id)) { reject(503); return; }
 +      if (!plugin.manifestJson.capabilities.includes("transport.websockets.register") ||
 +        !plugin.manifestJson.webSocketRoutes?.some(route => route.routeKey === match[2])) { reject(404); return; }
++      const call = <M extends "webSocketOpen" | "webSocketMessage" | "webSocketClose">(
++        method: M, params: HostToWorkerMethods[M][0], timeout: number,
++      ): Promise<HostToWorkerMethods[M][1]> => {
++        inFlight++;
++        const { result, completed } = worker.callWithCompletion(method, params, timeout);
++        void completed.then(() => { inFlight--; release(); });
++        return result;
++      };
 +      const workerPid = worker.diagnostics().pid;
 +      const connectionId = randomUUID();
 +      const input = { connectionId, companyId, routeKey: match[2]!, query: Object.fromEntries(url.searchParams), host,
@@ -284,10 +296,9 @@ index 000000000..5ea0620eb
 +      cleanup = () => {
 +        if (closed) return;
 +        closed = true;
-+        release();
-+        void worker.call("webSocketClose", event, 1000).catch(() => {});
++        void call("webSocketClose", event, 1000).catch(() => {});
 +      };
-+      const opened = await worker.call("webSocketOpen", input, 5000);
++      const opened = await call("webSocketOpen", input, 5000);
 +      event.principalId = opened.principalId ?? "";
 +      if (opened.status !== 101 || !opened.principalId || socket.destroyed) {
 +        cleanup(); reject([401,403,409,426,503].includes(opened.status) ? opened.status : 403); return;
@@ -318,14 +329,16 @@ index 000000000..5ea0620eb
 +          if (closed || ws.readyState !== WebSocket.OPEN) return;
 +          if (binary || ++queued > 16) { ws.close(1013, "transport capacity"); return; }
 +          chain = chain.then(async () => {
-+            if (!closed && ws.readyState === WebSocket.OPEN) send(await worker.call("webSocketMessage", {...event, data:data.toString()}, 5000));
++            if (!closed && ws.readyState === WebSocket.OPEN) send(await call("webSocketMessage", {...event, data:data.toString()}, 5000));
 +          }).catch(() => { ws.close(1011, "plugin unavailable"); }).finally(() => { queued--; });
 +        });
 +        ws.on("close", () => { clearInterval(heartbeat); cleanup(); });
 +        ws.on("error", () => { ws.terminate(); });
 +        send(opened);
 +      });
-+    })().catch(() => { cleanup(); reject(503); release(); }).finally(() => { opening--; });
++    })().catch(() => { cleanup(); reject(503); }).finally(() => {
++      opening--; admissionSettled = true; release();
++    });
 +  });
 +  const stop = () => {
 +    if (stopping) return;
@@ -397,3 +410,267 @@ index c63a3974a..561b5c987 100644
        const rows = await db
          .select({ companyId: builtInManagedResources.companyId })
          .from(builtInManagedResources)
+diff --git a/server/src/services/plugin-worker-manager.ts b/server/src/services/plugin-worker-manager.ts
+index af6721f3d..d3b01e042 100644
+--- a/server/src/services/plugin-worker-manager.ts
++++ b/server/src/services/plugin-worker-manager.ts
+@@ -715,6 +715,17 @@ export interface PluginWorkerHandle {
+     executeLogSink?: ExecuteLogSink,
+   ): Promise<HostToWorkerMethods[M][1]>;
+ 
++  /**
++   * Call with a separate completion signal for bounded delivery. The result
++   * observes the RPC deadline; completed waits for a worker reply, process exit,
++   * or failure to send. A timeout alone does not prove execution has ended.
++   */
++  callWithCompletion<M extends HostToWorkerMethodName>(
++    method: M,
++    params: HostToWorkerMethods[M][0],
++    timeoutMs?: number,
++  ): { result: Promise<HostToWorkerMethods[M][1]>; completed: Promise<void> };
++
+   /**
+    * Send a fire-and-forget notification to the worker (no response expected).
+    */
+@@ -888,6 +899,8 @@ export function createPluginWorkerHandle(
+ 
+   // Pending RPC requests awaiting a response
+   const pendingRequests = new Map<string | number, PendingRequest>();
++  // Tracked execution survives expiration of the caller's result deadline.
++  const workerCompletions = new Map<string | number, () => void>();
+   let nextRequestId = 1;
+   const activeInvocations = new Map<string, ActiveInvocation>();
+   // Host-owned execute routes, keyed by the host-issued invocation id. Only an
+@@ -1093,9 +1106,12 @@ export function createPluginWorkerHandle(
+       return;
+     }
+ 
++    const complete = workerCompletions.get(id);
++    workerCompletions.delete(id);
++    complete?.();
+     const pending = pendingRequests.get(id);
+     if (!pending) {
+-      log.warn({ id }, "received response for unknown request id");
++      if (!complete) log.warn({ id }, "received response for unknown request id");
+       return;
+     }
+ 
+@@ -3039,6 +3055,8 @@ export function createPluginWorkerHandle(
+       );
+     }
+     pendingRequests.clear();
++    for (const complete of workerCompletions.values()) complete();
++    workerCompletions.clear();
+     for (const invocation of activeInvocations.values()) {
+       if (invocation.timer) clearTimeout(invocation.timer);
+     }
+@@ -3291,9 +3309,11 @@ export function createPluginWorkerHandle(
+     params: HostToWorkerMethods[M][0],
+     timeoutMs?: number,
+     executeLogSink?: ExecuteLogSink,
++    onWorkerCompleted?: () => void,
+   ): Promise<HostToWorkerMethods[M][1]> {
+     const rpcPromise = new Promise<HostToWorkerMethods[M][1]>((resolve, reject) => {
+       if (!childProcess?.stdin?.writable) {
++        onWorkerCompleted?.();
+         reject(
+           new Error(
+             `Cannot call "${method}" — worker for "${pluginId}" is not running`,
+@@ -3303,6 +3323,7 @@ export function createPluginWorkerHandle(
+       }
+ 
+       const id = nextRequestId++;
++      if (onWorkerCompleted) workerCompletions.set(id, onWorkerCompleted);
+       const timeout = resolveRpcCallTimeoutMs(timeoutMs, rpcTimeoutMs);
+       const invocationScope = deriveInvocationScope(method, params);
+       const invocation = invocationScope ? registerInvocation(invocationScope) : null;
+@@ -3366,6 +3387,8 @@ export function createPluginWorkerHandle(
+         };
+         sendMessage(request);
+       } catch (err) {
++        workerCompletions.delete(id);
++        onWorkerCompleted?.();
+         clearTimeout(timer);
+         pendingRequests.delete(id);
+         clearInvocation(invocation);
+@@ -3435,6 +3458,22 @@ export function createPluginWorkerHandle(
+       return callInternal(method, params, timeoutMs, executeLogSink);
+     },
+ 
++    callWithCompletion<M extends HostToWorkerMethodName>(
++      method: M,
++      params: HostToWorkerMethods[M][0],
++      timeoutMs?: number,
++    ) {
++      let complete!: () => void;
++      const completed = new Promise<void>(resolve => { complete = resolve; });
++      if (status !== "running" && status !== "starting") {
++        complete();
++        return { completed, result: Promise.reject(new Error(
++          `Cannot call "${method}" — worker for "${pluginId}" is ${status}`,
++        )) };
++      }
++      return { completed, result: callInternal(method, params, timeoutMs, undefined, complete) };
++    },
++
+     openLoginPtySession(input: LoginPtyOpenInput) {
+       if (status !== "running" && status !== "starting") {
+         return Promise.reject(
+diff --git a/server/src/__tests__/fixtures/plugin-worker-websocket-stalled.cjs b/server/src/__tests__/fixtures/plugin-worker-websocket-stalled.cjs
+new file mode 100644
+index 000000000..c47b53d19
+--- /dev/null
++++ b/server/src/__tests__/fixtures/plugin-worker-websocket-stalled.cjs
+@@ -0,0 +1,31 @@
++const readline = require("node:readline");
++const connections = new Map();
++const pending = [];
++const counts = { webSocketOpen: 0, webSocketMessage: 0, webSocketClose: 0 };
++let released = false;
++const send = (id, result) => process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`);
++
++readline.createInterface({ input: process.stdin }).on("line", line => {
++  const { id, method, params } = JSON.parse(line);
++  if (method === "initialize") {
++    send(id, { ok: true, supportedMethods: [...Object.keys(counts), "getData"] });
++  } else if (method === "getData") {
++    if (params.key === "release") {
++      released = true;
++      for (const reply of pending.splice(0)) reply();
++    }
++    send(id, { counts, pending: pending.length });
++  } else if (method === "shutdown") {
++    send(id, {});
++    setImmediate(() => process.exit(0));
++  } else if (Object.hasOwn(counts, method)) {
++    counts[method]++;
++    if (method === "webSocketOpen") connections.set(params.connectionId, params.query.outpostId);
++    const stall = connections.get(params.connectionId) === method;
++    const result = method === "webSocketOpen" ? { status: 101, principalId: "fixture" } : {};
++    if (method === "webSocketClose") connections.delete(params.connectionId);
++    const reply = () => send(id, result);
++    if (stall && !released) pending.push(reply);
++    else reply();
++  }
++});
+diff --git a/server/src/__tests__/plugin-websocket-timeouts.test.ts b/server/src/__tests__/plugin-websocket-timeouts.test.ts
+new file mode 100644
+index 000000000..1543c5f30
+--- /dev/null
++++ b/server/src/__tests__/plugin-websocket-timeouts.test.ts
+@@ -0,0 +1,115 @@
++import { createServer, type Server } from "node:http";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { setTimeout as delay } from "node:timers/promises";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import WebSocket from "ws";
++import type { Db } from "@paperclipai/db";
++import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
++import { createPluginWorkerHandle, type PluginWorkerHandle, type PluginWorkerManager } from "../services/plugin-worker-manager.js";
++import { setupPluginWebSocketServer } from "../realtime/plugin-ws.js";
++
++vi.mock("../services/plugin-registry.js", () => ({
++  pluginRegistryService: () => ({ getByKey: async () => ({
++    id: "test.plugin", status: "ready", manifestJson: {
++      capabilities: ["transport.websockets.register"], webSocketRoutes: [{ routeKey: "transport" }],
++    },
++  }) }),
++}));
++
++const manifest: PaperclipPluginManifestV1 = {
++  id: "test.plugin", apiVersion: 1, version: "1.0.0", displayName: "Test plugin",
++  description: "Test plugin", author: "Paperclip", categories: ["automation"], capabilities: [],
++  entrypoints: { worker: "dist/worker.js" },
++};
++let handle: PluginWorkerHandle;
++let server: Server;
++let route: ReturnType<typeof setupPluginWebSocketServer>;
++const sockets: WebSocket[] = [];
++
++async function fixture() {
++  handle = createPluginWorkerHandle("test.plugin", {
++    entrypointPath: path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures/plugin-worker-websocket-stalled.cjs"),
++    manifest, config: {}, instanceInfo: { instanceId: "test", hostVersion: "1.0.0" }, apiVersion: 1, hostHandlers: {},
++  });
++  await handle.start();
++  server = createServer();
++  route = setupPluginWebSocketServer(server, {} as Db, {
++    getWorker: () => handle, isRunning: () => handle.status === "running",
++  } as unknown as PluginWorkerManager);
++  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
++  const port = (server.address() as { port: number }).port;
++  return (stall: string) => {
++    const ws = new WebSocket(`ws://127.0.0.1:${port}/api/plugins/test.plugin/ws/transport?companyId=00000000-0000-0000-0000-000000000000&outpostId=${stall}`);
++    ws.on("error", () => {});
++    sockets.push(ws);
++    return ws;
++  };
++}
++const stats = () => handle.call("getData", { key: "status" }) as Promise<{ counts: Record<string, number>; pending: number }>;
++async function eventually(check: () => Promise<boolean>) {
++  const end = Date.now() + 2000;
++  while (Date.now() < end) {
++    if (await check()) return;
++    await delay(10);
++  }
++  throw new Error("Transport permits were not recovered");
++}
++function opened(ws: WebSocket) {
++  return new Promise<void>((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
++}
++function rejected(ws: WebSocket, timeout = 1000) {
++  return new Promise<number>((resolve, reject) => {
++    const timer = setTimeout(() => { ws.terminate(); reject(new Error("Admission was forwarded instead of rejected immediately")); }, timeout);
++    ws.once("unexpected-response", (_req, res) => { clearTimeout(timer); res.resume(); ws.terminate(); resolve(res.statusCode!); });
++    ws.once("open", () => { clearTimeout(timer); reject(new Error("Admission exceeded the worker bound")); });
++  });
++}
++
++afterEach(async () => {
++  for (const ws of sockets.splice(0)) ws.terminate();
++  route?.stop();
++  await handle?.stop();
++  if (server?.listening) await new Promise<void>(resolve => server.close(() => resolve()));
++});
++
++describe("WebSocket worker execution bounds", () => {
++  it("retains admission permits after RPC timeout until the worker replies", async () => {
++    const connect = await fixture();
++    const first = Array.from({ length: 64 }, () => rejected(connect("webSocketOpen"), 7000));
++    expect(await Promise.all(first)).toEqual(Array(64).fill(503));
++    expect((await stats()).pending).toBe(64);
++    expect(await Promise.all(Array.from({ length: 64 }, () => rejected(connect("normal"))))).toEqual(Array(64).fill(503));
++    expect((await stats()).counts.webSocketOpen).toBe(64);
++    await handle.call("getData", { key: "release" });
++    await eventually(async () => (await stats()).pending === 0);
++    await opened(connect("normal"));
++  }, 15000);
++
++  it("retains permits for timed-out message handlers until worker exit", async () => {
++    const connect = await fixture();
++    const clients = Array.from({ length: 64 }, () => connect("webSocketMessage"));
++    await Promise.all(clients.map(opened));
++    const closed = clients.map(ws => new Promise<number>(resolve => ws.once("close", resolve)));
++    for (const ws of clients) ws.send("stall");
++    expect(await Promise.all(closed)).toEqual(Array(64).fill(1011));
++    expect((await stats()).pending).toBe(64);
++    expect(await rejected(connect("normal"))).toBe(503);
++    await handle.restart();
++    await opened(connect("normal"));
++  }, 15000);
++
++  it("keeps stalled cleanup charged after its shorter RPC timeout", async () => {
++    const connect = await fixture();
++    const clients = Array.from({ length: 64 }, () => connect("webSocketClose"));
++    await Promise.all(clients.map(opened));
++    const closed = clients.map(ws => new Promise<void>(resolve => ws.once("close", () => resolve())));
++    for (const ws of clients) ws.close();
++    await Promise.all(closed);
++    await eventually(async () => (await stats()).pending === 64);
++    await delay(1100);
++    expect(await rejected(connect("normal"))).toBe(503);
++    await handle.call("getData", { key: "release" });
++    await opened(connect("normal"));
++  }, 10000);
++});

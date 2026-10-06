@@ -61,6 +61,8 @@ jobs:
           src/__tests__/plugin-routes-authz.test.ts
           src/__tests__/environment-selection-route-guards.test.ts
           src/__tests__/live-events-ws.test.ts
+          src/__tests__/plugin-worker-manager.test.ts
+          src/__tests__/plugin-websocket-timeouts.test.ts
 
       - name: Test public host, plugin, and daemon workflow
         run: pnpm test

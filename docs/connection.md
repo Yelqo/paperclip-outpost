@@ -116,13 +116,17 @@ same version tuple before declaring itself connected. Packaged hosts must carry
 Paperclip's build commit stamp. Compatibility is a pinned declaration, not
 cryptographic attestation of the machine's executable.
 
-Core limits connections to 64 (including admissions) and outstanding admission
-work separately to 64. Closed peers retain their work permit until the registry
-lookup and worker admission settle; a closed connection is checked before
-worker dispatch. Core limits inbound frames to 16 KiB,
-pending frames to 16 per connection, one serialized worker request per
-connection with a five-second timeout, replies to four frames, and buffered
-outbound data to 64 KiB. Compression is disabled. Core pings, closes sockets,
+Core limits connections to 64 (including admissions and unfinished cleanup) and
+outstanding admission work separately to 64. Closed peers retain their connection
+permit until the registry lookup and every delivered worker call finish. RPC
+deadlines reject the caller without proving the handler stopped; permits remain
+charged until a late worker reply or worker process exit, including message and
+cleanup calls. A worker that never replies requires an operator restart to
+recover its capacity. A closed connection is checked before worker dispatch.
+Core limits inbound frames to 16 KiB, pending frames to 16 per connection, one
+serialized message request per connection with a five-second timeout, replies
+to four frames, and buffered outbound data to 64 KiB. Compression is disabled.
+Core pings, closes sockets,
 cleans up after worker loss and server shutdown, and delivers close events.
 The plugin uses scoped Effects only for its own connection-to-outpost
 associations. SDK promises are adapted to typed Effect failures at the boundary.
