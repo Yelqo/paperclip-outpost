@@ -24,8 +24,6 @@ type Versions struct {
 	Protocol int    `json:"protocol"`
 }
 
-var supported = Versions{"f858207161ba29c01c82f4674aef83d91b74480f", "1.0.0+outpost.1", "0.1.0", "0.1.0", 1}
-
 type Connection struct {
 	Instance      string            `json:"instance"`
 	CompanyID     string            `json:"companyId"`

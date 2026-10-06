@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import WebSocket from 'ws';
+import { versions as supportedVersions } from '../plugin/versions.ts';
 
 const root = resolve('.');
 const host = join(root, '.cache/paperclip');
@@ -120,7 +121,7 @@ test('the Go daemon connects outbound and the operator observes its authenticate
 
 const connection = () => JSON.parse(readFileSync(join(privateDir,'connection.json'),'utf8'));
 function transport(c = connection(), versionOverrides = {}, route = 'transport', extraHeaders = {}) {
-  const versions = {host:'f858207161ba29c01c82f4674aef83d91b74480f',sdk:'1.0.0+outpost.1',plugin:'0.1.0',daemon:'0.1.0',protocol:1,...versionOverrides};
+  const versions = {...supportedVersions,...versionOverrides};
   return new WebSocket(`${origin.replace('http','ws')}/api/plugins/yelqo.outpost/ws/${route}?companyId=${c.companyId}&outpostId=${c.outpostId}`, {
     headers:{Authorization:`Bearer ${c.credential}`,'X-Outpost-Versions':JSON.stringify(versions),...extraHeaders},
   });
@@ -311,7 +312,7 @@ test('the actual Go daemon reconnects after plugin restart while revocation rema
 test('the actual host rejects WebSocket declarations without the required capability', async () => {
   const fixture = join(home,'undeclared-plugin');
   mkdirSync(join(fixture,'dist'),{recursive:true});
-  writeFileSync(join(fixture,'package.json'),JSON.stringify({name:'@yelqo/undeclared-outpost',version:'0.1.0',type:'module',paperclipPlugin:{manifest:'./dist/manifest.js',worker:'./dist/worker.js'}}));
+  writeFileSync(join(fixture,'package.json'),JSON.stringify({name:'@yelqo/undeclared-outpost',version:supportedVersions.plugin,type:'module',paperclipPlugin:{manifest:'./dist/manifest.js',worker:'./dist/worker.js'}}));
   const manifest = readFileSync(join(root,'dist/manifest.js'),'utf8').replace('yelqo.outpost','yelqo.undeclared-outpost').replace('"transport.websockets.register",','');
   writeFileSync(join(fixture,'dist/manifest.js'),manifest);
   writeFileSync(join(fixture,'dist/worker.js'),readFileSync(join(root,'dist/worker.js')));

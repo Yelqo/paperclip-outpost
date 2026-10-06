@@ -116,6 +116,14 @@ same version tuple before declaring itself connected. Packaged hosts must carry
 Paperclip's build commit stamp. Compatibility is a pinned declaration, not
 cryptographic attestation of the machine's executable.
 
+Maintain host, SDK and protocol pins in `upstream/paperclip.lock.json`, and the
+Outpost release version in `package.json`. The plugin and daemon ship together
+with that release version. `pnpm generate:versions` generates their committed
+TypeScript/Go constants and updates the carried host's SDK/transport declarations.
+Preparation and builds run generation; `pnpm check` rejects stale declarations.
+Workflow tests reuse the generated contract, and the plugin manifest derives its
+version from it. Committed Go constants also support standalone `go build`.
+
 Core limits connections to 64 (including admissions and unfinished cleanup) and
 outstanding admission work separately to 64. Closed peers retain their connection
 permit until the registry lookup and every delivered worker call finish. RPC

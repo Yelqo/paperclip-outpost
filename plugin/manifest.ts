@@ -1,7 +1,8 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
+import { versions } from "./versions.js";
 
 export default {
-  id: "yelqo.outpost", apiVersion: 1, version: "0.1.0", displayName: "Outpost",
+  id: "yelqo.outpost", apiVersion: 1, version: versions.plugin, displayName: "Outpost",
   description: "Authenticated outbound connections from prepared Linux execution hosts.",
   author: "Yelqo", categories: ["automation"],
   capabilities: ["api.routes.register", "transport.websockets.register", "plugin.state.read", "plugin.state.write", "activity.log.write", "environment.drivers.register"],
