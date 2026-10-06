@@ -29,6 +29,15 @@ Linux user namespaces and `bubblewrap` for the local protection test. No paid
 provider, deployed instance or Cloudflare account is needed. Tests use loopback
 HTTP; remote connections require HTTPS/WSS with normal TLS verification.
 
+GitHub Actions runs these checks on pushes and pull requests; the `CI` workflow
+also supports manual runs. It installs the toolchain from `mise.toml`, prepares
+the pinned host/SDK patch with frozen dependencies, builds the plugin and daemon,
+checks plugin and host TypeScript plus Go, and runs the host routing/authorization
+regressions and public workflow suite. The Ubuntu 24.04 runner installs bubblewrap
+and permits unprivileged user namespaces for the protection tests. This setting
+applies only to the disposable CI runner. No additional repository secrets or
+external service accounts are required.
+
 Install the built plugin directory through Paperclip's existing instance-admin
 plugin installation API or UI. Use the pinned, patched host for that instance;
 `pnpm prepare:host` prepares its source and TypeScript prerequisites. Normal
