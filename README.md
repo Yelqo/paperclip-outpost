@@ -35,3 +35,9 @@ standalone Go binary, optional connection configuration, operator registration,
 and installation of a systemd service under the worker account. Updates are
 operator managed. Cloudflare Access is an optional connection requirement;
 Outpost does not provision Cloudflare resources or target machines.
+
+## License
+
+Paperclip Outpost is licensed under the [MIT License](LICENSE).
+Agent configuration adapted from Matt Pocock's skills is also MIT-licensed;
+see [third-party notices](THIRD_PARTY_NOTICES).
