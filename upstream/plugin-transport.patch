@@ -351,14 +351,14 @@ index 000000000..7b1150362
 +  return { stop };
 +}
 diff --git a/server/src/routes/environment-selection.ts b/server/src/routes/environment-selection.ts
-index eba3d8772..8e6de2866 100644
+index eba3d8772..98bfedfd7 100644
 --- a/server/src/routes/environment-selection.ts
 +++ b/server/src/routes/environment-selection.ts
 @@ -2,6 +2,7 @@ import { unprocessable } from "../errors.js";
  
  export async function assertEnvironmentSelectionForCompany(
    environmentsSvc: {
-+    listBoundCompanyIds?(environmentId: string): Promise<string[]>;
++    listBoundCompanyIds?(environmentId: string, options?: { includeManagedBindings?: boolean }): Promise<string[]>;
      getById(environmentId: string): Promise<{
        id: string;
        driver: string;
@@ -371,17 +371,19 @@ index eba3d8772..8e6de2866 100644
    environmentId: string | null | undefined,
    options?: {
      allowedDrivers?: string[];
-@@ -21,6 +22,8 @@ export async function assertEnvironmentSelectionForCompany(
+@@ -21,6 +22,10 @@ export async function assertEnvironmentSelectionForCompany(
    if (!environment) {
      throw unprocessable("Environment not found.");
    }
-+  const companies = await environmentsSvc.listBoundCompanyIds?.(environmentId) ?? [];
++  // Managed resource bindings provision an instance-wide environment for its
++  // companies. Only an explicit provider scope restricts selection here.
++  const companies = await environmentsSvc.listBoundCompanyIds?.(environmentId, { includeManagedBindings: false }) ?? [];
 +  if (companies.length && !companies.includes(companyId)) throw unprocessable("The selected environment belongs to another company.");
    if (environment.status === "archived") {
      throw unprocessable("Environment is archived.");
    }
 diff --git a/server/src/services/environments.ts b/server/src/services/environments.ts
-index c63a3974a..561b5c987 100644
+index c63a3974a..864675502 100644
 --- a/server/src/services/environments.ts
 +++ b/server/src/services/environments.ts
 @@ -13,6 +13,7 @@ import {
@@ -392,10 +394,16 @@ index c63a3974a..561b5c987 100644
  } from "@paperclipai/db";
  import {
    ENVIRONMENT_DRIVERS,
-@@ -888,6 +889,17 @@ export function environmentService(db: Db) {
-      * as an instance-global environment with no company owner.
+@@ -885,9 +886,22 @@ export function environmentService(db: Db) {
+      * resource binding. A managed sandbox row binds to each company that the
+      * instance provisions it for. An operator-created environment has no
+      * binding, so this returns an empty list. The caller treats an empty list
+-     * as an instance-global environment with no company owner.
++     * as an instance-global environment with no company owner. Excluding managed
++     * bindings returns only explicit provider company restrictions.
       */
-     listBoundCompanyIds: async (environmentId: string): Promise<string[]> => {
+-    listBoundCompanyIds: async (environmentId: string): Promise<string[]> => {
++    listBoundCompanyIds: async (environmentId: string, options?: { includeManagedBindings?: boolean }): Promise<string[]> => {
 +      const environment = await db.select().from(environments).where(eq(environments.id, environmentId)).then(rows => rows[0]);
 +      if (environment?.driver === "sandbox") {
 +        const provider = environment.config?.provider;
@@ -407,6 +415,7 @@ index c63a3974a..561b5c987 100644
 +          return [companyId];
 +        }
 +      }
++      if (options?.includeManagedBindings === false) return [];
        const rows = await db
          .select({ companyId: builtInManagedResources.companyId })
          .from(builtInManagedResources)
@@ -674,3 +683,25 @@ index 000000000..1543c5f30
 +    await opened(connect("normal"));
 +  }, 10000);
 +});
+diff --git a/server/src/__tests__/environment-service.test.ts b/server/src/__tests__/environment-service.test.ts
+index 5167ae403..7efc6cbe2 100644
+--- a/server/src/__tests__/environment-service.test.ts
++++ b/server/src/__tests__/environment-service.test.ts
+@@ -23,6 +23,7 @@ import {
+   startEmbeddedPostgresTestDatabase,
+ } from "./helpers/embedded-postgres.js";
+ import { environmentService } from "../services/environments.ts";
++import { assertEnvironmentSelectionForCompany } from "../routes/environment-selection.js";
+ 
+ const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+@@ -1227,6 +1228,9 @@ describeEmbeddedPostgres("environmentService leases", () => {
+ 
+     const owners = await svc.listBoundCompanyIds(environmentId);
+     expect(owners.slice().sort()).toEqual([companyA, companyB].sort());
++    // Managed bindings provision an instance-wide default for companies; they
++    // must not prevent an administrator from selecting that default again.
++    await expect(assertEnvironmentSelectionForCompany(svc, "instance", environmentId)).resolves.toBeUndefined();
+ 
+     // An operator-created environment has no managed binding, so it lists no
+     // owner and stays instance-global.

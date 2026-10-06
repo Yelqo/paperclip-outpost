@@ -204,6 +204,11 @@ test('an agent from another company cannot select the outpost environment', asyn
   assert.equal(response.status,422);
 });
 
+test('a company-scoped outpost cannot become the instance-wide default', async () => {
+  const response = await api('/api/instance/settings', {defaultEnvironmentId:registered.environmentId}, cookie, 'PATCH');
+  assert.equal(response.status,422);
+});
+
 test('private state cannot sit beneath any agent-writable root, including filesystem root', () => {
   assert.throws(() => cli(['register','--instance',origin,'--company',company.id,'--name','Unsafe placement',
     '--private-dir',join(home,'unsafe-private'),'--workspace-root','/','--scratch-root',join(home,'scratch')],
