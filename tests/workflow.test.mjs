@@ -1,0 +1,314 @@
+import { test, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { spawn, execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, mkdirSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { resolve, join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import WebSocket from 'ws';
+
+const root = resolve('.');
+const host = join(root, '.cache/paperclip');
+const home = mkdtempSync(join(tmpdir(), 'outpost-workflow-'));
+const port = 32187;
+const origin = `http://127.0.0.1:${port}`;
+let server, cookie, company, boardToken;
+let logs = '';
+const processes = [];
+let registered, privateDir, assignedAgent;
+let secondPrivate, secondRegistered;
+const proxySecrets = { 'CF-Access-Client-Id':'fixture-access-client-id', 'CF-Access-Client-Secret':'fixture-access-client-secret' };
+
+async function api(path, body, auth = cookie, method = body === undefined ? 'GET' : 'POST') {
+  const headers = { 'Content-Type': 'application/json', Origin: origin };
+  if (auth?.startsWith('Bearer ')) headers.Authorization = auth;
+  else if (auth) headers.Cookie = auth;
+  return fetch(origin + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+}
+async function json(path, body, auth, method) {
+  const response = await api(path, body, auth, method);
+  assert.ok(response.ok, `${path}: ${response.status} ${await response.clone().text()}`);
+  return response.json();
+}
+async function eventually(check, timeout = 15000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) { if (await check()) return; await delay(100); }
+  assert.fail('Timed out waiting for public workflow outcome');
+}
+function cli(args, input) {
+  return execFileSync(join(root, 'bin/outpost'), args, {
+    input: input === undefined ? undefined : JSON.stringify(input), encoding: 'utf8', timeout: 15000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+}
+
+before(async () => {
+  server = spawn(process.execPath, ['--import', 'tsx', 'src/index.ts'], {
+    cwd: join(host, 'server'), env: {
+      ...process.env, PAPERCLIP_HOME: home, PAPERCLIP_INSTANCE_ID: 'acceptance',
+      PORT: String(port), HOST: '127.0.0.1', PAPERCLIP_DEPLOYMENT_MODE: 'authenticated',
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: 'private', PAPERCLIP_AUTH_PUBLIC_BASE_URL: origin,
+      BETTER_AUTH_SECRET: 'isolated-fixture-secret-with-at-least-32-characters',
+      SERVE_UI: 'false', HEARTBEAT_SCHEDULER_ENABLED: 'false',
+      PAPERCLIP_DB_BACKUP_ENABLED: 'false', PAPERCLIP_MIGRATION_AUTO_APPLY: 'true',
+      PAPERCLIP_MIGRATION_PROMPT: 'never', PAPERCLIP_TELEMETRY_DISABLED: '1',
+      PAPERCLIP_ANNOUNCEMENTS_ENABLED: 'false', NODE_ENV: 'production',
+    }, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  server.stdout.on('data', data => { logs += data; });
+  server.stderr.on('data', data => { logs += data; });
+  await eventually(async () => {
+    if (server.exitCode !== null) throw new Error(`Host exited: ${logs.slice(-5000)}`);
+    try { return (await fetch(origin + '/api/health')).ok; } catch { return false; }
+  }, 90000);
+  const signup = await api('/api/auth/sign-up/email', {name:'Operator', email:'operator@outpost.test', password:'fixture-password-123'});
+  assert.ok(signup.ok, await signup.text());
+  cookie = signup.headers.getSetCookie().map(value => value.split(';')[0]).join('; ');
+  const config = join(home, 'bootstrap.json');
+  const dbDir = join(home, 'instances/acceptance/db');
+  assert.ok(existsSync(join(dbDir, 'postmaster.pid')), `Cannot find fixture DB: ${home}`);
+  writeFileSync(config, JSON.stringify({database:{mode:'embedded-postgres', embeddedPostgresDataDir:dbDir}}));
+  const invite = execFileSync(process.execPath, ['--import', join(host, 'server/node_modules/tsx/dist/loader.mjs'), 'packages/db/scripts/create-auth-bootstrap-invite.ts', '--config', config, '--base-url', origin], {
+    cwd:host, encoding:'utf8', env:{...process.env, PAPERCLIP_HOME:home}, timeout:15000,
+  }).trim().split('/').at(-1);
+  await json(`/api/invites/${invite}/accept`, {requestType:'human'});
+  company = await json('/api/companies', {name:'Outpost acceptance'});
+  const key = await json('/api/board-api-keys', {name:'Outpost fixture operator', requestedCompanyId:company.id});
+  boardToken = key.token;
+  const installed = await json('/api/plugins/install', {packageName:root, isLocalPath:true});
+  assert.ok(installed);
+}, {timeout:120000});
+
+after(async () => {
+  for (const child of processes) child.kill('SIGTERM');
+  if (server) { server.kill('SIGTERM'); await Promise.race([new Promise(r => server.once('exit', r)), delay(10000)]); }
+  writeFileSync(join(home, 'host.log'), logs);
+});
+
+test('operator registers a distinct outpost and selects its named environment', async () => {
+  privateDir = join(home, 'private');
+  const workspace = join(home, 'workspaces');
+  const scratch = join(home, 'scratch');
+  mkdirSync(workspace); mkdirSync(scratch);
+  const output = cli(['register', '--instance', origin, '--company', company.id, '--name', 'Ubuntu worker',
+    '--private-dir', privateDir, '--workspace-root', workspace, '--scratch-root', scratch], {operatorAuthorization:`Bearer ${boardToken}`});
+  registered = JSON.parse(output);
+  assert.equal(registered.name, 'Ubuntu worker');
+  const environments = await json(`/api/companies/${company.id}/environments`);
+  assert.ok(environments.some(e => e.id === registered.environmentId && e.name === 'Ubuntu worker'));
+  const agent = await json(`/api/companies/${company.id}/agents`, {name:'Assigned agent', role:'engineer', adapterType:'pi_local', defaultEnvironmentId:registered.environmentId});
+  assignedAgent = agent.id;
+  assert.equal(agent.defaultEnvironmentId, registered.environmentId);
+  const state = readFileSync(join(privateDir, 'connection.json'), 'utf8');
+  assert.ok(!state.includes(boardToken));
+  assert.ok(!output.includes(JSON.parse(state).credential));
+});
+
+test('the Go daemon connects outbound and the operator observes its authenticated identity', async () => {
+  const daemon = spawn(join(root, 'bin/outpost'), ['daemon','--private-dir',privateDir], {stdio:['ignore','pipe','pipe']});
+  processes.push(daemon);
+  let output = ''; daemon.stdout.on('data',data => { output += data; }); daemon.stderr.on('data',data => { output += data; });
+  await eventually(async () => {
+    assert.equal(daemon.exitCode, null, output);
+    const status = await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`);
+    return status.connected === true;
+  });
+  assert.ok(output.includes('connected'));
+  daemon.kill('SIGTERM');
+  await eventually(async () => !(await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).connected);
+});
+
+const connection = () => JSON.parse(readFileSync(join(privateDir,'connection.json'),'utf8'));
+function transport(c = connection(), versionOverrides = {}, route = 'transport', extraHeaders = {}) {
+  const versions = {host:'f858207161ba29c01c82f4674aef83d91b74480f',sdk:'1.0.0+outpost.1',plugin:'0.1.0',daemon:'0.1.0',protocol:1,...versionOverrides};
+  return new WebSocket(`${origin.replace('http','ws')}/api/plugins/yelqo.outpost/ws/${route}?companyId=${c.companyId}&outpostId=${c.outpostId}`, {
+    headers:{Authorization:`Bearer ${c.credential}`,'X-Outpost-Versions':JSON.stringify(versions),...extraHeaders},
+  });
+}
+async function rejected(ws, timeout = 10000) {
+  return new Promise((resolve,reject) => {
+    const timer = setTimeout(() => {ws.terminate(); reject(new Error('Transport rejection timed out'));},timeout);
+    ws.on('open',() => {clearTimeout(timer); ws.terminate(); reject(new Error('Unauthorized transport accepted'));});
+    ws.on('unexpected-response',(_req,res) => {clearTimeout(timer); res.resume(); ws.terminate(); resolve(res.statusCode);});
+    ws.on('error',() => {});
+  });
+}
+async function ready(ws) {
+  return new Promise((resolve,reject) => {
+    ws.once('message',data => resolve(JSON.parse(data.toString())));
+    ws.once('error',reject);
+  });
+}
+
+test('machine credentials authorize only their registered company transport', async () => {
+  const c = connection();
+  const other = await json('/api/companies',{name:'Other company'});
+  assert.equal(await rejected(transport({...c,companyId:other.id})),401);
+  assert.equal(await rejected(transport({...c,credential:boardToken})),401);
+  assert.equal(await rejected(transport({...c,credential:'invalid-outpost-secret'})),401);
+  assert.equal(await rejected(transport(c,{},'undeclared')),404);
+  for (const [path,body,method] of [
+    ['/api/companies', {name:'Unauthorized board action'},'POST'],
+    ['/api/agents/me',undefined,'GET'],
+    ['/api/plugins/yelqo.outpost/api/outposts',{companyId:company.id,name:'Unauthorized registration'},'POST'],
+  ]) {
+    const response = await api(path,body,`Bearer ${c.credential}`,method);
+    assert.ok([401,403].includes(response.status),`${path} accepted machine authentication: ${response.status}`);
+  }
+  const status = await api(`/api/plugins/yelqo.outpost/api/outposts/${c.outpostId}?companyId=${other.id}`);
+  assert.equal(status.status,404);
+  const agentKey = await json(`/api/agents/${assignedAgent}/keys`,{name:'Work agent fixture'});
+  assert.equal((await api('/api/plugins/yelqo.outpost/api/outposts',{companyId:company.id,name:'Agent registration'},`Bearer ${agentKey.token}`)).status,403);
+  assert.equal(await rejected(transport({...c,credential:agentKey.token})),401);
+});
+
+test('every supported version pin is checked before the transport accepts work', async () => {
+  for (const field of ['host','sdk','plugin','daemon','protocol']) {
+    assert.equal(await rejected(transport(connection(),{[field]:field==='protocol'?2:'incompatible'})),426,field);
+  }
+});
+
+test('core bounds frames and closes the connection without leaving plugin-owned state', async () => {
+  const ws = transport();
+  assert.equal((await ready(ws)).outpostId,registered.outpostId);
+  const closed = new Promise(resolve => ws.once('close',resolve));
+  ws.on('error',() => {});
+  ws.send('x'.repeat(16385));
+  assert.equal(await closed,1009);
+  await eventually(async () => !(await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).connected);
+  assert.match(cli(['connect','--private-dir',privateDir]),/connected/);
+});
+
+test('revocation rejects subsequent connections from the actual Go daemon', async () => {
+  assert.equal((await api(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}/revoke`,{companyId:company.id})).status,204);
+  assert.throws(() => cli(['connect','--private-dir',privateDir]),error => {
+    assert.match(error.stderr,/outpost connection rejected/);
+    assert.ok(!error.stderr.includes(connection().credential));
+    return true;
+  });
+  assert.equal(await rejected(transport()),403);
+});
+
+test('same-UID runtime isolation hides connection files and the daemon process namespace', () => {
+  const privateFile = join(privateDir,'connection.json');
+  // Ordinary same-UID permissions do allow a read: the launcher must add isolation.
+  assert.ok(readFileSync(privateFile,'utf8').includes(connection().credential));
+  const output = cli(['protect','--private-dir',privateDir,'--','/bin/sh','-c',
+    `test ! -e '${privateFile}' && test ! -e /proc/${process.pid}/environ && echo isolated`]);
+  assert.match(output,/isolated/);
+});
+
+test('an agent from another company cannot select the outpost environment', async () => {
+  const other = await json('/api/companies',{name:'Company placement rejection'});
+  const response = await api(`/api/companies/${other.id}/agents`,{name:'Wrong company agent',role:'engineer',adapterType:'pi_local',defaultEnvironmentId:registered.environmentId});
+  assert.equal(response.status,422);
+});
+
+test('private state cannot sit beneath any agent-writable root, including filesystem root', () => {
+  assert.throws(() => cli(['register','--instance',origin,'--company',company.id,'--name','Unsafe placement',
+    '--private-dir',join(home,'unsafe-private'),'--workspace-root','/','--scratch-root',join(home,'scratch')],
+    {operatorAuthorization:`Bearer ${boardToken}`}),error => { assert.match(error.stderr,/outside workspace and scratch roots/); return true; });
+  const file = join(privateDir,'connection.json');
+  chmodSync(file,0o644);
+  try { assert.throws(() => cli(['diagnose','--private-dir',privateDir]),/mode 0600/); }
+  finally { chmodSync(file,0o600); }
+});
+
+test('optional access headers are shared by registration and daemon without appearing in diagnostics or logs', () => {
+  secondPrivate = join(home,'second-private');
+  secondRegistered = JSON.parse(cli(['register','--instance',origin,'--company',company.id,'--name','Access worker',
+    '--private-dir',secondPrivate,'--workspace-root',join(home,'workspaces'),'--scratch-root',join(home,'scratch')],
+    {operatorAuthorization:`Bearer ${boardToken}`,headers:proxySecrets}));
+  const connected = cli(['connect','--private-dir',secondPrivate]);
+  const diagnostic = cli(['diagnose','--private-dir',secondPrivate]);
+  const c = JSON.parse(readFileSync(join(secondPrivate,'connection.json'),'utf8'));
+  for (const secret of [boardToken, connection().credential,c.credential,...Object.values(proxySecrets)]) {
+    assert.ok(!logs.includes(secret),'Credential present in host logs');
+    assert.ok(!diagnostic.includes(secret),'Credential present in diagnostic output');
+    assert.ok(!connected.includes(secret),'Credential present in connection output');
+  }
+});
+
+test('duplicate connections and machine-authored company changes are rejected, then scoped cleanup permits reconnect', async () => {
+  const c = JSON.parse(readFileSync(join(secondPrivate,'connection.json'),'utf8'));
+  const ws = transport(c);
+  await ready(ws);
+  assert.equal(await rejected(transport(c)),409);
+  const closed = new Promise(resolve => ws.once('close',resolve));
+  ws.send(JSON.stringify({type:'heartbeat',companyId:'another-company'}));
+  assert.equal(await closed,1008);
+  await eventually(async () => !(await json(`/api/plugins/yelqo.outpost/api/outposts/${c.outpostId}?companyId=${company.id}`)).connected);
+  assert.match(cli(['connect','--private-dir',secondPrivate]),/connected/);
+});
+
+test('the actual Go daemon retries a transient persistence failure instead of exiting', async () => {
+  const { default: postgres } = await import(join(host,'packages/db/node_modules/postgres/src/index.js'));
+  const daemon = spawn(join(root,'bin/outpost'),['daemon','--private-dir',secondPrivate],{stdio:['ignore','pipe','pipe']});
+  processes.push(daemon);
+  let output = ''; daemon.stdout.on('data',data => {output += data;}); daemon.stderr.on('data',data => {output += data;});
+  const statusPath = `/api/plugins/yelqo.outpost/api/outposts/${secondRegistered.outpostId}?companyId=${company.id}`;
+  await eventually(async () => (await json(statusPath)).connected);
+  // Inject a real persistence outage in the disposable DB. All observations
+  // remain at the public daemon/API seam, rather than reading stored records.
+  const dbPort = readFileSync(join(home,'instances/acceptance/db/postmaster.pid'),'utf8').split('\n')[3];
+  const sql = postgres(`postgres://paperclip:paperclip@127.0.0.1:${dbPort}/paperclip`,{max:1});
+  try {
+    await sql`ALTER TABLE plugin_state RENAME TO unavailable_plugin_state`;
+    try {
+      await eventually(async () => {assert.equal(daemon.exitCode,null,output); return output.includes('disconnected');});
+    } finally { await sql`ALTER TABLE unavailable_plugin_state RENAME TO plugin_state`; }
+    await eventually(async () => (await json(statusPath)).connected);
+  } finally { await sql.end(); daemon.kill('SIGTERM'); }
+  await eventually(async () => !(await json(statusPath)).connected);
+});
+
+test('disconnected clients cannot bypass the bound on pending admission work', async () => {
+  const { default: postgres } = await import(join(host,'packages/db/node_modules/postgres/src/index.js'));
+  const dbPort = readFileSync(join(home,'instances/acceptance/db/postmaster.pid'),'utf8').split('\n')[3];
+  const sql = postgres(`postgres://paperclip:paperclip@127.0.0.1:${dbPort}/paperclip`,{max:1});
+  const c = JSON.parse(readFileSync(join(secondPrivate,'connection.json'),'utf8'));
+  try {
+    await sql.begin(async transaction => {
+      await transaction`LOCK TABLE plugins IN ACCESS EXCLUSIVE MODE`;
+      for (let i=0;i<64;i++) {
+        const ws = transport(c);
+        ws.on('error',() => {});
+        await delay(25);
+        ws.terminate();
+      }
+      // Let the raw socket deadlines expire while registry lookups stay blocked.
+      await delay(6500);
+      assert.equal(await rejected(transport(c),1000),503);
+    });
+  } finally { await sql.end(); }
+  await eventually(async () => {
+    try { return cli(['connect','--private-dir',secondPrivate]).includes('connected'); }
+    catch { return false; }
+  });
+});
+
+test('the actual Go daemon reconnects after plugin restart while revocation remains durable', async () => {
+  const daemon = spawn(join(root,'bin/outpost'),['daemon','--private-dir',secondPrivate],{stdio:['ignore','pipe','pipe']});
+  processes.push(daemon);
+  let output = ''; daemon.stdout.on('data',data => {output += data;}); daemon.stderr.on('data',data => {output += data;});
+  const statusPath = `/api/plugins/yelqo.outpost/api/outposts/${secondRegistered.outpostId}?companyId=${company.id}`;
+  await eventually(async () => (await json(statusPath)).connected);
+  await json('/api/plugins/yelqo.outpost/disable',{});
+  await eventually(async () => output.includes('disconnected'),20000);
+  assert.equal(daemon.exitCode,null,output);
+  await json('/api/plugins/yelqo.outpost/enable',{});
+  await eventually(async () => (await json(statusPath)).connected,20000);
+  assert.equal(await rejected(transport()),403);
+  daemon.kill('SIGTERM');
+  await eventually(async () => !(await json(statusPath)).connected);
+});
+
+test('the actual host rejects WebSocket declarations without the required capability', async () => {
+  const fixture = join(home,'undeclared-plugin');
+  mkdirSync(join(fixture,'dist'),{recursive:true});
+  writeFileSync(join(fixture,'package.json'),JSON.stringify({name:'@yelqo/undeclared-outpost',version:'0.1.0',type:'module',paperclipPlugin:{manifest:'./dist/manifest.js',worker:'./dist/worker.js'}}));
+  const manifest = readFileSync(join(root,'dist/manifest.js'),'utf8').replace('yelqo.outpost','yelqo.undeclared-outpost').replace('"transport.websockets.register",','');
+  writeFileSync(join(fixture,'dist/manifest.js'),manifest);
+  writeFileSync(join(fixture,'dist/worker.js'),readFileSync(join(root,'dist/worker.js')));
+  assert.equal((await api('/api/plugins/install',{packageName:fixture,isLocalPath:true})).status,400);
+});

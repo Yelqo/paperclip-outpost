@@ -1,0 +1,7 @@
+[tools]
+go = "1.26.6"
+node = "24.19.0"
+pnpm = "9.15.4"
+
+[env]
+GOTMPDIR = "/tmp"
