@@ -34,8 +34,8 @@ The job runs on a standard GitHub-hosted Ubuntu runner and checks:
 - Plugin and daemon builds, patched host TypeScript, and host authorization tests.
 - The public host, plugin, and daemon integration workflow.
 
-Formatting and generated-file freshness are checked before the build, which
-regenerates compatibility declarations. There is currently no configured
+Formatting and generated-file freshness are checked before host preparation
+and the build, which regenerate compatibility declarations. There is currently no configured
 TypeScript formatter or separate lint tool; TypeScript checks and Go vetting
 use the existing toolchain.
 
