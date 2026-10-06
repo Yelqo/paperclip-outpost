@@ -77,7 +77,13 @@ transaction.
 
 The CLI prints public IDs only. Select the named environment in existing agent
 configuration (`defaultEnvironmentId`); there is no Outpost workspace catalog
-or placement scheduler. Then run:
+or placement scheduler. Provider keys are unique within a plugin manifest. If
+multiple installed plugins declare the same provider key, the host rejects
+environment selection because company ownership is ambiguous. Remove the
+conflicting plugin declaration to restore selection; disabled plugins still
+count toward this check.
+
+Then run:
 
 ```sh
 bin/outpost connect --private-dir /home/worker/.outpost-private

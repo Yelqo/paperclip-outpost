@@ -383,7 +383,7 @@ index eba3d8772..98bfedfd7 100644
      throw unprocessable("Environment is archived.");
    }
 diff --git a/server/src/services/environments.ts b/server/src/services/environments.ts
-index c63a3974a..864675502 100644
+index c63a3974a..6dc9e7f89 100644
 --- a/server/src/services/environments.ts
 +++ b/server/src/services/environments.ts
 @@ -13,6 +13,7 @@ import {
@@ -394,7 +394,7 @@ index c63a3974a..864675502 100644
  } from "@paperclipai/db";
  import {
    ENVIRONMENT_DRIVERS,
-@@ -885,9 +886,22 @@ export function environmentService(db: Db) {
+@@ -885,9 +886,27 @@ export function environmentService(db: Db) {
       * resource binding. A managed sandbox row binds to each company that the
       * instance provisions it for. An operator-created environment has no
       * binding, so this returns an empty list. The caller treats an empty list
@@ -408,7 +408,12 @@ index c63a3974a..864675502 100644
 +      if (environment?.driver === "sandbox") {
 +        const provider = environment.config?.provider;
 +        const installed = await db.select().from(plugins);
-+        const driver = installed.flatMap(plugin => plugin.manifestJson.environmentDrivers ?? []).find(driver => driver.kind === "sandbox_provider" && driver.driverKey === provider);
++        // Provider keys are unique only within a manifest. Disabled plugins
++        // still declare scopes; never let installation order erase a binding.
++        const drivers = installed.flatMap(plugin => plugin.manifestJson.environmentDrivers ?? [])
++          .filter(driver => driver.kind === "sandbox_provider" && driver.driverKey === provider);
++        if (drivers.length > 1) throw forbidden("Sandbox provider is declared by multiple plugins; company ownership is ambiguous.");
++        const driver = drivers[0];
 +        if (driver?.companyScopeConfigKey) {
 +          const companyId = environment.config?.[driver.companyScopeConfigKey];
 +          if (typeof companyId !== "string" || !companyId) throw forbidden("Provider environment requires a company binding.");
@@ -684,10 +689,18 @@ index 000000000..1543c5f30
 +  }, 10000);
 +});
 diff --git a/server/src/__tests__/environment-service.test.ts b/server/src/__tests__/environment-service.test.ts
-index 5167ae403..7efc6cbe2 100644
+index 5167ae403..ae8d34d2b 100644
 --- a/server/src/__tests__/environment-service.test.ts
 +++ b/server/src/__tests__/environment-service.test.ts
-@@ -23,6 +23,7 @@ import {
+@@ -16,6 +16,7 @@ import {
+   heartbeatRuns,
+   instanceSettings,
+   issues,
++  plugins,
+   projects,
+ } from "@paperclipai/db";
+ import {
+@@ -23,6 +24,7 @@ import {
    startEmbeddedPostgresTestDatabase,
  } from "./helpers/embedded-postgres.js";
  import { environmentService } from "../services/environments.ts";
@@ -695,7 +708,29 @@ index 5167ae403..7efc6cbe2 100644
  
  const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
  const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
-@@ -1227,6 +1228,9 @@ describeEmbeddedPostgres("environmentService leases", () => {
+@@ -57,6 +59,7 @@ describeEmbeddedPostgres("environmentService leases", () => {
+     await db.delete(agents);
+     await db.delete(instanceSettings);
+     await db.delete(environments);
++    await db.delete(plugins);
+     await db.delete(companySecrets);
+     await db.delete(companies);
+   });
+@@ -118,11 +121,12 @@ describeEmbeddedPostgres("environmentService leases", () => {
+     return { companyId, agentId, environmentId, runId };
+   }
+ 
+-  async function seedCompany(name = "Acme") {
++  async function seedCompany(name = "Acme", issuePrefix = "PAP") {
+     const companyId = randomUUID();
+     await db.insert(companies).values({
+       id: companyId,
+       name,
++      issuePrefix,
+       status: "active",
+       createdAt: new Date(),
+       updatedAt: new Date(),
+@@ -1227,6 +1231,9 @@ describeEmbeddedPostgres("environmentService leases", () => {
  
      const owners = await svc.listBoundCompanyIds(environmentId);
      expect(owners.slice().sort()).toEqual([companyA, companyB].sort());
@@ -705,3 +740,72 @@ index 5167ae403..7efc6cbe2 100644
  
      // An operator-created environment has no managed binding, so it lists no
      // owner and stays instance-global.
+@@ -1243,6 +1250,68 @@ describeEmbeddedPostgres("environmentService leases", () => {
+     expect(await svc.listBoundCompanyIds(unboundId)).toEqual([]);
+   });
+ 
++  async function seedOutpostProvider(pluginKey: string, scoped: boolean, status: "ready" | "disabled") {
++    await db.insert(plugins).values({
++      pluginKey,
++      packageName: pluginKey,
++      version: "1.0.0",
++      status,
++      manifestJson: {
++        id: pluginKey, apiVersion: 1, version: "1.0.0", displayName: pluginKey,
++        description: "Company selection regression fixture", author: "test", categories: ["automation"],
++        capabilities: ["environment.drivers.register"], entrypoints: { worker: "dist/worker.js" },
++        environmentDrivers: [{
++          driverKey: "outpost", kind: "sandbox_provider", displayName: "Outpost", configSchema: { type: "object" },
++          ...(scoped ? { companyScopeConfigKey: "companyId" } : {}),
++        }],
++      },
++    });
++  }
++
++  async function seedOutpostEnvironment(companyId: string) {
++    const [environment] = await db.insert(environments).values({
++      name: "Company outpost", driver: "sandbox", status: "active",
++      config: { provider: "outpost", companyId, outpostId: randomUUID() },
++    }).returning();
++    return environment.id;
++  }
++
++  it.each(["ready", "disabled"] as const)("retains the outpost company restriction when its plugin is %s", async (status) => {
++    const companyA = await seedCompany("Company A", "CA");
++    const companyB = await seedCompany("Company B", "CB");
++    await seedOutpostProvider("test.outpost", true, status);
++    const environmentId = await seedOutpostEnvironment(companyA);
++
++    expect(await svc.listBoundCompanyIds(environmentId, { includeManagedBindings: false })).toEqual([companyA]);
++    await expect(assertEnvironmentSelectionForCompany(svc, companyA, environmentId)).resolves.toBeUndefined();
++    await expect(assertEnvironmentSelectionForCompany(svc, companyB, environmentId)).rejects.toThrow("belongs to another company");
++    await expect(assertEnvironmentSelectionForCompany(svc, "instance", environmentId)).rejects.toThrow("belongs to another company");
++  });
++
++  it.each([
++    { status: "ready" as const, unscopedFirst: true },
++    { status: "ready" as const, unscopedFirst: false },
++    { status: "disabled" as const, unscopedFirst: true },
++    { status: "disabled" as const, unscopedFirst: false },
++  ])("rejects ambiguous outpost ownership with a $status duplicate (unscoped first: $unscopedFirst)", async ({ status, unscopedFirst }) => {
++    const companyA = await seedCompany("Company A", "CA");
++    const companyB = await seedCompany("Company B", "CB");
++    const providers = unscopedFirst
++      ? [["test.unscoped", false], ["test.outpost", true]] as const
++      : [["test.outpost", true], ["test.unscoped", false]] as const;
++    for (const [key, scoped] of providers) await seedOutpostProvider(key, scoped, scoped ? "ready" : status);
++    const environmentId = await seedOutpostEnvironment(companyA);
++
++    await expect(svc.listBoundCompanyIds(environmentId)).rejects.toThrow("ownership is ambiguous");
++    for (const companyId of [companyA, companyB, "instance"]) {
++      await expect(assertEnvironmentSelectionForCompany(svc, companyId, environmentId)).rejects.toThrow("ownership is ambiguous");
++    }
++    // Removing the unrelated declaration restores the owning company's access.
++    await db.delete(plugins).where(eq(plugins.pluginKey, "test.unscoped"));
++    await expect(assertEnvironmentSelectionForCompany(svc, companyA, environmentId)).resolves.toBeUndefined();
++    await expect(assertEnvironmentSelectionForCompany(svc, companyB, environmentId)).rejects.toThrow("belongs to another company");
++  });
++
+   it("preserves tenant env vars across managed sandbox boot reconciles", async () => {
+     // The cloud contract lets tenants add env vars — and only env vars —
+     // to the managed sandbox environment. The provisioner reconciles
