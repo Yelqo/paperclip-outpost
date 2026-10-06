@@ -35,11 +35,15 @@ The job runs on a standard GitHub-hosted Ubuntu runner and checks:
 - The public host, plugin, and daemon integration workflow.
 
 Formatting and generated-file freshness are checked before host preparation
-and the build, which regenerate compatibility declarations. There is currently no configured
-TypeScript formatter or separate lint tool; TypeScript checks and Go vetting
-use the existing toolchain.
+and the build, which regenerate compatibility declarations. There is currently
+no configured TypeScript formatter or separate lint tool; TypeScript checks and
+Go vetting use the existing toolchain.
 
 The workflow has no path filters or conditional job skips, so documentation
 changes also run the required check. Do not add filters that leave applicable
 pull requests without a result. See the development setup for the test suite's
 Linux and `bubblewrap` requirements.
+
+Avoid commit messages that skip CI, such as `[skip ci]`: a pull request still
+needs the required check. If CI was skipped, push a new commit without a skip
+instruction to run it.
