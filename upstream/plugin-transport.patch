@@ -1,0 +1,811 @@
+diff --git a/packages/plugins/sdk/src/define-plugin.ts b/packages/plugins/sdk/src/define-plugin.ts
+index 947a67cbb..45d259622 100644
+--- a/packages/plugins/sdk/src/define-plugin.ts
++++ b/packages/plugins/sdk/src/define-plugin.ts
+@@ -176,6 +176,21 @@ export interface PluginApiRequestInput {
+   headers: Record<string, string>;
+ }
+ 
++export interface PluginWebSocketOpen {
++  connectionId: string; routeKey: string; companyId: string;
++  query: Record<string, string>;
++  headers: { authorization?: string; versions?: string };
++  host: { commit: string; sdk: string; transport: number };
++}
++export interface PluginWebSocketEvent {
++  connectionId: string; routeKey: string; companyId: string; principalId: string;
++  data?: string;
++}
++export interface PluginWebSocketReply { messages?: string[]; close?: boolean; closeCode?: 1008 | 1011 | 1013 }
++export interface PluginWebSocketAdmission extends PluginWebSocketReply {
++  status: 101 | 401 | 403 | 409 | 426 | 503; principalId?: string;
++}
++
+ export interface PluginApiResponse {
+   status?: number;
+   headers?: Record<string, string>;
+@@ -327,6 +342,9 @@ export interface PluginDefinition {
+    * access, capabilities, and checkout policy.
+    */
+   onApiRequest?(input: PluginApiRequestInput): Promise<PluginApiResponse>;
++  onWebSocketOpen?(input: PluginWebSocketOpen): Promise<PluginWebSocketAdmission>;
++  onWebSocketMessage?(input: PluginWebSocketEvent): Promise<PluginWebSocketReply>;
++  onWebSocketClose?(input: PluginWebSocketEvent): Promise<void>;
+ 
+   /**
+    * Called when Paperclip scans issue/comment/document content and asks this
+diff --git a/packages/plugins/sdk/src/index.ts b/packages/plugins/sdk/src/index.ts
+index 57f862811..03943508c 100644
+--- a/packages/plugins/sdk/src/index.ts
++++ b/packages/plugins/sdk/src/index.ts
+@@ -49,6 +49,9 @@
+ // Main factory
+ // ---------------------------------------------------------------------------
+ 
++export type { PluginWebSocketOpen, PluginWebSocketEvent, PluginWebSocketReply, PluginWebSocketAdmission } from "./define-plugin.js";
++export const PLUGIN_WEBSOCKET_SDK_VERSION = "1.0.0+outpost.1";
++
+ export { definePlugin } from "./define-plugin.js";
+ export { createTestHarness, createEnvironmentTestHarness, createFakeEnvironmentDriver, filterEnvironmentEvents, assertEnvironmentEventOrder, assertLeaseLifecycle, assertWorkspaceRealizationLifecycle, assertExecutionLifecycle, assertEnvironmentError } from "./testing.js";
+ export { createPluginBundlerPresets } from "./bundlers.js";
+diff --git a/packages/plugins/sdk/src/protocol.ts b/packages/plugins/sdk/src/protocol.ts
+index 9c08a45c4..9c7f2bd3e 100644
+--- a/packages/plugins/sdk/src/protocol.ts
++++ b/packages/plugins/sdk/src/protocol.ts
+@@ -1323,6 +1323,9 @@ export const DUPLEX_CHANNEL_EXIT_NOTIFICATION = "duplexChannel.exit";
+  * ensure type safety across the IPC boundary.
+  */
+ export interface HostToWorkerMethods {
++  webSocketOpen: [params: import("./define-plugin.js").PluginWebSocketOpen, result: import("./define-plugin.js").PluginWebSocketAdmission];
++  webSocketMessage: [params: import("./define-plugin.js").PluginWebSocketEvent, result: import("./define-plugin.js").PluginWebSocketReply];
++  webSocketClose: [params: import("./define-plugin.js").PluginWebSocketEvent, result: void];
+   /** @see PLUGIN_SPEC.md §13.1 */
+   initialize: [params: InitializeParams, result: InitializeResult];
+   /** @see PLUGIN_SPEC.md §13.2 */
+@@ -1476,6 +1479,9 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[]
+   "runJob",
+   "handleWebhook",
+   "handleApiRequest",
++  "webSocketOpen",
++  "webSocketMessage",
++  "webSocketClose",
+   "getData",
+   "performAction",
+   "executeTool",
+diff --git a/packages/plugins/sdk/src/worker-rpc-host.ts b/packages/plugins/sdk/src/worker-rpc-host.ts
+index 0f0d4eb4c..493cabc7c 100644
+--- a/packages/plugins/sdk/src/worker-rpc-host.ts
++++ b/packages/plugins/sdk/src/worker-rpc-host.ts
+@@ -1608,6 +1608,14 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
+       case "handleWebhook":
+         return handleWebhook(params as PluginWebhookInput);
+ 
++      case "webSocketOpen":
++        if (!plugin.definition.onWebSocketOpen) throw methodNotImplemented("webSocketOpen");
++        return plugin.definition.onWebSocketOpen(params as import("./define-plugin.js").PluginWebSocketOpen);
++      case "webSocketMessage":
++        if (!plugin.definition.onWebSocketMessage) throw methodNotImplemented("webSocketMessage");
++        return plugin.definition.onWebSocketMessage(params as import("./define-plugin.js").PluginWebSocketEvent);
++      case "webSocketClose":
++        return plugin.definition.onWebSocketClose?.(params as import("./define-plugin.js").PluginWebSocketEvent);
+       case "handleApiRequest":
+         return handleApiRequest(params as PluginApiRequestInput);
+ 
+@@ -1739,6 +1747,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
+     if (plugin.definition.onHealth) supportedMethods.push("health");
+     if (plugin.definition.onShutdown) supportedMethods.push("shutdown");
+     if (plugin.definition.onApiRequest) supportedMethods.push("handleApiRequest");
++    if (plugin.definition.onWebSocketOpen) supportedMethods.push("webSocketOpen");
++    if (plugin.definition.onWebSocketMessage) supportedMethods.push("webSocketMessage");
++    if (plugin.definition.onWebSocketClose) supportedMethods.push("webSocketClose");
+     if (plugin.definition.onDetectExternalObjects) supportedMethods.push("detectExternalObjects");
+     if (plugin.definition.onRouteAiConnection) supportedMethods.push("routeAiConnection");
+     if (plugin.definition.onResolveExternalObject) supportedMethods.push("resolveExternalObject");
+diff --git a/packages/shared/src/constants.ts b/packages/shared/src/constants.ts
+index 3e83f2631..8cb5030fa 100644
+--- a/packages/shared/src/constants.ts
++++ b/packages/shared/src/constants.ts
+@@ -1405,6 +1405,7 @@ export const PLUGIN_CAPABILITIES = [
+   "jobs.schedule",
+   "webhooks.receive",
+   "api.routes.register",
++  "transport.websockets.register",
+   "http.outbound",
+   "secrets.read-ref",
+   "environment.drivers.register",
+diff --git a/packages/shared/src/types/plugin.ts b/packages/shared/src/types/plugin.ts
+index 42643d3b0..3de401097 100644
+--- a/packages/shared/src/types/plugin.ts
++++ b/packages/shared/src/types/plugin.ts
+@@ -201,6 +201,8 @@ export interface PluginEnvironmentDriverDeclaration {
+    * provider key is implemented by a plugin.
+    */
+   kind?: "environment_driver" | "sandbox_provider";
++  /** Restrict this provider environment to the company ID in this config field. */
++  companyScopeConfigKey?: string;
+   /** Human-readable name shown in environment configuration UI. */
+   displayName: string;
+   /** Optional description for operator-facing docs or UI affordances. */
+@@ -708,6 +710,8 @@ export interface PaperclipPluginManifestV1 {
+   database?: PluginDatabaseDeclaration;
+   /** Scoped JSON API routes mounted under `/api/plugins/:pluginId/api/*`. */
+   apiRoutes?: PluginApiRouteDeclaration[];
++  /** Machine-authenticated routes at /api/plugins/:pluginId/ws/:routeKey. */
++  webSocketRoutes?: Array<{ routeKey: string }>;
+   /** Environment drivers this plugin contributes. Requires `environment.drivers.register` capability. */
+   environmentDrivers?: PluginEnvironmentDriverDeclaration[];
+   /** Suggested company-scoped agents this plugin can provision and resolve by stable key. */
+diff --git a/packages/shared/src/validators/plugin.ts b/packages/shared/src/validators/plugin.ts
+index 002497716..acc61d4e5 100644
+--- a/packages/shared/src/validators/plugin.ts
++++ b/packages/shared/src/validators/plugin.ts
+@@ -182,6 +182,7 @@ export const pluginEnvironmentDriverDeclarationSchema = z.object({
+     "Environment driver key must start with a lowercase alphanumeric and contain only lowercase letters, digits, dots, hyphens, or underscores",
+   ),
+   kind: z.enum(["environment_driver", "sandbox_provider"]).optional(),
++  companyScopeConfigKey: z.string().regex(/^[a-zA-Z][a-zA-Z0-9_]{0,99}$/).optional(),
+   displayName: z.string().min(1).max(100),
+   description: z.string().max(500).optional(),
+   defaultAcquireTimeoutMs: z.number().int().positive().max(86_400_000).optional(),
+@@ -793,6 +794,7 @@ export const pluginManifestV1Schema = z.object({
+   tools: z.array(pluginToolDeclarationSchema).optional(),
+   database: pluginDatabaseDeclarationSchema.optional(),
+   apiRoutes: z.array(pluginApiRouteDeclarationSchema).optional(),
++  webSocketRoutes: z.array(z.object({ routeKey: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,99}$/) }).strict()).max(16).optional(),
+   environmentDrivers: z.array(pluginEnvironmentDriverDeclarationSchema).optional(),
+   agents: z.array(pluginManagedAgentDeclarationSchema).optional(),
+   projects: z.array(pluginManagedProjectDeclarationSchema).optional(),
+@@ -851,6 +853,16 @@ export const pluginManifestV1Schema = z.object({
+     }
+   }
+ 
++  if (manifest.webSocketRoutes?.length) {
++    if (!manifest.capabilities.includes("transport.websockets.register")) {
++      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["capabilities"], message: "WebSocket routes require transport.websockets.register" });
++    }
++    const keys = manifest.webSocketRoutes.map(route => route.routeKey);
++    if (new Set(keys).size !== keys.length) {
++      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["webSocketRoutes"], message: "Duplicate WebSocket route key" });
++    }
++  }
++
+   // environment drivers require environment.drivers.register
+   if (manifest.environmentDrivers && manifest.environmentDrivers.length > 0) {
+     if (!manifest.capabilities.includes("environment.drivers.register")) {
+diff --git a/server/src/index.ts b/server/src/index.ts
+index 92c57e4b9..c665e370d 100644
+--- a/server/src/index.ts
++++ b/server/src/index.ts
+@@ -58,6 +58,7 @@ import {
+ } from "./services/managed-config.js";
+ import { getOperatorSettingDefaults } from "./services/setting-defaults.js";
+ import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/environment-custom-image-terminal-ws.js";
++import { setupPluginWebSocketServer } from "./realtime/plugin-ws.js";
+ import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
+ import { setupRunnerPrpWebSocketServer } from "./realtime/runner-prp-ws.js";
+ import { cloudActorHeaderSourceFromHeaders, resolveCloudTenantActor } from "./middleware/auth.js";
+@@ -961,6 +962,7 @@ async function startServerWithDatabaseTeardown(
+   setupEnvironmentCustomImageTerminalWebSocketServer(server, db as any, {
+     pluginWorkerManager,
+   });
++  const pluginWebSocketServer = setupPluginWebSocketServer(server, db as any, pluginWorkerManager);
+   setupLiveEventsWebSocketServer(server, db as any, {
+     deploymentMode: config.deploymentMode,
+     resolveSessionFromHeaders,
+@@ -2007,6 +2009,7 @@ async function startServerWithDatabaseTeardown(
+     // request in flight is drained against a working server and none reaches
+     // a route once the pool is gone; the programmatic close below then finds
+     // the listener already closed and skips.
++    pluginWebSocketServer.stop();
+     await finalizeServerShutdown({
+       signal,
+       shutdownAppServices: appShutdown,
+diff --git a/server/src/middleware/http-log-redaction.ts b/server/src/middleware/http-log-redaction.ts
+index 684e7cc13..8985f9c3a 100644
+--- a/server/src/middleware/http-log-redaction.ts
++++ b/server/src/middleware/http-log-redaction.ts
+@@ -1,5 +1,7 @@
+ export const HTTP_LOG_REDACT_PATHS = [
+   "req.headers.authorization",
++  'req.headers["cf-access-client-id"]',
++  'req.headers["cf-access-client-secret"]',
+   'req.headers["proxy-authorization"]',
+   "req.headers.cookie",
+   // "set-cookie" is normally a response header; keep the request-side
+diff --git a/server/src/realtime/plugin-ws.ts b/server/src/realtime/plugin-ws.ts
+new file mode 100644
+index 000000000..7b1150362
+--- /dev/null
++++ b/server/src/realtime/plugin-ws.ts
+@@ -0,0 +1,132 @@
++import { execFileSync } from "node:child_process";
++import { randomUUID } from "node:crypto";
++import type { Server } from "node:http";
++import { fileURLToPath } from "node:url";
++import { WebSocketServer, WebSocket } from "ws";
++import type { Db } from "@paperclipai/db";
++import { PLUGIN_WEBSOCKET_SDK_VERSION, type PluginWebSocketReply } from "@paperclipai/plugin-sdk";
++import type { HostToWorkerMethods } from "@paperclipai/plugin-sdk";
++import { pluginRegistryService } from "../services/plugin-registry.js";
++import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
++import { readBuildCommit } from "../build-commit.js";
++
++/** Core owns every socket. Plugins see bounded, serialized RPC events only. */
++export function setupPluginWebSocketServer(server: Server, db: Db, workers: PluginWorkerManager) {
++  const registry = pluginRegistryService(db);
++  const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024, perMessageDeflate: false });
++  let commit = readBuildCommit() ?? "";
++  try { commit = execFileSync("git", ["rev-parse", "HEAD"], {
++    cwd: fileURLToPath(new URL("../../../", import.meta.url)), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1000,
++  }).trim(); } catch { /* Packaged hosts must carry the build commit stamp. */ }
++  const host = { commit, sdk: PLUGIN_WEBSOCKET_SDK_VERSION, transport: 1 };
++  let admitted = 0, opening = 0, stopping = false;
++  const pending = new Set<import("node:stream").Duplex>();
++  server.on("upgrade", (req, socket, head) => {
++    const request = req as typeof req & { paperclipWebSocketHandled?: boolean };
++    if (request.paperclipWebSocketHandled) return;
++    let url: URL;
++    try { url = new URL(req.url ?? "", "http://localhost"); } catch { return; }
++    const match = url.pathname.match(/^\/api\/plugins\/([a-z0-9._-]+)\/ws\/([a-z0-9._-]+)$/);
++    if (!match) return;
++    request.paperclipWebSocketHandled = true;
++    socket.on("error", () => {});
++    pending.add(socket);
++    const deadline = setTimeout(() => socket.destroy(), 6000);
++    socket.once("close", () => { pending.delete(socket); clearTimeout(deadline); });
++    const reject = (status: number) => {
++      if (!socket.destroyed) socket.end(`HTTP/1.1 ${status} Rejected\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`, () => socket.destroy());
++    };
++    const companyId = url.searchParams.get("companyId") ?? "";
++    if (req.headers.origin || !/^[0-9a-f-]{36}$/i.test(companyId) ||
++      [...url.searchParams.keys()].some(key => key !== "companyId" && key !== "outpostId") ||
++      url.search.length > 256) { reject(400); return; }
++    if (stopping || admitted >= 64 || opening >= 64) { reject(503); return; }
++    admitted++;
++    // Admission work keeps its permit even after its peer socket closes.
++    opening++;
++    let released = false, disconnected = false, admissionSettled = false, inFlight = 0;
++    const release = () => {
++      if (!released && disconnected && admissionSettled && inFlight === 0) {
++        released = true; admitted--;
++      }
++    };
++    let cleanup = () => {};
++    socket.once("close", () => { disconnected = true; cleanup(); release(); });
++    void (async () => {
++      const plugin = await registry.getByKey(match[1]!);
++      if (socket.destroyed || stopping) { release(); return; }
++      const worker = plugin ? workers.getWorker(plugin.id) : undefined;
++      if (!plugin || plugin.status !== "ready" || !worker || !workers.isRunning(plugin.id)) { reject(503); return; }
++      if (!plugin.manifestJson.capabilities.includes("transport.websockets.register") ||
++        !plugin.manifestJson.webSocketRoutes?.some(route => route.routeKey === match[2])) { reject(404); return; }
++      const call = <M extends "webSocketOpen" | "webSocketMessage" | "webSocketClose">(
++        method: M, params: HostToWorkerMethods[M][0], timeout: number,
++      ): Promise<HostToWorkerMethods[M][1]> => {
++        inFlight++;
++        const { result, completed } = worker.callWithCompletion(method, params, timeout);
++        void completed.then(() => { inFlight--; release(); });
++        return result;
++      };
++      const workerPid = worker.diagnostics().pid;
++      const connectionId = randomUUID();
++      const input = { connectionId, companyId, routeKey: match[2]!, query: Object.fromEntries(url.searchParams), host,
++        headers: { authorization: req.headers.authorization, versions: typeof req.headers["x-outpost-versions"] === "string" ? req.headers["x-outpost-versions"] : undefined } };
++      const event = { connectionId, companyId, routeKey: input.routeKey, principalId: "" };
++      let closed = false;
++      cleanup = () => {
++        if (closed) return;
++        closed = true;
++        void call("webSocketClose", event, 1000).catch(() => {});
++      };
++      const opened = await call("webSocketOpen", input, 5000);
++      event.principalId = opened.principalId ?? "";
++      if (opened.status !== 101 || !opened.principalId || socket.destroyed) {
++        cleanup(); reject([401,403,409,426,503].includes(opened.status) ? opened.status : 403); return;
++      }
++      wss.handleUpgrade(req, socket, head, ws => {
++        pending.delete(socket);
++        clearTimeout(deadline);
++        const send = (reply: PluginWebSocketReply) => {
++          const messages = reply.messages ?? [];
++          if (!Array.isArray(messages) || messages.length > 4 || messages.some(message => typeof message !== "string" || Buffer.byteLength(message) > 16 * 1024)) {
++            ws.close(1011, "invalid plugin reply"); return;
++          }
++          for (const message of messages) {
++            if (ws.readyState !== WebSocket.OPEN) return;
++            if (ws.bufferedAmount + Buffer.byteLength(message) > 64 * 1024) { ws.close(1013, "transport capacity"); return; }
++            ws.send(message);
++          }
++          if (reply.close) ws.close([1008,1011,1013].includes(reply.closeCode ?? 1008) ? reply.closeCode ?? 1008 : 1011, "transport closed");
++        };
++        let queued = 0, chain = Promise.resolve(), alive = true;
++        const heartbeat = setInterval(() => {
++          if (!alive || !workers.isRunning(plugin.id) || workers.getWorker(plugin.id) !== worker || worker.diagnostics().pid !== workerPid) { ws.terminate(); return; }
++          alive = false; ws.ping();
++        }, 10000);
++        heartbeat.unref();
++        ws.on("pong", () => { alive = true; });
++        ws.on("message", (data, binary) => {
++          if (closed || ws.readyState !== WebSocket.OPEN) return;
++          if (binary || ++queued > 16) { ws.close(1013, "transport capacity"); return; }
++          chain = chain.then(async () => {
++            if (!closed && ws.readyState === WebSocket.OPEN) send(await call("webSocketMessage", {...event, data:data.toString()}, 5000));
++          }).catch(() => { ws.close(1011, "plugin unavailable"); }).finally(() => { queued--; });
++        });
++        ws.on("close", () => { clearInterval(heartbeat); cleanup(); });
++        ws.on("error", () => { ws.terminate(); });
++        send(opened);
++      });
++    })().catch(() => { cleanup(); reject(503); }).finally(() => {
++      opening--; admissionSettled = true; release();
++    });
++  });
++  const stop = () => {
++    if (stopping) return;
++    stopping = true;
++    for (const socket of pending) socket.destroy();
++    for (const ws of wss.clients) ws.terminate();
++    wss.close();
++  };
++  server.once("close", stop);
++  return { stop };
++}
+diff --git a/server/src/routes/environment-selection.ts b/server/src/routes/environment-selection.ts
+index eba3d8772..98bfedfd7 100644
+--- a/server/src/routes/environment-selection.ts
++++ b/server/src/routes/environment-selection.ts
+@@ -2,6 +2,7 @@ import { unprocessable } from "../errors.js";
+ 
+ export async function assertEnvironmentSelectionForCompany(
+   environmentsSvc: {
++    listBoundCompanyIds?(environmentId: string, options?: { includeManagedBindings?: boolean }): Promise<string[]>;
+     getById(environmentId: string): Promise<{
+       id: string;
+       driver: string;
+@@ -9,7 +10,7 @@ export async function assertEnvironmentSelectionForCompany(
+       config: Record<string, unknown> | null;
+     } | null>;
+   },
+-  _companyId: string,
++  companyId: string,
+   environmentId: string | null | undefined,
+   options?: {
+     allowedDrivers?: string[];
+@@ -21,6 +22,10 @@ export async function assertEnvironmentSelectionForCompany(
+   if (!environment) {
+     throw unprocessable("Environment not found.");
+   }
++  // Managed resource bindings provision an instance-wide environment for its
++  // companies. Only an explicit provider scope restricts selection here.
++  const companies = await environmentsSvc.listBoundCompanyIds?.(environmentId, { includeManagedBindings: false }) ?? [];
++  if (companies.length && !companies.includes(companyId)) throw unprocessable("The selected environment belongs to another company.");
+   if (environment.status === "archived") {
+     throw unprocessable("Environment is archived.");
+   }
+diff --git a/server/src/services/environments.ts b/server/src/services/environments.ts
+index c63a3974a..6dc9e7f89 100644
+--- a/server/src/services/environments.ts
++++ b/server/src/services/environments.ts
+@@ -13,6 +13,7 @@ import {
+   instanceSettings,
+   issues,
+   projects,
++  plugins,
+ } from "@paperclipai/db";
+ import {
+   ENVIRONMENT_DRIVERS,
+@@ -885,9 +886,27 @@ export function environmentService(db: Db) {
+      * resource binding. A managed sandbox row binds to each company that the
+      * instance provisions it for. An operator-created environment has no
+      * binding, so this returns an empty list. The caller treats an empty list
+-     * as an instance-global environment with no company owner.
++     * as an instance-global environment with no company owner. Excluding managed
++     * bindings returns only explicit provider company restrictions.
+      */
+-    listBoundCompanyIds: async (environmentId: string): Promise<string[]> => {
++    listBoundCompanyIds: async (environmentId: string, options?: { includeManagedBindings?: boolean }): Promise<string[]> => {
++      const environment = await db.select().from(environments).where(eq(environments.id, environmentId)).then(rows => rows[0]);
++      if (environment?.driver === "sandbox") {
++        const provider = environment.config?.provider;
++        const installed = await db.select().from(plugins);
++        // Provider keys are unique only within a manifest. Disabled plugins
++        // still declare scopes; never let installation order erase a binding.
++        const drivers = installed.flatMap(plugin => plugin.manifestJson.environmentDrivers ?? [])
++          .filter(driver => driver.kind === "sandbox_provider" && driver.driverKey === provider);
++        if (drivers.length > 1) throw forbidden("Sandbox provider is declared by multiple plugins; company ownership is ambiguous.");
++        const driver = drivers[0];
++        if (driver?.companyScopeConfigKey) {
++          const companyId = environment.config?.[driver.companyScopeConfigKey];
++          if (typeof companyId !== "string" || !companyId) throw forbidden("Provider environment requires a company binding.");
++          return [companyId];
++        }
++      }
++      if (options?.includeManagedBindings === false) return [];
+       const rows = await db
+         .select({ companyId: builtInManagedResources.companyId })
+         .from(builtInManagedResources)
+diff --git a/server/src/services/plugin-worker-manager.ts b/server/src/services/plugin-worker-manager.ts
+index af6721f3d..d3b01e042 100644
+--- a/server/src/services/plugin-worker-manager.ts
++++ b/server/src/services/plugin-worker-manager.ts
+@@ -715,6 +715,17 @@ export interface PluginWorkerHandle {
+     executeLogSink?: ExecuteLogSink,
+   ): Promise<HostToWorkerMethods[M][1]>;
+ 
++  /**
++   * Call with a separate completion signal for bounded delivery. The result
++   * observes the RPC deadline; completed waits for a worker reply, process exit,
++   * or failure to send. A timeout alone does not prove execution has ended.
++   */
++  callWithCompletion<M extends HostToWorkerMethodName>(
++    method: M,
++    params: HostToWorkerMethods[M][0],
++    timeoutMs?: number,
++  ): { result: Promise<HostToWorkerMethods[M][1]>; completed: Promise<void> };
++
+   /**
+    * Send a fire-and-forget notification to the worker (no response expected).
+    */
+@@ -888,6 +899,8 @@ export function createPluginWorkerHandle(
+ 
+   // Pending RPC requests awaiting a response
+   const pendingRequests = new Map<string | number, PendingRequest>();
++  // Tracked execution survives expiration of the caller's result deadline.
++  const workerCompletions = new Map<string | number, () => void>();
+   let nextRequestId = 1;
+   const activeInvocations = new Map<string, ActiveInvocation>();
+   // Host-owned execute routes, keyed by the host-issued invocation id. Only an
+@@ -1093,9 +1106,12 @@ export function createPluginWorkerHandle(
+       return;
+     }
+ 
++    const complete = workerCompletions.get(id);
++    workerCompletions.delete(id);
++    complete?.();
+     const pending = pendingRequests.get(id);
+     if (!pending) {
+-      log.warn({ id }, "received response for unknown request id");
++      if (!complete) log.warn({ id }, "received response for unknown request id");
+       return;
+     }
+ 
+@@ -3039,6 +3055,8 @@ export function createPluginWorkerHandle(
+       );
+     }
+     pendingRequests.clear();
++    for (const complete of workerCompletions.values()) complete();
++    workerCompletions.clear();
+     for (const invocation of activeInvocations.values()) {
+       if (invocation.timer) clearTimeout(invocation.timer);
+     }
+@@ -3291,9 +3309,11 @@ export function createPluginWorkerHandle(
+     params: HostToWorkerMethods[M][0],
+     timeoutMs?: number,
+     executeLogSink?: ExecuteLogSink,
++    onWorkerCompleted?: () => void,
+   ): Promise<HostToWorkerMethods[M][1]> {
+     const rpcPromise = new Promise<HostToWorkerMethods[M][1]>((resolve, reject) => {
+       if (!childProcess?.stdin?.writable) {
++        onWorkerCompleted?.();
+         reject(
+           new Error(
+             `Cannot call "${method}" — worker for "${pluginId}" is not running`,
+@@ -3303,6 +3323,7 @@ export function createPluginWorkerHandle(
+       }
+ 
+       const id = nextRequestId++;
++      if (onWorkerCompleted) workerCompletions.set(id, onWorkerCompleted);
+       const timeout = resolveRpcCallTimeoutMs(timeoutMs, rpcTimeoutMs);
+       const invocationScope = deriveInvocationScope(method, params);
+       const invocation = invocationScope ? registerInvocation(invocationScope) : null;
+@@ -3366,6 +3387,8 @@ export function createPluginWorkerHandle(
+         };
+         sendMessage(request);
+       } catch (err) {
++        workerCompletions.delete(id);
++        onWorkerCompleted?.();
+         clearTimeout(timer);
+         pendingRequests.delete(id);
+         clearInvocation(invocation);
+@@ -3435,6 +3458,22 @@ export function createPluginWorkerHandle(
+       return callInternal(method, params, timeoutMs, executeLogSink);
+     },
+ 
++    callWithCompletion<M extends HostToWorkerMethodName>(
++      method: M,
++      params: HostToWorkerMethods[M][0],
++      timeoutMs?: number,
++    ) {
++      let complete!: () => void;
++      const completed = new Promise<void>(resolve => { complete = resolve; });
++      if (status !== "running" && status !== "starting") {
++        complete();
++        return { completed, result: Promise.reject(new Error(
++          `Cannot call "${method}" — worker for "${pluginId}" is ${status}`,
++        )) };
++      }
++      return { completed, result: callInternal(method, params, timeoutMs, undefined, complete) };
++    },
++
+     openLoginPtySession(input: LoginPtyOpenInput) {
+       if (status !== "running" && status !== "starting") {
+         return Promise.reject(
+diff --git a/server/src/__tests__/fixtures/plugin-worker-websocket-stalled.cjs b/server/src/__tests__/fixtures/plugin-worker-websocket-stalled.cjs
+new file mode 100644
+index 000000000..c47b53d19
+--- /dev/null
++++ b/server/src/__tests__/fixtures/plugin-worker-websocket-stalled.cjs
+@@ -0,0 +1,31 @@
++const readline = require("node:readline");
++const connections = new Map();
++const pending = [];
++const counts = { webSocketOpen: 0, webSocketMessage: 0, webSocketClose: 0 };
++let released = false;
++const send = (id, result) => process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`);
++
++readline.createInterface({ input: process.stdin }).on("line", line => {
++  const { id, method, params } = JSON.parse(line);
++  if (method === "initialize") {
++    send(id, { ok: true, supportedMethods: [...Object.keys(counts), "getData"] });
++  } else if (method === "getData") {
++    if (params.key === "release") {
++      released = true;
++      for (const reply of pending.splice(0)) reply();
++    }
++    send(id, { counts, pending: pending.length });
++  } else if (method === "shutdown") {
++    send(id, {});
++    setImmediate(() => process.exit(0));
++  } else if (Object.hasOwn(counts, method)) {
++    counts[method]++;
++    if (method === "webSocketOpen") connections.set(params.connectionId, params.query.outpostId);
++    const stall = connections.get(params.connectionId) === method;
++    const result = method === "webSocketOpen" ? { status: 101, principalId: "fixture" } : {};
++    if (method === "webSocketClose") connections.delete(params.connectionId);
++    const reply = () => send(id, result);
++    if (stall && !released) pending.push(reply);
++    else reply();
++  }
++});
+diff --git a/server/src/__tests__/plugin-websocket-timeouts.test.ts b/server/src/__tests__/plugin-websocket-timeouts.test.ts
+new file mode 100644
+index 000000000..1543c5f30
+--- /dev/null
++++ b/server/src/__tests__/plugin-websocket-timeouts.test.ts
+@@ -0,0 +1,115 @@
++import { createServer, type Server } from "node:http";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { setTimeout as delay } from "node:timers/promises";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import WebSocket from "ws";
++import type { Db } from "@paperclipai/db";
++import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
++import { createPluginWorkerHandle, type PluginWorkerHandle, type PluginWorkerManager } from "../services/plugin-worker-manager.js";
++import { setupPluginWebSocketServer } from "../realtime/plugin-ws.js";
++
++vi.mock("../services/plugin-registry.js", () => ({
++  pluginRegistryService: () => ({ getByKey: async () => ({
++    id: "test.plugin", status: "ready", manifestJson: {
++      capabilities: ["transport.websockets.register"], webSocketRoutes: [{ routeKey: "transport" }],
++    },
++  }) }),
++}));
++
++const manifest: PaperclipPluginManifestV1 = {
++  id: "test.plugin", apiVersion: 1, version: "1.0.0", displayName: "Test plugin",
++  description: "Test plugin", author: "Paperclip", categories: ["automation"], capabilities: [],
++  entrypoints: { worker: "dist/worker.js" },
++};
++let handle: PluginWorkerHandle;
++let server: Server;
++let route: ReturnType<typeof setupPluginWebSocketServer>;
++const sockets: WebSocket[] = [];
++
++async function fixture() {
++  handle = createPluginWorkerHandle("test.plugin", {
++    entrypointPath: path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures/plugin-worker-websocket-stalled.cjs"),
++    manifest, config: {}, instanceInfo: { instanceId: "test", hostVersion: "1.0.0" }, apiVersion: 1, hostHandlers: {},
++  });
++  await handle.start();
++  server = createServer();
++  route = setupPluginWebSocketServer(server, {} as Db, {
++    getWorker: () => handle, isRunning: () => handle.status === "running",
++  } as unknown as PluginWorkerManager);
++  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
++  const port = (server.address() as { port: number }).port;
++  return (stall: string) => {
++    const ws = new WebSocket(`ws://127.0.0.1:${port}/api/plugins/test.plugin/ws/transport?companyId=00000000-0000-0000-0000-000000000000&outpostId=${stall}`);
++    ws.on("error", () => {});
++    sockets.push(ws);
++    return ws;
++  };
++}
++const stats = () => handle.call("getData", { key: "status" }) as Promise<{ counts: Record<string, number>; pending: number }>;
++async function eventually(check: () => Promise<boolean>) {
++  const end = Date.now() + 2000;
++  while (Date.now() < end) {
++    if (await check()) return;
++    await delay(10);
++  }
++  throw new Error("Transport permits were not recovered");
++}
++function opened(ws: WebSocket) {
++  return new Promise<void>((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
++}
++function rejected(ws: WebSocket, timeout = 1000) {
++  return new Promise<number>((resolve, reject) => {
++    const timer = setTimeout(() => { ws.terminate(); reject(new Error("Admission was forwarded instead of rejected immediately")); }, timeout);
++    ws.once("unexpected-response", (_req, res) => { clearTimeout(timer); res.resume(); ws.terminate(); resolve(res.statusCode!); });
++    ws.once("open", () => { clearTimeout(timer); reject(new Error("Admission exceeded the worker bound")); });
++  });
++}
++
++afterEach(async () => {
++  for (const ws of sockets.splice(0)) ws.terminate();
++  route?.stop();
++  await handle?.stop();
++  if (server?.listening) await new Promise<void>(resolve => server.close(() => resolve()));
++});
++
++describe("WebSocket worker execution bounds", () => {
++  it("retains admission permits after RPC timeout until the worker replies", async () => {
++    const connect = await fixture();
++    const first = Array.from({ length: 64 }, () => rejected(connect("webSocketOpen"), 7000));
++    expect(await Promise.all(first)).toEqual(Array(64).fill(503));
++    expect((await stats()).pending).toBe(64);
++    expect(await Promise.all(Array.from({ length: 64 }, () => rejected(connect("normal"))))).toEqual(Array(64).fill(503));
++    expect((await stats()).counts.webSocketOpen).toBe(64);
++    await handle.call("getData", { key: "release" });
++    await eventually(async () => (await stats()).pending === 0);
++    await opened(connect("normal"));
++  }, 15000);
++
++  it("retains permits for timed-out message handlers until worker exit", async () => {
++    const connect = await fixture();
++    const clients = Array.from({ length: 64 }, () => connect("webSocketMessage"));
++    await Promise.all(clients.map(opened));
++    const closed = clients.map(ws => new Promise<number>(resolve => ws.once("close", resolve)));
++    for (const ws of clients) ws.send("stall");
++    expect(await Promise.all(closed)).toEqual(Array(64).fill(1011));
++    expect((await stats()).pending).toBe(64);
++    expect(await rejected(connect("normal"))).toBe(503);
++    await handle.restart();
++    await opened(connect("normal"));
++  }, 15000);
++
++  it("keeps stalled cleanup charged after its shorter RPC timeout", async () => {
++    const connect = await fixture();
++    const clients = Array.from({ length: 64 }, () => connect("webSocketClose"));
++    await Promise.all(clients.map(opened));
++    const closed = clients.map(ws => new Promise<void>(resolve => ws.once("close", () => resolve())));
++    for (const ws of clients) ws.close();
++    await Promise.all(closed);
++    await eventually(async () => (await stats()).pending === 64);
++    await delay(1100);
++    expect(await rejected(connect("normal"))).toBe(503);
++    await handle.call("getData", { key: "release" });
++    await opened(connect("normal"));
++  }, 10000);
++});
+diff --git a/server/src/__tests__/environment-service.test.ts b/server/src/__tests__/environment-service.test.ts
+index 5167ae403..ae8d34d2b 100644
+--- a/server/src/__tests__/environment-service.test.ts
++++ b/server/src/__tests__/environment-service.test.ts
+@@ -16,6 +16,7 @@ import {
+   heartbeatRuns,
+   instanceSettings,
+   issues,
++  plugins,
+   projects,
+ } from "@paperclipai/db";
+ import {
+@@ -23,6 +24,7 @@ import {
+   startEmbeddedPostgresTestDatabase,
+ } from "./helpers/embedded-postgres.js";
+ import { environmentService } from "../services/environments.ts";
++import { assertEnvironmentSelectionForCompany } from "../routes/environment-selection.js";
+ 
+ const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+@@ -57,6 +59,7 @@ describeEmbeddedPostgres("environmentService leases", () => {
+     await db.delete(agents);
+     await db.delete(instanceSettings);
+     await db.delete(environments);
++    await db.delete(plugins);
+     await db.delete(companySecrets);
+     await db.delete(companies);
+   });
+@@ -118,11 +121,12 @@ describeEmbeddedPostgres("environmentService leases", () => {
+     return { companyId, agentId, environmentId, runId };
+   }
+ 
+-  async function seedCompany(name = "Acme") {
++  async function seedCompany(name = "Acme", issuePrefix = "PAP") {
+     const companyId = randomUUID();
+     await db.insert(companies).values({
+       id: companyId,
+       name,
++      issuePrefix,
+       status: "active",
+       createdAt: new Date(),
+       updatedAt: new Date(),
+@@ -1227,6 +1231,9 @@ describeEmbeddedPostgres("environmentService leases", () => {
+ 
+     const owners = await svc.listBoundCompanyIds(environmentId);
+     expect(owners.slice().sort()).toEqual([companyA, companyB].sort());
++    // Managed bindings provision an instance-wide default for companies; they
++    // must not prevent an administrator from selecting that default again.
++    await expect(assertEnvironmentSelectionForCompany(svc, "instance", environmentId)).resolves.toBeUndefined();
+ 
+     // An operator-created environment has no managed binding, so it lists no
+     // owner and stays instance-global.
+@@ -1243,6 +1250,68 @@ describeEmbeddedPostgres("environmentService leases", () => {
+     expect(await svc.listBoundCompanyIds(unboundId)).toEqual([]);
+   });
+ 
++  async function seedOutpostProvider(pluginKey: string, scoped: boolean, status: "ready" | "disabled") {
++    await db.insert(plugins).values({
++      pluginKey,
++      packageName: pluginKey,
++      version: "1.0.0",
++      status,
++      manifestJson: {
++        id: pluginKey, apiVersion: 1, version: "1.0.0", displayName: pluginKey,
++        description: "Company selection regression fixture", author: "test", categories: ["automation"],
++        capabilities: ["environment.drivers.register"], entrypoints: { worker: "dist/worker.js" },
++        environmentDrivers: [{
++          driverKey: "outpost", kind: "sandbox_provider", displayName: "Outpost", configSchema: { type: "object" },
++          ...(scoped ? { companyScopeConfigKey: "companyId" } : {}),
++        }],
++      },
++    });
++  }
++
++  async function seedOutpostEnvironment(companyId: string) {
++    const [environment] = await db.insert(environments).values({
++      name: "Company outpost", driver: "sandbox", status: "active",
++      config: { provider: "outpost", companyId, outpostId: randomUUID() },
++    }).returning();
++    return environment.id;
++  }
++
++  it.each(["ready", "disabled"] as const)("retains the outpost company restriction when its plugin is %s", async (status) => {
++    const companyA = await seedCompany("Company A", "CA");
++    const companyB = await seedCompany("Company B", "CB");
++    await seedOutpostProvider("test.outpost", true, status);
++    const environmentId = await seedOutpostEnvironment(companyA);
++
++    expect(await svc.listBoundCompanyIds(environmentId, { includeManagedBindings: false })).toEqual([companyA]);
++    await expect(assertEnvironmentSelectionForCompany(svc, companyA, environmentId)).resolves.toBeUndefined();
++    await expect(assertEnvironmentSelectionForCompany(svc, companyB, environmentId)).rejects.toThrow("belongs to another company");
++    await expect(assertEnvironmentSelectionForCompany(svc, "instance", environmentId)).rejects.toThrow("belongs to another company");
++  });
++
++  it.each([
++    { status: "ready" as const, unscopedFirst: true },
++    { status: "ready" as const, unscopedFirst: false },
++    { status: "disabled" as const, unscopedFirst: true },
++    { status: "disabled" as const, unscopedFirst: false },
++  ])("rejects ambiguous outpost ownership with a $status duplicate (unscoped first: $unscopedFirst)", async ({ status, unscopedFirst }) => {
++    const companyA = await seedCompany("Company A", "CA");
++    const companyB = await seedCompany("Company B", "CB");
++    const providers = unscopedFirst
++      ? [["test.unscoped", false], ["test.outpost", true]] as const
++      : [["test.outpost", true], ["test.unscoped", false]] as const;
++    for (const [key, scoped] of providers) await seedOutpostProvider(key, scoped, scoped ? "ready" : status);
++    const environmentId = await seedOutpostEnvironment(companyA);
++
++    await expect(svc.listBoundCompanyIds(environmentId)).rejects.toThrow("ownership is ambiguous");
++    for (const companyId of [companyA, companyB, "instance"]) {
++      await expect(assertEnvironmentSelectionForCompany(svc, companyId, environmentId)).rejects.toThrow("ownership is ambiguous");
++    }
++    // Removing the unrelated declaration restores the owning company's access.
++    await db.delete(plugins).where(eq(plugins.pluginKey, "test.unscoped"));
++    await expect(assertEnvironmentSelectionForCompany(svc, companyA, environmentId)).resolves.toBeUndefined();
++    await expect(assertEnvironmentSelectionForCompany(svc, companyB, environmentId)).rejects.toThrow("belongs to another company");
++  });
++
+   it("preserves tenant env vars across managed sandbox boot reconciles", async () => {
+     // The cloud contract lets tenants add env vars — and only env vars —
+     // to the managed sandbox environment. The provisioner reconciles

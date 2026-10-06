@@ -15,11 +15,16 @@ human decisions.
 
 ## Current status
 
-This repository records the design reconstructed with the operator on
-2026-10-06. No daemon, plugin, npm package or installation command is implemented
-yet. The original conversation was unavailable; these documents distinguish
-accepted decisions from inspected upstream behavior and proposed integration
-work.
+Registration, named execution-environment selection and authenticated outbound
+connections are implemented in the Go CLI/daemon and TypeScript/Effect plugin.
+See [setup, operator commands and protection boundaries](docs/connection.md).
+The required Paperclip host/SDK extension is carried as a reproducible patch
+against a pinned upstream commit. Agent execution, callback integration and
+release/service installation remain subsequent milestones.
+
+The design was reconstructed with the operator on 2026-10-06. Its documents
+distinguish accepted decisions from source findings and proposed integration
+work; they do not claim completed live deployment acceptance.
 
 ## Read the design
 
