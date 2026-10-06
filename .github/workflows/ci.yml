@@ -29,6 +29,9 @@ jobs:
         with:
           version: '2026.8.6'
 
+      - name: Check Go formatting
+        run: pnpm check:format
+
       - name: Prepare Linux protection tests
         run: |
           sudo apt-get update
@@ -45,11 +48,11 @@ jobs:
       - name: Install plugin dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build plugin and daemon
-        run: pnpm build
-
       - name: Check TypeScript and Go
         run: pnpm check
+
+      - name: Build plugin and daemon
+        run: pnpm build
 
       - name: Check patched host TypeScript
         run: pnpm --dir .cache/paperclip/server exec tsc --noEmit
