@@ -41,6 +41,11 @@ and installation of a systemd service under the worker account. Updates are
 operator managed. Cloudflare Access is an optional connection requirement;
 Outpost does not provision Cloudflare resources or target machines.
 
+## Contributing
+
+Changes to `main` require a pull request and passing CI. See the
+[contribution workflow and required check](CONTRIBUTING.md).
+
 ## License
 
 Paperclip Outpost is licensed under the [MIT License](LICENSE).
