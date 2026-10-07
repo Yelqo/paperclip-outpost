@@ -69,6 +69,13 @@ type executionRecord struct {
 	Outcome     *processOutcome `json:"outcome,omitempty"`
 }
 
+type workspaceOwnership struct {
+	runID          string
+	operations     map[string]struct{}
+	agentOperation string
+	lock           *os.File
+}
+
 // The supervisor survives transport sessions. A durable intent is a consumed
 // operation even if a crash occurs before Start; uncertainty never authorizes it.
 type supervisor struct {
@@ -76,7 +83,7 @@ type supervisor struct {
 	dir            string
 	connection     Connection
 	records        map[string]executionRecord
-	owners         map[string]string
+	owners         map[string]*workspaceOwnership
 	activeAgents   int
 	activeControls int
 	lock           *os.File
@@ -94,7 +101,7 @@ func newSupervisor(dir string, c Connection) (*supervisor, error) {
 		lock.Close()
 		return nil, errors.New("daemon already running")
 	}
-	s := &supervisor{dir: dir, connection: c, records: map[string]executionRecord{}, owners: map[string]string{}, lock: lock}
+	s := &supervisor{dir: dir, connection: c, records: map[string]executionRecord{}, owners: map[string]*workspaceOwnership{}, lock: lock}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		lock.Close()
@@ -112,7 +119,19 @@ func newSupervisor(dir string, c Connection) (*supervisor, error) {
 		}
 		s.records[record.OperationID] = record
 		if record.Outcome == nil {
-			s.owners[record.Workspace] = record.RunID
+			owner := s.owners[record.Workspace]
+			if owner == nil {
+				owner = &workspaceOwnership{runID: record.RunID, operations: map[string]struct{}{}}
+				s.owners[record.Workspace] = owner
+			}
+			if owner.runID != record.RunID {
+				lock.Close()
+				return nil, errors.New("cannot reconcile conflicting workspace ownership")
+			}
+			owner.operations[record.OperationID] = struct{}{}
+			if record.Purpose == "agent_execution" {
+				owner.agentOperation = record.OperationID
+			}
 		}
 	}
 	return s, nil
@@ -201,19 +220,34 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 		reply(nil, err)
 		return
 	}
-	defer file.Close()
+	retained := false
+	defer func() {
+		if !retained {
+			file.Close()
+		}
+	}()
 	if op.Type == "inspect" {
 		s.mu.Lock()
 		owner := s.owners[workspace]
-		s.mu.Unlock()
-		if owner == "" {
+		ownerRunID := ""
+		if owner != nil {
+			ownerRunID = owner.runID
+		}
+		if owner == nil || owner.lock == nil {
 			if syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+				s.mu.Unlock()
 				reply(nil, &executionUnavailable{"workspace is busy"})
 				return
 			}
-			_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+			if owner != nil {
+				owner.lock = file
+				retained = true
+			} else {
+				_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+			}
 		}
-		reply(map[string]string{"cwd": file.Name(), "workspaceId": workspace, "ownerRunId": owner}, nil)
+		s.mu.Unlock()
+		reply(map[string]string{"cwd": file.Name(), "workspaceId": workspace, "ownerRunId": ownerRunID}, nil)
 		return
 	}
 	if op.WorkspaceID != workspace {
@@ -255,24 +289,35 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 		return
 	}
 	owner := s.owners[workspace]
-	if (op.Purpose == "agent_execution" && (owner != "" || s.activeAgents >= 16)) || (op.Purpose == "control" && ((owner != "" && owner != op.RunID) || s.activeControls >= 16)) {
+	if (owner != nil && owner.runID != op.RunID) ||
+		(op.Purpose == "agent_execution" && ((owner != nil && owner.agentOperation != "") || s.activeAgents >= 16)) ||
+		(op.Purpose == "control" && s.activeControls >= 16) {
 		s.mu.Unlock()
 		reply(nil, &executionUnavailable{"workspace is busy or its previous process outcome is uncertain"})
 		return
 	}
 	// A directory flock also excludes a second registration/daemon with another
 	// private directory, including a symlink or bind-mount alias of this workspace.
-	if op.Purpose == "agent_execution" && syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
-		s.mu.Unlock()
-		reply(nil, &executionUnavailable{"workspace is busy"})
-		return
+	if owner == nil || owner.lock == nil {
+		if syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+			s.mu.Unlock()
+			reply(nil, &executionUnavailable{"workspace is busy"})
+			return
+		}
+		if owner == nil {
+			owner = &workspaceOwnership{runID: op.RunID, operations: map[string]struct{}{}}
+			s.owners[workspace] = owner
+		}
+		owner.lock = file
+		retained = true
 	}
 	record := executionRecord{RunID: op.RunID, OperationID: op.OperationID, Purpose: op.Purpose, Workspace: workspace, Deadline: op.Deadline}
 
 	admitted = true
 	s.records[op.OperationID] = record
+	owner.operations[op.OperationID] = struct{}{}
 	if op.Purpose == "agent_execution" {
-		s.owners[workspace] = op.RunID
+		owner.agentOperation = op.OperationID
 	}
 	if err := s.persist(record, true); err != nil {
 		s.mu.Unlock()
@@ -365,8 +410,13 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 	record.Outcome = &outcome
 	if s.persist(record, false) == nil {
 		s.records[op.OperationID] = record
+		delete(owner.operations, op.OperationID)
 		if op.Purpose == "agent_execution" {
+			owner.agentOperation = ""
+		}
+		if len(owner.operations) == 0 {
 			delete(s.owners, workspace)
+			owner.lock.Close()
 		}
 	} else {
 		outcome.Error = "process ended but its durable outcome is uncertain"

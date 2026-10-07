@@ -9,6 +9,11 @@ export function createServerAdapter() {
       const execute=(operationId,purpose,command,timeoutMs=5000) => runner.execute({
         operationId,purpose,command:'/bin/sh',args:['-c',command],cwd:executionTarget.remoteCwd,timeoutMs,onLog,
       });
+      if(config.scenario==='control-ownership') {
+        const result=await execute(`${runId}:control`,'control',
+          'echo control-started > control; while ! test -e finish-control; do sleep .1; done; echo control-finished > finished-control',60000);
+        return {...result,resultJson:{controlSucceeded:true}};
+      }
       if(config.scenario==='ownership') {
         let started,failed;
         const running=new Promise((resolve,reject) => { started=resolve; failed=reject; });

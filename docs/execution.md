@@ -59,8 +59,11 @@ reservation. The daemon makes the authoritative admission decision and holds a
 local directory lock. Dispatch includes the inspected filesystem identity;
 replacement of the directory before launch refuses the request. The admitted
 directory is pinned when launching the protected process. Associated control
-operations can run while that agent is active. Different workspaces can execute
-concurrently. Both sides reserve separate capacities of 16 agent operations and
+operations can run while that agent is active, and controls preparing its launch
+also own the workspace. The run shares one directory lock across its admitted
+operations; a completed agent or control cannot release another operation's
+ownership. Different workspaces can execute concurrently. Both sides reserve
+separate capacities of 16 agent operations and
 16 control operations per outpost, with a separate plugin inspection capacity,
 so agents cannot occupy all control capacity.
 
@@ -101,8 +104,9 @@ Read-only workspace inspection and commands still awaiting transport dispatch
 can be deferred safely after disconnection. Once an execution request has been
 dispatched, a missing response is uncertain and does not schedule a replacement
 of the admitted run. Releasing the host lease preserves that workspace's server
-reservation until termination is known. The daemon also preserves uncertain
-ownership across restart, so conflicting pending work keeps waiting instead of
+reservation until every dispatched agent and control operation has a known
+termination. The daemon also preserves uncertain ownership across restart, so
+conflicting pending work keeps waiting instead of
 launching. Full reconciliation of uncertain operations belongs to the recovery
 milestones.
 

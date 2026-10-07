@@ -429,6 +429,49 @@ test('execution enforces the original deadline and stops descendants before rele
   } finally { await stopExecutionDaemon(daemon); }
 });
 
+test('a control before agent launch excludes conflicting work after plugin restart until it terminates', {timeout:90000}, async () => {
+  await installExecutionAdapter();
+  const daemon=await startExecutionDaemon();
+  const workspace=join(home,'workspaces','control-ownership');
+  const independent=join(home,'workspaces','control-independent');
+  mkdirSync(workspace); mkdirSync(independent);
+  const statusPath=`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`;
+  let disabled=false;
+  try {
+    const owner=await commandAgent(workspace,'',{scenario:'control-ownership'});
+    const run=await json(`/api/agents/${owner.id}/heartbeat/invoke`,{});
+    await eventually(() => existsSync(join(workspace,'control')));
+    await json('/api/plugins/yelqo.outpost/disable',{});
+    disabled=true;
+    await json('/api/plugins/yelqo.outpost/enable',{});
+    disabled=false;
+    await eventually(async () => (await json(statusPath)).connected,20000);
+    assert.equal((await terminalRun(run)).status,'failed');
+    assert.equal(existsSync(join(workspace,'finished-control')),false,'control must still be executing after transport loss');
+    const competing=await commandAgent(workspace,'echo conflicting >> launches');
+    const conflict=await json(`/api/agents/${competing.id}/heartbeat/invoke`,{});
+    const outcome=await terminalRun(conflict);
+    assert.equal(outcome.status,'cancelled',JSON.stringify(outcome));
+    assert.equal(outcome.errorCode,'execution_unavailable');
+    const retry=await scheduledRetry(conflict);
+    await json(`/api/heartbeat-runs/${retry.id}/cancel`,{});
+    assert.equal(existsSync(join(workspace,'launches')),false);
+    const parallel=await commandAgent(independent,'echo independent > effect');
+    assert.equal((await terminalRun(await json(`/api/agents/${parallel.id}/heartbeat/invoke`,{}))).status,'succeeded');
+    assert.equal(readFileSync(join(independent,'effect'),'utf8'),'independent\n');
+    writeFileSync(join(workspace,'finish-control'),'');
+    await eventually(() => existsSync(join(workspace,'finished-control')));
+    const after=await json(`/api/agents/${competing.id}/heartbeat/invoke`,{});
+    assert.equal((await terminalRun(after)).status,'succeeded');
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'conflicting\n');
+  } finally {
+    writeFileSync(join(workspace,'finish-control'),'');
+    if(disabled) await json('/api/plugins/yelqo.outpost/enable',{});
+    await stopExecutionDaemon(daemon);
+    await removeExecutionAdapter();
+  }
+});
+
 test('execution stops at its output limit and retains the workspace',async () => {
   const daemon=await startExecutionDaemon();
   const workspace=join(home,'workspaces','output-limit');

@@ -56,7 +56,7 @@ function readOutcome(value:unknown):Outcome {
 export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:string,outpostId:string) => boolean) {
   const pending = new Map<string,Pending>();
   const queues = new Map<string,Array<OperationRequest & {requestId:string}>>();
-  type Lease = {runId:string;outpostKey:string;workspaceId?:string;workspaceKey?:string;uncertain:boolean;executedAgent:boolean};
+  type Lease = {runId:string;outpostKey:string;workspaceId?:string;workspaceKey?:string;operations:Map<string,Identity["purpose"]>;released:boolean;executedAgent:boolean};
   const leases = new Map<string,Lease>();
   const owners = new Map<string,string>();
   const key = (companyId:string,outpostId:string) => `${companyId}:${outpostId}`;
@@ -120,7 +120,7 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
     if (!input.runId) throw new Error("An explicit run is required");
     if (!["process","pi_local"].includes(input.adapterType ?? "")) throw new Error("This Outpost release supports process and pi_local adapters");
     const providerLeaseId=randomUUID();
-    leases.set(providerLeaseId,{runId:input.runId,outpostKey:key(input.companyId,id),uncertain:false,executedAgent:false});
+    leases.set(providerLeaseId,{runId:input.runId,outpostKey:key(input.companyId,id),operations:new Map(),released:false,executedAgent:false});
     return {providerLeaseId};
   };
   const leaseFor = (input:PluginEnvironmentRealizeWorkspaceParams | PluginEnvironmentExecuteParams) => {
@@ -128,11 +128,15 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
     if(!lease || lease.outpostKey!==key(input.companyId,outpost(input))) throw new Error("Unknown Outpost run lease");
     return lease;
   };
+  const releaseOwnership = (lease:Lease) => {
+    if(lease.released && lease.operations.size===0 && lease.workspaceKey && owners.get(lease.workspaceKey)===lease.runId) owners.delete(lease.workspaceKey);
+  };
   const release = async (input:PluginEnvironmentReleaseLeaseParams) => {
     const id=input.providerLeaseId ?? "";
     const lease=leases.get(id);
     if(!lease || lease.outpostKey!==key(input.companyId,outpost(input))) return;
-    if(!lease.uncertain && lease.workspaceKey && owners.get(lease.workspaceKey)===lease.runId) owners.delete(lease.workspaceKey);
+    lease.released=true;
+    releaseOwnership(lease);
     leases.delete(id);
   };
   const realize = async (input:PluginEnvironmentRealizeWorkspaceParams) => {
@@ -157,7 +161,12 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
     const decoders={stdout:new StringDecoder("utf8"),stderr:new StringDecoder("utf8")};
     const log=AsyncLocalStorage.bind((stream:"stdout"|"stderr",chunk:string) => ctx.execution.log(stream,chunk));
     const agentExecution=input.purpose==="agent_execution";
-    if(agentExecution && lease.uncertain) throw new Error("The run's previous agent operation still owns the workspace");
+    const operationId=input.operationId;
+    if(lease.operations.has(operationId)) throw new Error("The run's previous operation still owns the workspace");
+    if(agentExecution && [...lease.operations.values()].includes("agent_execution")) throw new Error("The run's previous agent operation still owns the workspace");
+    lease.operations.set(operationId,input.purpose);
+    const settle = () => { lease.operations.delete(operationId); releaseOwnership(lease); };
+    let sent=false;
     let result:Outcome;
     try { result = await dispatch(input.companyId,outpost(input),{
       type:"execute",runId:input.runId,operationId:input.operationId,purpose:input.purpose,
@@ -169,15 +178,16 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
       if(frame.stream==="stdout") stdout+=chunk; else stderr+=chunk;
       if(Buffer.byteLength(stdout)+Buffer.byteLength(stderr)>1048576) throw new Error("Outpost output limit exceeded");
       log(frame.stream,chunk);
-    },() => { if(agentExecution) lease.uncertain=true; }); } catch(error) {
-      if(agentExecution && error instanceof Error && "beforeLaunch" in error && error.beforeLaunch===true) lease.uncertain=false;
+    },() => { sent=true; }); } catch(error) {
+      if(!sent || (error instanceof Error && "beforeLaunch" in error && error.beforeLaunch===true)) settle();
       if(error instanceof Error && "code" in error && error.code===PLUGIN_RPC_ERROR_CODES.EXECUTION_UNAVAILABLE) {
-        if(agentExecution) lease.uncertain=false;
+        settle();
         if(!agentExecution || lease.executedAgent) throw new Error(error.message);
       }
       throw error;
     }
-    if(agentExecution) { lease.executedAgent=true; lease.uncertain=result.ownershipUncertain===true; }
+    if(agentExecution) lease.executedAgent=true;
+    if(result.ownershipUncertain!==true) settle();
     for (const stream of ["stdout","stderr"] as const) {
       const chunk=decoders[stream].end();
       if(stream==="stdout") stdout+=chunk; else stderr+=chunk;
