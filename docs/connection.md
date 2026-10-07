@@ -140,7 +140,9 @@ cleanup calls. A worker that never replies requires an operator restart to
 recover its capacity. A closed connection is checked before worker dispatch.
 Core limits inbound frames to 16 KiB, pending frames to 16 per connection, one
 serialized message request per connection with a five-second timeout, replies
-to four frames, and buffered outbound data to 64 KiB. Compression is disabled.
+to four frames of at most 64 KiB each, and buffered outbound data to 64 KiB.
+The plugin admits commands of at most 60,000 serialized bytes so its transport
+envelope fits that outbound limit. Compression is disabled.
 Core pings, closes sockets,
 cleans up after worker loss and server shutdown, and delivers close events.
 The plugin uses scoped Effects only for its own connection-to-outpost

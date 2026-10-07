@@ -22,7 +22,8 @@ See [setup, operator commands and protection boundaries](docs/connection.md).
 See [command execution and supervision](docs/execution.md).
 The required Paperclip host/SDK extension is carried as a reproducible patch
 against a pinned upstream commit. [Pi integration](docs/pi.md) uses machine-owned
-runtime assets and scoped callbacks. Release/service installation remains a
+runtime assets, scoped callbacks and human approval continuation with session
+reuse. Release/service installation remains a
 subsequent milestone.
 
 The design was reconstructed with the operator on 2026-10-06. Its documents
