@@ -51,7 +51,7 @@ before(async () => {
       PORT: String(port), HOST: '127.0.0.1', PAPERCLIP_DEPLOYMENT_MODE: 'authenticated',
       PAPERCLIP_DEPLOYMENT_EXPOSURE: 'private', PAPERCLIP_AUTH_PUBLIC_BASE_URL: origin,
       BETTER_AUTH_SECRET: 'isolated-fixture-secret-with-at-least-32-characters',
-      SERVE_UI: 'false', HEARTBEAT_SCHEDULER_ENABLED: 'false',
+      SERVE_UI: 'false', HEARTBEAT_SCHEDULER_ENABLED: 'true', HEARTBEAT_SCHEDULER_INTERVAL_MS: '10000',
       PAPERCLIP_DB_BACKUP_ENABLED: 'false', PAPERCLIP_MIGRATION_AUTO_APPLY: 'true',
       PAPERCLIP_MIGRATION_PROMPT: 'never', PAPERCLIP_TELEMETRY_DISABLED: '1',
       PAPERCLIP_ANNOUNCEMENTS_ENABLED: 'false', NODE_ENV: 'production',
@@ -284,6 +284,41 @@ async function terminalRun(run) {
   return outcome;
 }
 
+async function scheduledRetry(run) {
+  let retry;
+  await eventually(async () => {
+    const runs=await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${run.agentId}`);
+    retry=runs.find(value => value.retryOfRunId===run.id);
+    return retry?.status==='scheduled_retry';
+  });
+  return json(`/api/heartbeat-runs/${retry.id}`);
+}
+
+test('offline work stays pending in Paperclip and the scheduler launches it after reconnection', {timeout:60000}, async () => {
+  const workspace=join(home,'workspaces','offline'); mkdirSync(workspace);
+  const agent=await commandAgent(workspace,'echo once >> launches');
+  const task=await json(`/api/companies/${company.id}/issues`,{title:'Pending offline task',status:'backlog',assigneeAgentId:agent.id});
+  const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{payload:{issueId:task.id}});
+  const outcome=await terminalRun(run);
+  assert.equal(outcome.status,'cancelled',JSON.stringify(outcome));
+  assert.equal(outcome.errorCode,'execution_unavailable');
+  const retry=await scheduledRetry(run);
+  assert.equal(retry.scheduledRetryReason,'execution_unavailable');
+  assert.equal(retry.contextSnapshot.issueId,task.id);
+  assert.equal(retry.contextSnapshot.executionRetryAccounting.failureRetries,0);
+  assert.equal((await json(`/api/issues/${task.id}`)).scheduledRetry.runId,retry.id);
+  assert.equal(existsSync(join(workspace,'launches')),false);
+  const daemon=await startExecutionDaemon();
+  try {
+    let result;
+    await eventually(async () => {
+      result=await json(`/api/heartbeat-runs/${retry.id}`);
+      return result.status==='succeeded';
+    },45000);
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'once\n');
+  } finally { await stopExecutionDaemon(daemon); }
+});
+
 test('execution rejects a missing workspace without creating it',async () => {
   const daemon=await startExecutionDaemon();
   const missing=join(home,'workspaces','missing');
@@ -330,7 +365,7 @@ test('execution rejects a consumed operation after daemon restart without repeat
   } finally { await stopExecutionDaemon(daemon); await removeExecutionAdapter(); }
 });
 
-test('execution owns an actual workspace while associated controls and another workspace stay available',async () => {
+test('aliases of separate Paperclip workspace records defer while controls and distinct directories execute, then retry automatically', {timeout:90000}, async () => {
   await installExecutionAdapter();
   const daemon=await startExecutionDaemon();
   const workspace=join(home,'workspaces','owned');
@@ -341,7 +376,14 @@ test('execution owns an actual workspace while associated controls and another w
     const owner=await commandAgent(workspace,'',{scenario:'ownership'});
     const competing=await commandAgent(alias,'echo competing >> launches');
     const parallel=await commandAgent(separate,'echo separate > effect');
-    const run=await json(`/api/agents/${owner.id}/heartbeat/invoke`,{});
+    const project=await json(`/api/companies/${company.id}/projects`,{name:'Shared outpost directories'});
+    const task=async (agent,cwd) => {
+      const record=await json(`/api/projects/${project.id}/workspaces`,{name:agent.id,cwd});
+      return json(`/api/companies/${company.id}/issues`,{title:agent.id,status:'backlog',projectId:project.id,projectWorkspaceId:record.id,assigneeAgentId:agent.id});
+    };
+    const ownerTask=await task(owner,workspace), competingTask=await task(competing,alias), parallelTask=await task(parallel,separate);
+    const invoke=(agent,task) => json(`/api/agents/${agent.id}/heartbeat/invoke`,{payload:{issueId:task.id}});
+    const run=await invoke(owner,ownerTask);
     await eventually(async () => {
       const response=await api(`/api/heartbeat-runs/${run.id}/log`);
       if(response.status===404) return false;
@@ -350,18 +392,25 @@ test('execution owns an actual workspace while associated controls and another w
       return log.content?.includes('holding-workspace');
     });
     assert.equal((await json(`/api/heartbeat-runs/${run.id}`)).status,'running','stdout must stream before exit');
-    const conflictRun=await json(`/api/agents/${competing.id}/heartbeat/invoke`,{});
-    const parallelRun=await json(`/api/agents/${parallel.id}/heartbeat/invoke`,{});
+    await eventually(() => existsSync(join(workspace,'control')));
+    const conflictRun=await invoke(competing,competingTask);
+    const parallelRun=await invoke(parallel,parallelTask);
     const conflict=await terminalRun(conflictRun);
-    assert.equal(conflict.status,'failed',JSON.stringify(conflict));
+    assert.equal(conflict.status,'cancelled',JSON.stringify(conflict));
     assert.match(conflict.error,/busy/);
+    const retry=await scheduledRetry(conflictRun);
+    assert.equal((await json(`/api/issues/${competingTask.id}`)).scheduledRetry.runId,retry.id);
     assert.equal((await terminalRun(parallelRun)).status,'succeeded');
+    assert.equal((await json(`/api/heartbeat-runs/${run.id}`)).status,'running');
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'agent\n');
+    writeFileSync(join(workspace,'allow-finish'),'');
     const outcome=await terminalRun(run);
     assert.equal(outcome.status,'succeeded',JSON.stringify(outcome));
     assert.equal(outcome.resultJson.controlSucceeded,true);
-    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'agent\n');
     assert.equal(readFileSync(join(workspace,'control'),'utf8'),'control\n');
     assert.equal(readFileSync(join(separate,'effect'),'utf8'),'separate\n');
+    await eventually(async () => (await json(`/api/heartbeat-runs/${retry.id}`)).status==='succeeded',45000);
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'agent\ncompeting\n');
   } finally { await stopExecutionDaemon(daemon); await removeExecutionAdapter(); }
 });
 
@@ -378,6 +427,49 @@ test('execution enforces the original deadline and stops descendants before rele
     const next=await commandAgent(workspace,'echo next > next');
     assert.equal((await terminalRun(await json(`/api/agents/${next.id}/heartbeat/invoke`,{}))).status,'succeeded');
   } finally { await stopExecutionDaemon(daemon); }
+});
+
+test('a control before agent launch excludes conflicting work after plugin restart until it terminates', {timeout:90000}, async () => {
+  await installExecutionAdapter();
+  const daemon=await startExecutionDaemon();
+  const workspace=join(home,'workspaces','control-ownership');
+  const independent=join(home,'workspaces','control-independent');
+  mkdirSync(workspace); mkdirSync(independent);
+  const statusPath=`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`;
+  let disabled=false;
+  try {
+    const owner=await commandAgent(workspace,'',{scenario:'control-ownership'});
+    const run=await json(`/api/agents/${owner.id}/heartbeat/invoke`,{});
+    await eventually(() => existsSync(join(workspace,'control')));
+    await json('/api/plugins/yelqo.outpost/disable',{});
+    disabled=true;
+    await json('/api/plugins/yelqo.outpost/enable',{});
+    disabled=false;
+    await eventually(async () => (await json(statusPath)).connected,20000);
+    assert.equal((await terminalRun(run)).status,'failed');
+    assert.equal(existsSync(join(workspace,'finished-control')),false,'control must still be executing after transport loss');
+    const competing=await commandAgent(workspace,'echo conflicting >> launches');
+    const conflict=await json(`/api/agents/${competing.id}/heartbeat/invoke`,{});
+    const outcome=await terminalRun(conflict);
+    assert.equal(outcome.status,'cancelled',JSON.stringify(outcome));
+    assert.equal(outcome.errorCode,'execution_unavailable');
+    const retry=await scheduledRetry(conflict);
+    await json(`/api/heartbeat-runs/${retry.id}/cancel`,{});
+    assert.equal(existsSync(join(workspace,'launches')),false);
+    const parallel=await commandAgent(independent,'echo independent > effect');
+    assert.equal((await terminalRun(await json(`/api/agents/${parallel.id}/heartbeat/invoke`,{}))).status,'succeeded');
+    assert.equal(readFileSync(join(independent,'effect'),'utf8'),'independent\n');
+    writeFileSync(join(workspace,'finish-control'),'');
+    await eventually(() => existsSync(join(workspace,'finished-control')));
+    const after=await json(`/api/agents/${competing.id}/heartbeat/invoke`,{});
+    assert.equal((await terminalRun(after)).status,'succeeded');
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'conflicting\n');
+  } finally {
+    writeFileSync(join(workspace,'finish-control'),'');
+    if(disabled) await json('/api/plugins/yelqo.outpost/enable',{});
+    await stopExecutionDaemon(daemon);
+    await removeExecutionAdapter();
+  }
 });
 
 test('execution stops at its output limit and retains the workspace',async () => {
@@ -407,7 +499,7 @@ test('execution refuses to launch when durable intent cannot be written',async (
   } finally { chmodSync(privateDir,0o700); await stopExecutionDaemon(daemon); }
 });
 
-test('execution keeps a crashed operation consumed and its conflicting workspace blocked',async () => {
+test('execution keeps a crashed operation consumed and scheduler retries cannot free its uncertain workspace', {timeout:90000}, async () => {
   let daemon=await startExecutionDaemon();
   const workspace=join(home,'workspaces','uncertain');
   mkdirSync(workspace);
@@ -423,9 +515,19 @@ test('execution keeps a crashed operation consumed and its conflicting workspace
     await terminalRun(run);
     daemon=await startExecutionDaemon();
     const second=await commandAgent(workspace,'echo duplicate >> launches');
-    const outcome=await terminalRun(await json(`/api/agents/${second.id}/heartbeat/invoke`,{}));
-    assert.equal(outcome.status,'failed',JSON.stringify(outcome));
+    const conflict=await json(`/api/agents/${second.id}/heartbeat/invoke`,{});
+    const outcome=await terminalRun(conflict);
+    assert.equal(outcome.status,'cancelled',JSON.stringify(outcome));
     assert.match(outcome.error,/uncertain/);
+    const retry=await scheduledRetry(conflict);
+    let retried;
+    await eventually(async () => {
+      retried=await json(`/api/heartbeat-runs/${retry.id}`);
+      return retried.status==='cancelled';
+    },45000);
+    assert.match(retried.error,/uncertain/);
+    const pending=await scheduledRetry(retried);
+    await json(`/api/heartbeat-runs/${pending.id}/cancel`,{});
     assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'effect\n');
   } finally { await stopExecutionDaemon(daemon); }
 });

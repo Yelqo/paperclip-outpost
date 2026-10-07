@@ -9,20 +9,25 @@ export function createServerAdapter() {
       const execute=(operationId,purpose,command,timeoutMs=5000) => runner.execute({
         operationId,purpose,command:'/bin/sh',args:['-c',command],cwd:executionTarget.remoteCwd,timeoutMs,onLog,
       });
+      if(config.scenario==='control-ownership') {
+        const result=await execute(`${runId}:control`,'control',
+          'echo control-started > control; while ! test -e finish-control; do sleep .1; done; echo control-finished > finished-control',60000);
+        return {...result,resultJson:{controlSucceeded:true}};
+      }
       if(config.scenario==='ownership') {
-        let started;
-        const running=new Promise(resolve => { started=resolve; });
+        let started,failed;
+        const running=new Promise((resolve,reject) => { started=resolve; failed=reject; });
         const agent=runner.execute({
           operationId:`${runId}:agent`,purpose:'agent_execution',command:'/bin/sh',
           args:['-c','echo holding-workspace; echo agent >> launches; while ! test -e finish; do sleep .1; done'],
-          cwd:executionTarget.remoteCwd,timeoutMs:8000,
+          cwd:executionTarget.remoteCwd,timeoutMs:30000,
           onLog:async (stream,chunk) => { await onLog(stream,chunk); if(chunk.includes('holding-workspace')) started(); },
         });
+        // Observe launch errors immediately while waiting for streaming output.
+        agent.catch(failed);
         await running;
-        await new Promise(resolve => setTimeout(resolve,2000));
-        const control=await execute(`${runId}:control`,'control','echo control > control; touch finish');
+        const [result,control]=await Promise.all([agent,execute(`${runId}:control`,'control','echo control > control; while ! test -e allow-finish; do sleep .1; done; touch finish',30000)]);
         if(control.exitCode!==0) throw new Error('Associated control failed');
-        const result=await agent;
         return {...result,resultJson:{controlSucceeded:true}};
       }
       const result=config.scenario==='replay'

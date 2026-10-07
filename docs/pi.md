@@ -13,8 +13,8 @@ runtime assets and workspace before dispatch.
 | Component | Supported version |
 | --- | --- |
 | Paperclip host and Pi adapter | `f858207161ba29c01c82f4674aef83d91b74480f` with `upstream/plugin-transport.patch` |
-| Plugin SDK / Outpost transport | `1.0.0+outpost.3` / `3` |
-| Outpost plugin and daemon | `0.3.0` |
+| Plugin SDK / Outpost transport | `1.0.0+outpost.4` / `4` |
+| Outpost plugin and daemon | `0.4.0` |
 | Pi | `1.0.3` (`@earendil-works/pi-coding-agent`) |
 | pi-config | `8f3a5726a254909a3100d8f719febc868237cd27` with `upstream/pi-config.patch` |
 | Worker Node / pi-config pnpm | `22.22.1` / `11.9.0` |

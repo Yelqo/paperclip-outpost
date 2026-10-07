@@ -52,13 +52,20 @@ crash occurs between its durable intent and process start. Redelivery is
 rejected even after daemon restart. A persistence failure prevents launch.
 There is no execution queue on the daemon.
 
-One active agent run owns the actual workspace directory, identified by its
-filesystem device/inode and held with a local directory lock. Symlink aliases
-do not create new slots. The admitted directory is pinned across path changes
-when launching the protected process. Associated control operations can run
-while that agent is active. Different workspaces can execute concurrently.
-The daemon reserves separate capacities of 16 agent operations and 16 control
-operations, so agents cannot occupy all control capacity.
+The plugin asks the daemon for the actual workspace's filesystem device/inode
+and its current owner, then reserves that identity for the run on the selected
+outpost. Separate Paperclip workspace records and symlink aliases share that
+reservation. The daemon makes the authoritative admission decision and holds a
+local directory lock. Dispatch includes the inspected filesystem identity;
+replacement of the directory before launch refuses the request. The admitted
+directory is pinned when launching the protected process. Associated control
+operations can run while that agent is active, and controls preparing its launch
+also own the workspace. The run shares one directory lock across its admitted
+operations; a completed agent or control cannot release another operation's
+ownership. Different workspaces can execute concurrently. Both sides reserve
+separate capacities of 16 agent operations and
+16 control operations per outpost, with a separate plugin inspection capacity,
+so agents cannot occupy all control capacity.
 
 Each operation receives an absolute deadline at dispatch, retains it throughout
 execution, and cannot gain a new deadline by replay. A positive adapter timeout
@@ -74,6 +81,46 @@ conflicting dispatch remains blocked. Preserve the private history; deleting
 it discards replay protection. Automatic interruption reconciliation, buffered
 output recovery, cancellation receipts and operator reconciliation belong to
 the recovery milestones. This release fails uncertain operations closed.
+
+On startup, the daemon locates uncertain workspace identities under its worker
+root and reacquires their directory locks before opening its transport. This
+preserves exclusion across other daemon registrations and directory renames,
+using the existing execution history format. Startup refuses to proceed if a
+recorded directory cannot be found or locked. Recovering uncertainty may require
+scanning the worker root; ordinary startup with only terminal records does not.
+
+## Pending unavailable work
+
+An offline outpost, a busy workspace or occupied admission capacity produces an
+explicit before-launch refusal. Paperclip cancels that attempt with
+`execution_unavailable` and stores a new `scheduled_retry` run and wakeup request
+using its existing scheduler. The pending task context and issue execution
+ownership transfer to the retry. The scheduler retries after 15 seconds while
+the agent and task remain eligible; resource waits do not spend the execution
+failure retry budget. The public task includes its `scheduledRetry` receipt.
+There is no daemon queue and no launch call held until the outpost becomes free.
+
+Workspace realization performs server admission using the daemon's directory
+identity instead of Paperclip's project workspace record identity. Daemon
+admission rechecks that identity and local ownership before durable launch
+intent, including contention with another daemon registration. Control
+operations keep their own admission capacity and use their admitted run's
+workspace reservation.
+
+Before-launch control refusals, including Pi's command availability check, use
+the same deferral lane when no agent has executed and no other operation remains
+outstanding. Refusals during or after agent execution, or while another operation
+has an uncertain outcome, do not authorize a replacement run.
+
+Read-only workspace inspection and commands still awaiting transport dispatch
+can be deferred safely after disconnection. Once an execution request has been
+dispatched, a missing response is uncertain and does not schedule a replacement
+of the admitted run. Releasing the host lease preserves that workspace's server
+reservation until every dispatched agent and control operation has a known
+termination. The daemon also preserves uncertain ownership across restart, so
+conflicting pending work keeps waiting instead of
+launching. Full reconciliation of uncertain operations belongs to the recovery
+milestones.
 
 ## Acceptance
 
