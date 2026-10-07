@@ -51,6 +51,11 @@ jobs:
       - name: Install plugin dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Prepare pinned Pi and pi-config
+        env:
+          OUTPOST_PI_CONFIG_READ_TOKEN: ${{ secrets.PI_CONFIG_READ_TOKEN }}
+        run: pnpm prepare:pi
+
       - name: Check TypeScript and Go
         run: pnpm check
 

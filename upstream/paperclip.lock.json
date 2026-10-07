@@ -1,8 +1,8 @@
 {
   "repository": "https://github.com/paperclipai/paperclip.git",
   "commit": "f858207161ba29c01c82f4674aef83d91b74480f",
-  "sdk": "1.0.0+outpost.2",
+  "sdk": "1.0.0+outpost.3",
   "shared": "0.3.1",
-  "transport": 2,
+  "transport": 3,
   "patch": "plugin-transport.patch"
 }

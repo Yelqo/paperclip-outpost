@@ -21,17 +21,29 @@ import (
 const maxOutputBytes = 1024 * 1024
 
 type operation struct {
-	Type        string            `json:"type"`
-	RequestID   string            `json:"requestId"`
-	RunID       string            `json:"runId"`
-	OperationID string            `json:"operationId"`
-	Purpose     string            `json:"purpose"`
-	Cwd         string            `json:"cwd"`
-	Command     string            `json:"command"`
-	Args        []string          `json:"args"`
-	Env         map[string]string `json:"env"`
-	Stdin       string            `json:"stdin"`
-	Deadline    string            `json:"deadline"`
+	Type              string             `json:"type"`
+	RequestID         string             `json:"requestId"`
+	RunID             string             `json:"runId"`
+	OperationID       string             `json:"operationId"`
+	Purpose           string             `json:"purpose"`
+	Cwd               string             `json:"cwd"`
+	Command           string             `json:"command"`
+	Args              []string           `json:"args"`
+	Env               map[string]string  `json:"env"`
+	Stdin             string             `json:"stdin"`
+	Deadline          string             `json:"deadline"`
+	CallbackTransport *callbackTransport `json:"callbackTransport,omitempty"`
+}
+
+type callbackTransport struct {
+	Instance  string `json:"instance"`
+	CompanyID string `json:"companyId"`
+	AgentID   string `json:"agentId"`
+	TaskID    string `json:"taskId"`
+	RunID     string `json:"runId"`
+	QueueDir  string `json:"queueDir"`
+	Token     string `json:"token"`
+	ExpiresAt string `json:"expiresAt"`
 }
 
 type processOutcome struct {
@@ -186,6 +198,29 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 		reply(nil, errors.New("explicit execution identity, purpose and bounded deadline are required"))
 		return
 	}
+	var descriptorPath string
+	if op.CallbackTransport != nil {
+		transport := op.CallbackTransport
+		expires, expiryErr := time.Parse(time.RFC3339Nano, transport.ExpiresAt)
+		if op.Purpose != "agent_execution" || transport.Instance != s.connection.Instance || transport.CompanyID != s.connection.CompanyID || transport.RunID != op.RunID || transport.AgentID == "" || transport.TaskID == "" || transport.Token == "" || expiryErr != nil || !expires.After(time.Now()) || expires.After(deadline.Add(time.Second)) || !containsPath(op.Cwd, transport.QueueDir) {
+			reply(nil, errors.New("callback transport scope does not match the registered instance and run"))
+			return
+		}
+		file, createErr := os.CreateTemp(s.dir, "transport-")
+		if createErr != nil {
+			reply(nil, errors.New("cannot create private run transport"))
+			return
+		}
+		descriptorPath = file.Name()
+		defer os.Remove(descriptorPath)
+		writeErr := json.NewEncoder(file).Encode(transport)
+		closeErr := file.Close()
+		if writeErr != nil || closeErr != nil {
+			reply(nil, errors.New("cannot write private run transport"))
+			return
+		}
+	}
+
 	s.mu.Lock()
 	if _, seen := s.records[op.OperationID]; seen {
 		s.mu.Unlock()
@@ -235,13 +270,22 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 	args := protectionArgs(s.dir, s.connection, op.Cwd)
 	// Pin the actual directory at admission across path renames/replacements.
 	args = append(args[:len(args)-1], "--bind", "/proc/self/fd/3", op.Cwd, "--")
+	if descriptorPath != "" {
+		args = append(args[:len(args)-1], "--ro-bind", descriptorPath, descriptorPath, "--")
+	}
 	cmd := exec.CommandContext(processCtx, "bwrap", append(args, append([]string{op.Command}, op.Args...)...)...)
 	cmd.ExtraFiles = []*os.File{file}
 	cmd.Env = workerEnv(s.connection)
 	for name, value := range op.Env {
+		if name == "PI_APPROVAL_TRANSPORT" {
+			continue
+		}
 		if !strings.ContainsAny(name, "=\x00") && !strings.ContainsRune(value, 0) {
 			cmd.Env = append(cmd.Env, name+"="+value)
 		}
+	}
+	if descriptorPath != "" {
+		cmd.Env = append(cmd.Env, "PI_APPROVAL_TRANSPORT="+descriptorPath)
 	}
 	cmd.Stdin = strings.NewReader(op.Stdin)
 	var outputMu sync.Mutex

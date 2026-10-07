@@ -32,8 +32,8 @@ Dispatch through Paperclip's existing task scheduling or the operator API
 `GET /api/heartbeat-runs/RUN_ID/log`. Both stdout and stderr stream before
 the command finishes; exit code, signal and deadline expiration feed the
 normal Paperclip run result. Runtime-specific interpretation stays in the
-Paperclip adapter. Remote connection-instruction files and Pi runtime assets
-are not supported by this bounded-command milestone.
+Paperclip adapter. See [Pi execution](pi.md) for machine-owned runtime assets
+and scoped task callbacks. Remote connection-instruction files remain unsupported.
 
 ## Admission and process supervision
 

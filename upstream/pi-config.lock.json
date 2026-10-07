@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/Yelqo/pi-config.git",
+  "commit": "8f3a5726a254909a3100d8f719febc868237cd27",
+  "pi": "1.0.3",
+  "node": "22.22.1",
+  "pnpm": "11.9.0",
+  "patch": "pi-config.patch"
+}

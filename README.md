@@ -21,8 +21,9 @@ implemented in the Go CLI/daemon and TypeScript/Effect plugin.
 See [setup, operator commands and protection boundaries](docs/connection.md).
 See [command execution and supervision](docs/execution.md).
 The required Paperclip host/SDK extension is carried as a reproducible patch
-against a pinned upstream commit. Pi runtime integration, callbacks and
-release/service installation remain subsequent milestones.
+against a pinned upstream commit. [Pi integration](docs/pi.md) uses machine-owned
+runtime assets and scoped callbacks. Release/service installation remains a
+subsequent milestone.
 
 The design was reconstructed with the operator on 2026-10-06. Its documents
 distinguish accepted decisions from source findings and proposed integration
