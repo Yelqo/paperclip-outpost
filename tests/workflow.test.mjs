@@ -1,7 +1,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, mkdirSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
+import { mkdtempSync, readFileSync, mkdirSync, writeFileSync, existsSync, chmodSync, symlinkSync, copyFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -119,6 +119,238 @@ test('the Go daemon connects outbound and the operator observes its authenticate
   await eventually(async () => !(await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).connected);
 });
 
+test('execution runs a bounded command through the selected outpost and preserves its workspace', async () => {
+  const workspace = join(home, 'workspaces', 'existing');
+  mkdirSync(workspace);
+  execFileSync('git', ['init', workspace], {stdio:'ignore'});
+  execFileSync('git', ['-C',workspace,'-c','user.name=Fixture','-c','user.email=fixture@outpost.test','commit','--allow-empty','-m','Machine history'], {stdio:'ignore'});
+  const history = execFileSync('git',['-C',workspace,'rev-parse','HEAD'],{encoding:'utf8'});
+  const daemon = spawn(join(root,'bin/outpost'),['daemon','--private-dir',privateDir],{stdio:['ignore','pipe','pipe']});
+  processes.push(daemon);
+  await eventually(async () => (await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).connected);
+  try {
+    const agent = await json(`/api/companies/${company.id}/agents`, {
+      name:'Bounded execution', role:'engineer', adapterType:'process', defaultEnvironmentId:registered.environmentId,
+      adapterConfig:{command:'/bin/sh',args:['-c','echo launched >> launches; echo machine-output; echo machine-error >&2'],cwd:workspace,timeoutSec:5},
+    });
+    for (let attempt=0;attempt<2;attempt++) {
+      const run = await json(`/api/agents/${agent.id}/heartbeat/invoke`,{});
+      let outcome;
+      await eventually(async () => {
+        outcome = await json(`/api/heartbeat-runs/${run.id}`);
+        return !['queued','running'].includes(outcome.status);
+      });
+      assert.equal(outcome.status,'succeeded',JSON.stringify(outcome));
+      assert.equal(outcome.exitCode,0);
+      const log = await json(`/api/heartbeat-runs/${run.id}/log`);
+      assert.match(log.content,/machine-output/);
+      assert.match(log.content,/machine-error/);
+    }
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'launched\nlaunched\n');
+    assert.equal(execFileSync('git',['-C',workspace,'rev-parse','HEAD'],{encoding:'utf8'}),history);
+  } finally {
+    daemon.kill('SIGTERM');
+    await eventually(async () => !(await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).connected);
+  }
+});
+
+async function startExecutionDaemon() {
+  const daemon=spawn(join(root,'bin/outpost'),['daemon','--private-dir',privateDir],{stdio:['ignore','pipe','pipe']});
+  processes.push(daemon);
+  let output=''; daemon.stdout.on('data',data => {output+=data;}); daemon.stderr.on('data',data => {output+=data;});
+  await eventually(async () => {
+    assert.equal(daemon.exitCode,null,output);
+    return (await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).connected;
+  });
+  return daemon;
+}
+async function stopExecutionDaemon(daemon) {
+  daemon.kill('SIGTERM');
+  await eventually(async () => !(await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).connected);
+}
+async function commandAgent(cwd,args,extra={}) {
+  return json(`/api/companies/${company.id}/agents`,{
+    name:'Execution fixture',role:'engineer',adapterType:'process',defaultEnvironmentId:registered.environmentId,
+    adapterConfig:{command:'/bin/sh',args:['-c',args],cwd,timeoutSec:5,...extra},
+  });
+}
+async function terminalRun(run) {
+  let outcome;
+  await eventually(async () => {
+    outcome=await json(`/api/heartbeat-runs/${run.id}`);
+    return !['queued','running'].includes(outcome.status);
+  });
+  return outcome;
+}
+
+test('execution rejects a missing workspace without creating it',async () => {
+  const daemon=await startExecutionDaemon();
+  const missing=join(home,'workspaces','missing');
+  try {
+    const agent=await commandAgent(missing,'echo should-never-launch');
+    const outcome=await terminalRun(await json(`/api/agents/${agent.id}/heartbeat/invoke`,{}));
+    assert.equal(outcome.status,'failed');
+    assert.match(outcome.error,/existing absolute directory/);
+    assert.equal(existsSync(missing),false);
+  } finally { await stopExecutionDaemon(daemon); }
+});
+
+async function installExecutionAdapter() {
+  const fixture=join(home,'execution-adapter');
+  mkdirSync(fixture,{recursive:true});
+  writeFileSync(join(fixture,'package.json'),JSON.stringify({name:'@yelqo/acceptance-execution-adapter',version:'1.0.0',type:'module',main:'index.mjs'}));
+  copyFileSync(join(root,'tests/fixtures/execution-adapter.mjs'),join(fixture,'index.mjs'));
+  await json('/api/adapters/install',{packageName:fixture,isLocalPath:true});
+  await json('/api/adapters/process/override',{paused:false},cookie,'PATCH');
+}
+async function removeExecutionAdapter() {
+  // The pinned host retains process overrides on uninstall; pause it through
+  // the public API first so following tests use the built-in process adapter.
+  await json('/api/adapters/process/override',{paused:true},cookie,'PATCH');
+  const response=await api('/api/adapters/process',undefined,cookie,'DELETE');
+  assert.ok(response.ok,await response.text());
+}
+
+test('execution rejects a consumed operation after daemon restart without repeating its effect',async () => {
+  await installExecutionAdapter();
+  let daemon=await startExecutionDaemon();
+  const workspace=join(home,'workspaces','replay');
+  mkdirSync(workspace);
+  try {
+    const agent=await commandAgent(workspace,'',{scenario:'replay'});
+    const first=await terminalRun(await json(`/api/agents/${agent.id}/heartbeat/invoke`,{}));
+    assert.equal(first.status,'succeeded',JSON.stringify(first));
+    await stopExecutionDaemon(daemon);
+    daemon=await startExecutionDaemon();
+    const second=await terminalRun(await json(`/api/agents/${agent.id}/heartbeat/invoke`,{}));
+    assert.equal(second.status,'failed',JSON.stringify(second));
+    assert.match(second.error,/already admitted/);
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'effect\n');
+  } finally { await stopExecutionDaemon(daemon); await removeExecutionAdapter(); }
+});
+
+test('execution owns an actual workspace while associated controls and another workspace stay available',async () => {
+  await installExecutionAdapter();
+  const daemon=await startExecutionDaemon();
+  const workspace=join(home,'workspaces','owned');
+  const alias=join(home,'workspaces','owned-alias');
+  const separate=join(home,'workspaces','separate');
+  mkdirSync(workspace); mkdirSync(separate); symlinkSync(workspace,alias);
+  try {
+    const owner=await commandAgent(workspace,'',{scenario:'ownership'});
+    const competing=await commandAgent(alias,'echo competing >> launches');
+    const parallel=await commandAgent(separate,'echo separate > effect');
+    const run=await json(`/api/agents/${owner.id}/heartbeat/invoke`,{});
+    await eventually(async () => {
+      const response=await api(`/api/heartbeat-runs/${run.id}/log`);
+      if(response.status===404) return false;
+      assert.ok(response.ok);
+      const log=await response.json();
+      return log.content?.includes('holding-workspace');
+    });
+    assert.equal((await json(`/api/heartbeat-runs/${run.id}`)).status,'running','stdout must stream before exit');
+    const conflictRun=await json(`/api/agents/${competing.id}/heartbeat/invoke`,{});
+    const parallelRun=await json(`/api/agents/${parallel.id}/heartbeat/invoke`,{});
+    const conflict=await terminalRun(conflictRun);
+    assert.equal(conflict.status,'failed',JSON.stringify(conflict));
+    assert.match(conflict.error,/busy/);
+    assert.equal((await terminalRun(parallelRun)).status,'succeeded');
+    const outcome=await terminalRun(run);
+    assert.equal(outcome.status,'succeeded',JSON.stringify(outcome));
+    assert.equal(outcome.resultJson.controlSucceeded,true);
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'agent\n');
+    assert.equal(readFileSync(join(workspace,'control'),'utf8'),'control\n');
+    assert.equal(readFileSync(join(separate,'effect'),'utf8'),'separate\n');
+  } finally { await stopExecutionDaemon(daemon); await removeExecutionAdapter(); }
+});
+
+test('execution enforces the original deadline and stops descendants before releasing the workspace',async () => {
+  const daemon=await startExecutionDaemon();
+  const workspace=join(home,'workspaces','deadline');
+  mkdirSync(workspace);
+  try {
+    const agent=await commandAgent(workspace,'echo launch > launches; sleep 3; echo late > late',{timeoutSec:1});
+    const outcome=await terminalRun(await json(`/api/agents/${agent.id}/heartbeat/invoke`,{}));
+    assert.equal(outcome.status,'timed_out',JSON.stringify(outcome));
+    await delay(3100);
+    assert.equal(existsSync(join(workspace,'late')),false);
+    const next=await commandAgent(workspace,'echo next > next');
+    assert.equal((await terminalRun(await json(`/api/agents/${next.id}/heartbeat/invoke`,{}))).status,'succeeded');
+  } finally { await stopExecutionDaemon(daemon); }
+});
+
+test('execution stops at its output limit and retains the workspace',async () => {
+  const daemon=await startExecutionDaemon();
+  const workspace=join(home,'workspaces','output-limit');
+  mkdirSync(workspace);
+  try {
+    const agent=await commandAgent(workspace,'echo launch > launches; yes output');
+    const outcome=await terminalRun(await json(`/api/agents/${agent.id}/heartbeat/invoke`,{}));
+    assert.equal(outcome.status,'failed',JSON.stringify(outcome));
+    assert.match(outcome.error,/output limit/);
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'launch\n');
+  } finally { await stopExecutionDaemon(daemon); }
+});
+
+test('execution refuses to launch when durable intent cannot be written',async () => {
+  const daemon=await startExecutionDaemon();
+  const workspace=join(home,'workspaces','intent-failure');
+  mkdirSync(workspace);
+  try {
+    const agent=await commandAgent(workspace,'echo forbidden > effect');
+    chmodSync(privateDir,0o500);
+    const outcome=await terminalRun(await json(`/api/agents/${agent.id}/heartbeat/invoke`,{}));
+    assert.equal(outcome.status,'failed',JSON.stringify(outcome));
+    assert.match(outcome.error,/persist launch intent/);
+    assert.equal(existsSync(join(workspace,'effect')),false);
+  } finally { chmodSync(privateDir,0o700); await stopExecutionDaemon(daemon); }
+});
+
+test('execution keeps a crashed operation consumed and its conflicting workspace blocked',async () => {
+  let daemon=await startExecutionDaemon();
+  const workspace=join(home,'workspaces','uncertain');
+  mkdirSync(workspace);
+  try {
+    const first=await commandAgent(workspace,'echo effect >> launches; echo before-crash; sleep 30');
+    const run=await json(`/api/agents/${first.id}/heartbeat/invoke`,{});
+    await eventually(async () => {
+      const response=await api(`/api/heartbeat-runs/${run.id}/log`);
+      return response.ok && (await response.json()).content.includes('before-crash');
+    });
+    daemon.kill('SIGKILL');
+    await eventually(async () => !(await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).connected);
+    await terminalRun(run);
+    daemon=await startExecutionDaemon();
+    const second=await commandAgent(workspace,'echo duplicate >> launches');
+    const outcome=await terminalRun(await json(`/api/agents/${second.id}/heartbeat/invoke`,{}));
+    assert.equal(outcome.status,'failed',JSON.stringify(outcome));
+    assert.match(outcome.error,/uncertain/);
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'effect\n');
+  } finally { await stopExecutionDaemon(daemon); }
+});
+
+test('execution uses the task project workspace and exposes its run through public task state',async () => {
+  const daemon=await startExecutionDaemon();
+  const workspace=join(home,'workspaces','project-task');
+  mkdirSync(workspace);
+  try {
+    const project=await json(`/api/companies/${company.id}/projects`,{name:'Machine-owned project'});
+    const projectWorkspace=await json(`/api/projects/${project.id}/workspaces`,{name:'Existing outpost checkout',cwd:workspace});
+    const agent=await commandAgent(join(home,'workspaces','unused-agent-default'),'echo task-effect > effect; echo task-output');
+    const task=await json(`/api/companies/${company.id}/issues`,{
+      title:'Bounded outpost task',status:'backlog',projectId:project.id,projectWorkspaceId:projectWorkspace.id,assigneeAgentId:agent.id,
+    });
+    const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{payload:{issueId:task.id}});
+    const outcome=await terminalRun(run);
+    assert.equal(outcome.status,'succeeded',JSON.stringify(outcome));
+    assert.equal(outcome.contextSnapshot.issueId,task.id);
+    const observed=await json(`/api/issues/${task.id}`);
+    assert.equal(observed.projectWorkspaceId,projectWorkspace.id);
+    assert.equal(readFileSync(join(workspace,'effect'),'utf8'),'task-effect\n');
+    assert.equal(existsSync(join(home,'workspaces','unused-agent-default')),false);
+  } finally { await stopExecutionDaemon(daemon); }
+});
+
 const connection = () => JSON.parse(readFileSync(join(privateDir,'connection.json'),'utf8'));
 function transport(c = connection(), versionOverrides = {}, route = 'transport', extraHeaders = {}) {
   const versions = {...supportedVersions,...versionOverrides};
@@ -165,7 +397,7 @@ test('machine credentials authorize only their registered company transport', as
 
 test('every supported version pin is checked before the transport accepts work', async () => {
   for (const field of ['host','sdk','plugin','daemon','protocol']) {
-    assert.equal(await rejected(transport(connection(),{[field]:field==='protocol'?2:'incompatible'})),426,field);
+    assert.equal(await rejected(transport(connection(),{[field]:field==='protocol'?supportedVersions.protocol+1:'incompatible'})),426,field);
   }
 });
 

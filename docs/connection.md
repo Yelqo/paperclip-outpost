@@ -1,9 +1,8 @@
 # Registration and authenticated connection
 
 Issue #3 implements registration, named environment selection and the outbound
-connection. Agent command execution belongs to the following execution issues.
-An assigned environment currently fails execution rather than claiming an
-unimplemented runtime is available.
+connection. Issue #4 adds [bounded process command execution](execution.md).
+Pi and other runtime adapters require their subsequent integration milestones.
 
 ## Supported development installation
 

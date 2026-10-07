@@ -114,7 +114,7 @@ func Run(args []string, input io.Reader, output io.Writer) error {
 	case "diagnose":
 		return json.NewEncoder(output).Encode(map[string]any{"instance": c.Instance, "companyId": c.CompanyID, "outpostId": c.OutpostID, "environmentId": c.EnvironmentID, "versions": supported})
 	case "connect", "daemon":
-		return connect(c, output, args[0] == "daemon")
+		return connect(*privateDir, c, output, args[0] == "daemon")
 	default:
 		return errors.New("unknown outpost command")
 	}

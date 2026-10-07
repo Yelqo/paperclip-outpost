@@ -1,0 +1,307 @@
+package outpost
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+)
+
+const maxOutputBytes = 1024 * 1024
+
+type operation struct {
+	Type        string            `json:"type"`
+	RequestID   string            `json:"requestId"`
+	RunID       string            `json:"runId"`
+	OperationID string            `json:"operationId"`
+	Purpose     string            `json:"purpose"`
+	Cwd         string            `json:"cwd"`
+	Command     string            `json:"command"`
+	Args        []string          `json:"args"`
+	Env         map[string]string `json:"env"`
+	Stdin       string            `json:"stdin"`
+	Deadline    string            `json:"deadline"`
+}
+
+type processOutcome struct {
+	ExitCode *int   `json:"exitCode"`
+	Signal   string `json:"signal,omitempty"`
+	TimedOut bool   `json:"timedOut"`
+	Error    string `json:"error,omitempty"`
+}
+
+type executionRecord struct {
+	RunID       string          `json:"runId"`
+	OperationID string          `json:"operationId"`
+	Purpose     string          `json:"purpose"`
+	Workspace   string          `json:"workspace"`
+	Deadline    string          `json:"deadline"`
+	Outcome     *processOutcome `json:"outcome,omitempty"`
+}
+
+// The supervisor survives transport sessions. A durable intent is a consumed
+// operation even if a crash occurs before Start; uncertainty never authorizes it.
+type supervisor struct {
+	mu             sync.Mutex
+	dir            string
+	connection     Connection
+	records        map[string]executionRecord
+	owners         map[string]string
+	activeAgents   int
+	activeControls int
+	lock           *os.File
+}
+
+func newSupervisor(dir string, c Connection) (*supervisor, error) {
+	if os.Geteuid() == 0 {
+		return nil, errors.New("daemon requires an unprivileged worker account")
+	}
+	lock, err := os.OpenFile(filepath.Join(dir, "daemon.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, errors.New("cannot open daemon lock")
+	}
+	if syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+		lock.Close()
+		return nil, errors.New("daemon already running")
+	}
+	s := &supervisor{dir: dir, connection: c, records: map[string]executionRecord{}, owners: map[string]string{}, lock: lock}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		lock.Close()
+		return nil, err
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "operation-") {
+			continue
+		}
+		data, readErr := os.ReadFile(filepath.Join(dir, entry.Name()))
+		var record executionRecord
+		if readErr != nil || json.Unmarshal(data, &record) != nil || record.OperationID == "" || record.RunID == "" || record.Workspace == "" {
+			lock.Close()
+			return nil, errors.New("cannot reconcile execution history")
+		}
+		s.records[record.OperationID] = record
+		if record.Outcome == nil {
+			s.owners[record.Workspace] = record.RunID
+		}
+	}
+	return s, nil
+}
+
+func (s *supervisor) persist(record executionRecord, exclusive bool) error {
+	hash := sha256.Sum256([]byte(record.OperationID))
+	path := filepath.Join(s.dir, "operation-"+hex.EncodeToString(hash[:])+".json")
+	flags := os.O_WRONLY | os.O_CREATE
+	if exclusive {
+		flags |= os.O_EXCL
+	} else {
+		path += ".tmp"
+		flags |= os.O_TRUNC
+	}
+	file, err := os.OpenFile(path, flags, 0600)
+	if err != nil {
+		return err
+	}
+	err = json.NewEncoder(file).Encode(record)
+	if err == nil {
+		err = file.Sync()
+	}
+	closeErr := file.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if !exclusive {
+		if err := os.Rename(path, strings.TrimSuffix(path, ".tmp")); err != nil {
+			return err
+		}
+	}
+	dir, err := os.Open(s.dir)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+func (s *supervisor) workspace(path string) (*os.File, string, error) {
+	if !filepath.IsAbs(path) {
+		return nil, "", errors.New("workspace must be an existing absolute directory")
+	}
+	canonical, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil, "", errors.New("workspace must be an existing absolute directory")
+	}
+	root, err := filepath.EvalSymlinks(s.connection.WorkspaceRoot)
+	if err != nil || !containsPath(root, canonical) {
+		return nil, "", errors.New("workspace is outside the configured worker root")
+	}
+	file, err := os.Open(canonical)
+	if err != nil {
+		return nil, "", errors.New("workspace is unavailable")
+	}
+	info, err := file.Stat()
+	if err != nil || !info.IsDir() {
+		file.Close()
+		return nil, "", errors.New("workspace must be an existing absolute directory")
+	}
+	stat := info.Sys().(*syscall.Stat_t)
+	identity := fmt.Sprintf("%d:%d", stat.Dev, stat.Ino)
+	return file, identity, nil
+}
+
+func (s *supervisor) handle(ctx context.Context, op operation, send func(any) error) {
+	reply := func(value any, err error) {
+		message := map[string]any{"type": "result", "requestId": op.RequestID, "runId": op.RunID, "operationId": op.OperationID, "result": value}
+		if err != nil {
+			message["error"] = err.Error()
+		}
+		_ = send(message)
+	}
+	file, workspace, err := s.workspace(op.Cwd)
+	if err != nil {
+		reply(nil, err)
+		return
+	}
+	defer file.Close()
+	if op.Type == "inspect" {
+		reply(map[string]string{"cwd": op.Cwd}, nil)
+		return
+	}
+	deadline, err := time.Parse(time.RFC3339Nano, op.Deadline)
+	if err != nil || !deadline.After(time.Now()) || deadline.After(time.Now().Add(time.Hour)) || op.OperationID == "" || op.RunID == "" || (op.Purpose != "agent_execution" && op.Purpose != "control") || op.Command == "" {
+		reply(nil, errors.New("explicit execution identity, purpose and bounded deadline are required"))
+		return
+	}
+	s.mu.Lock()
+	if _, seen := s.records[op.OperationID]; seen {
+		s.mu.Unlock()
+		reply(nil, errors.New("operation was already admitted; it will not launch again"))
+		return
+	}
+	owner := s.owners[workspace]
+	if (op.Purpose == "agent_execution" && (owner != "" || s.activeAgents >= 16)) || (op.Purpose == "control" && ((owner != "" && owner != op.RunID) || s.activeControls >= 16)) {
+		s.mu.Unlock()
+		reply(nil, errors.New("workspace is busy or its previous process outcome is uncertain"))
+		return
+	}
+	// A directory flock also excludes a second registration/daemon with another
+	// private directory, including a symlink or bind-mount alias of this workspace.
+	if op.Purpose == "agent_execution" && syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+		s.mu.Unlock()
+		reply(nil, errors.New("workspace is busy"))
+		return
+	}
+	record := executionRecord{RunID: op.RunID, OperationID: op.OperationID, Purpose: op.Purpose, Workspace: workspace, Deadline: op.Deadline}
+	s.records[op.OperationID] = record
+	if op.Purpose == "agent_execution" {
+		s.owners[workspace] = op.RunID
+	}
+	if err := s.persist(record, true); err != nil {
+		s.mu.Unlock()
+		reply(nil, errors.New("cannot persist launch intent; execution refused"))
+		return
+	}
+	if op.Purpose == "agent_execution" {
+		s.activeAgents++
+	} else {
+		s.activeControls++
+	}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		if op.Purpose == "agent_execution" {
+			s.activeAgents--
+		} else {
+			s.activeControls--
+		}
+		s.mu.Unlock()
+	}()
+	processCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	args := protectionArgs(s.dir, s.connection, op.Cwd)
+	// Pin the actual directory at admission across path renames/replacements.
+	args = append(args[:len(args)-1], "--bind", "/proc/self/fd/3", op.Cwd, "--")
+	cmd := exec.CommandContext(processCtx, "bwrap", append(args, append([]string{op.Command}, op.Args...)...)...)
+	cmd.ExtraFiles = []*os.File{file}
+	cmd.Env = workerEnv(s.connection)
+	for name, value := range op.Env {
+		if !strings.ContainsAny(name, "=\x00") && !strings.ContainsRune(value, 0) {
+			cmd.Env = append(cmd.Env, name+"="+value)
+		}
+	}
+	cmd.Stdin = strings.NewReader(op.Stdin)
+	var outputMu sync.Mutex
+	outputBytes := 0
+	limited := false
+	writer := func(stream string) io.Writer {
+		return outputWriter(func(data []byte) (int, error) {
+			outputMu.Lock()
+			defer outputMu.Unlock()
+			if outputBytes+len(data) > maxOutputBytes {
+				limited = true
+				cancel()
+				return 0, errors.New("output limit exceeded")
+			}
+			outputBytes += len(data)
+			for offset := 0; offset < len(data); offset += 2048 {
+				end := offset + 2048
+				if end > len(data) {
+					end = len(data)
+				}
+				if err := send(map[string]any{"type": "output", "requestId": op.RequestID, "runId": op.RunID, "operationId": op.OperationID, "stream": stream, "data": base64.StdEncoding.EncodeToString(data[offset:end])}); err != nil {
+					cancel()
+					return 0, err
+				}
+			}
+			return len(data), nil
+		})
+	}
+	cmd.Stdout = writer("stdout")
+	cmd.Stderr = writer("stderr")
+	err = cmd.Run()
+	outcome := processOutcome{TimedOut: processCtx.Err() == context.DeadlineExceeded}
+	if cmd.ProcessState != nil {
+		status := cmd.ProcessState.Sys().(syscall.WaitStatus)
+		if status.Signaled() {
+			outcome.Signal = status.Signal().String()
+		} else {
+			code := status.ExitStatus()
+			outcome.ExitCode = &code
+		}
+	} else if err != nil {
+		outcome.Error = "protected process could not start"
+	}
+	if limited {
+		outcome.Error = "output limit exceeded"
+	}
+	s.mu.Lock()
+	record.Outcome = &outcome
+	if s.persist(record, false) == nil {
+		s.records[op.OperationID] = record
+		if op.Purpose == "agent_execution" {
+			delete(s.owners, workspace)
+		}
+	} else {
+		outcome.Error = "process ended but its durable outcome is uncertain"
+	}
+	s.mu.Unlock()
+	reply(outcome, nil)
+}
+
+type outputWriter func([]byte) (int, error)
+
+func (w outputWriter) Write(data []byte) (int, error) { return w(data) }

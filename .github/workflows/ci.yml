@@ -70,6 +70,9 @@ jobs:
           src/__tests__/live-events-ws.test.ts
           src/__tests__/plugin-worker-manager.test.ts
           src/__tests__/plugin-websocket-timeouts.test.ts
+          src/__tests__/environment-execution-target.test.ts
+          src/__tests__/environment-execution-target-duplex.test.ts
+          src/__tests__/plugin-environment-driver-seam.test.ts
 
       - name: Test public host, plugin, and daemon workflow
         run: pnpm test
