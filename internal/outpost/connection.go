@@ -87,7 +87,7 @@ func session(ctx context.Context, c Connection, output io.Writer, daemon bool, s
 		return errDisconnected
 	}
 	defer ws.CloseNow()
-	ws.SetReadLimit(16 * 1024)
+	ws.SetReadLimit(64 * 1024)
 	var ready struct {
 		Type      string   `json:"type"`
 		OutpostID string   `json:"outpostId"`
