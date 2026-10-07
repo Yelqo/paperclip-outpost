@@ -1,8 +1,13 @@
 diff --git a/packages/adapter-utils/src/command-managed-runtime.ts b/packages/adapter-utils/src/command-managed-runtime.ts
-index 9abfd933c..170f5c645 100644
+index 9abfd933c..cb9c13ae3 100644
 --- a/packages/adapter-utils/src/command-managed-runtime.ts
 +++ b/packages/adapter-utils/src/command-managed-runtime.ts
-@@ -30,6 +30,8 @@ import type { DirectorySnapshot } from "./workspace-restore-merge.js";
+@@ -1,3 +1,4 @@
++import type { RunCallbackTransport } from "@paperclipai/shared";
+ import { promises as fs } from "node:fs";
+ import { randomUUID } from "node:crypto";
+ import os from "node:os";
+@@ -30,6 +31,8 @@ import type { DirectorySnapshot } from "./workspace-restore-merge.js";
   * `DuplexChannelOpenInput`, which also carries the lease scope fields.
   */
  export interface DuplexChannelOpenInput {
@@ -11,28 +16,250 @@ index 9abfd933c..170f5c645 100644
    command: readonly string[];
  }
  
-@@ -75,6 +77,8 @@ export interface CommandManagedRuntimeRunner {
+@@ -75,6 +78,9 @@ export interface CommandManagedRuntimeRunner {
     */
    supportsSingleStreamStdinProgress?: boolean;
    execute(input: {
++    callbackTransport?: RunCallbackTransport;
 +    operationId?: string;
 +    purpose?: "agent_execution" | "control";
      command: string;
      args?: string[];
      cwd?: string;
 diff --git a/packages/adapter-utils/src/execution-target.ts b/packages/adapter-utils/src/execution-target.ts
-index aa66d00dd..ff4a83970 100644
+index aa66d00dd..1bb17ff73 100644
 --- a/packages/adapter-utils/src/execution-target.ts
 +++ b/packages/adapter-utils/src/execution-target.ts
-@@ -876,6 +876,8 @@ export async function runAdapterExecutionTargetProcess(
+@@ -1,3 +1,4 @@
++import type { RunCallbackTransport } from "@paperclipai/shared";
+ import fs from "node:fs/promises";
+ import { execFile } from "node:child_process";
+ import { promisify } from "node:util";
+@@ -33,6 +34,7 @@ export type {
+   SandboxAdditionalSource,
+ } from "./sandbox-managed-runtime.js";
+ import {
++  buildSandboxCallbackBridgeEnv,
+   createCommandManagedSandboxCallbackBridgeQueueClient,
+   createSandboxCallbackBridgeAsset,
+   createSandboxCallbackBridgeToken,
+@@ -273,6 +275,7 @@ export interface PreparedAdapterExecutionTargetRuntime {
+ }
+ 
+ export interface AdapterExecutionTargetProcessOptions {
++  callbackTransport?: RunCallbackTransport;
+   cwd: string;
+   env: Record<string, string>;
+   stdin?: string;
+@@ -315,6 +318,7 @@ export interface AdapterExecutionTargetShellOptions {
+ }
+ 
+ export interface AdapterExecutionTargetPaperclipBridgeHandle {
++  callbackTransport?: RunCallbackTransport;
+   env: Record<string, string>;
+   /**
+    * Present when the sandbox target opted into run-log streaming
+@@ -876,6 +880,9 @@ export async function runAdapterExecutionTargetProcess(
      try {
        const result = await runner.execute({
          command: execCommand,
 +        operationId: `${runId}:agent`,
 +        purpose: "agent_execution",
++        callbackTransport: options.callbackTransport,
          args: execArgs,
          cwd: target.remoteCwd,
          env,
+@@ -4283,6 +4290,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
+   adapterKey: string;
+   timeoutSec?: number | null;
+   hostApiToken: string | null | undefined;
++  runtimeGateway?: { instance: string; companyId: string; agentId: string; taskId: string };
+   hostApiUrl?: string | null;
+   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+   maxBodyBytes?: number | null;
+@@ -4342,7 +4350,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
+       ? input.runtimeRootDir.trim()
+       : path.posix.join(target.remoteCwd, ".paperclip-runtime", input.adapterKey);
+   const bridgeRuntimeDir = path.posix.join(runtimeRootDir, "paperclip-bridge");
+-  const queueDir = path.posix.join(bridgeRuntimeDir, "queue");
++  const queueDir = path.posix.join(bridgeRuntimeDir, input.runtimeGateway ? input.runId : "queue");
+   const assetRemoteDir = path.posix.join(bridgeRuntimeDir, "server");
+   const bridgeToken = createSandboxCallbackBridgeToken();
+   const configuredAttachmentBytes = Number(process.env.PAPERCLIP_ATTACHMENT_MAX_BYTES);
+@@ -4868,6 +4876,16 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
+         reservation: options?.reservation,
+       }),
+     });
++    if (input.runtimeGateway) {
++      const scope = input.runtimeGateway;
++      return {
++        env: { ...buildSandboxCallbackBridgeEnv({ queueDir, bridgeToken, maxBodyBytes }), PAPERCLIP_API_KEY: bridgeToken },
++        callbackTransport: { ...scope, runId: input.runId, queueDir, token: bridgeToken,
++          expiresAt: new Date(Date.now() + (bridgeTimeoutMs ?? 60000)).toISOString() },
++        runLogTail: null,
++        stop: async () => { await worker?.stop(); await bridgeAsset.cleanup(); },
++      };
++    }
+     server = await startSandboxCallbackBridgeServer({
+       runner,
+       remoteCwd: target.remoteCwd,
+diff --git a/packages/adapters/pi-local/src/server/execute.ts b/packages/adapters/pi-local/src/server/execute.ts
+index 3149642b3..70f9e8071 100644
+--- a/packages/adapters/pi-local/src/server/execute.ts
++++ b/packages/adapters/pi-local/src/server/execute.ts
+@@ -229,6 +229,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
+   });
+   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
++  const machineOwned = executionTargetIsRemote && executionTarget?.workspaceRealization?.mode === "in_place";
+ 
+   const promptTemplate = asString(
+     config.promptTemplate,
+@@ -238,6 +239,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+   );
+   const hasCustomPromptTemplate = asString(config.promptTemplate, "").trim().length > 0;
+   const command = asString(config.command, "pi");
++  const machineSessionDir = asString(config.machineSessionDir, "");
++  if (machineOwned && !path.posix.isAbsolute(machineSessionDir)) throw new Error("A machine-owned Pi session directory is required");
+   const model = asString(config.model, "").trim();
+   const thinking = asString(config.thinking, "").trim();
+ 
+@@ -262,7 +265,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+   const effectiveWorkspaceCwd = useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
+   const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
+   let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
+-  await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
++  if (!executionTargetIsRemote) await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
+ 
+   if (!executionTargetIsRemote) {
+     await ensureSessionsDir();
+@@ -275,10 +278,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+   }
+ 
+   // Build environment
+-  const envConfig = parseObject(config.env);
++  const envConfig = machineOwned && config.allowServerRuntimeConfig !== true ? {} : parseObject(config.env);
+   const env: Record<string, string> = {
+     ...buildPaperclipEnv(agent),
+-    ...buildRuntimeToolsEnv(ctx.runtimeTools),
++    ...(machineOwned ? {} : buildRuntimeToolsEnv(ctx.runtimeTools)),
+   };
+   env.PAPERCLIP_RUN_ID = runId;
+ 
+@@ -327,13 +330,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+     executionTargetIsRemote,
+     executionCwd: effectiveExecutionCwd,
+   });
+-  if (authToken) {
++  if (authToken && !machineOwned) {
+     env.PAPERCLIP_API_KEY = authToken;
+   }
+   // Materialize custom Pi providers (PAPERCLIP_PI_PROVIDERS) into a managed
+   // PI_CODING_AGENT_DIR before runtimeEnv is computed, so both local validation
+   // and the spawned Pi process resolve models against the managed models.json.
+-  const preparedRuntimeConfig = await preparePiRuntimeConfig({ env });
++  const preparedRuntimeConfig = machineOwned
++    ? { agentConfigDir: null, notes: [] as string[], cleanup: async () => {} }
++    : await preparePiRuntimeConfig({ env });
+   const localAgentConfigDir = preparedRuntimeConfig.agentConfigDir ?? "";
+   if (localAgentConfigDir) {
+     env.PI_CODING_AGENT_DIR = localAgentConfigDir;
+@@ -346,10 +351,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+     // actually linked — otherwise non-injected skills' binaries would be reachable
+     // to the agent.
+     const injectedSkillKeys = new Set(desiredPiSkillNames);
+-    const skillBinDirs = piSkillEntries
++    const skillBinDirs = machineOwned ? [] : piSkillEntries
+       .filter((entry) => injectedSkillKeys.has(entry.key) && entry.source.length > 0)
+       .map((entry) => path.join(entry.source, "bin"));
+-    const mergedEnv = ensurePathInEnv({ ...process.env, ...env });
++    const mergedEnv = machineOwned ? { ...env } : ensurePathInEnv({ ...process.env, ...env });
+     const pathKey =
+       typeof mergedEnv.Path === "string" && mergedEnv.Path.length > 0 && !mergedEnv.PATH
+         ? "Path"
+@@ -372,7 +377,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+       asNumber(config.timeoutSec, 0),
+     );
+     const graceSec = asNumber(config.graceSec, 20);
+-    await ensureAdapterExecutionTargetRuntimeCommandInstalled({
++    if (!machineOwned) await ensureAdapterExecutionTargetRuntimeCommandInstalled({
+       runId,
+       target: executionTarget,
+       installCommand: ctx.runtimeCommandSpec?.installCommand,
+@@ -384,7 +389,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+       onLog,
+     });
+     await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv, {
+-      installCommand: SANDBOX_INSTALL_COMMAND,
++      installCommand: machineOwned ? undefined : SANDBOX_INSTALL_COMMAND,
+       timeoutSec,
+     });
+     const resolvedCommand = await resolveAdapterExecutionTargetCommandForLogs(command, executionTarget, cwd, runtimeEnv);
+@@ -414,7 +419,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+     let remoteSkillsDir: string | null = null;
+     let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
+ 
+-    if (executionTargetIsRemote) {
++    if (executionTargetIsRemote && !machineOwned) {
+       try {
+         localSkillsDir = await buildPiSkillsDir(config);
+         await onLog(
+@@ -487,14 +492,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+         runtimeRootDir: remoteRuntimeRootDir,
+         adapterKey: "pi",
+         timeoutSec,
+-        hostApiToken: env.PAPERCLIP_API_KEY,
++        hostApiToken: machineOwned ? authToken : env.PAPERCLIP_API_KEY,
++        ...(machineOwned ? { runtimeGateway: { instance: env.PAPERCLIP_API_URL,
++          companyId: agent.companyId, agentId: agent.id, taskId: wakeTaskId ?? "" } } : {}),
+         onLog,
+       });
+       if (paperclipBridge) {
+         Object.assign(env, paperclipBridge.env);
+         loggedEnv = buildInvocationEnvForLogs(env, {
+           runtimeEnv: Object.fromEntries(
+-            Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
++            Object.entries(machineOwned ? env : ensurePathInEnv({ ...process.env, ...env })).filter(
+               (entry): entry is [string, string] => typeof entry[1] === "string",
+             ),
+           ),
+@@ -535,6 +542,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+       sessionHeaderCwdMatches;
+     const sessionPath = canResumeSession
+       ? runtimeSessionId
++      : machineOwned ? buildRemoteSessionPath(machineSessionDir, agent.id, new Date().toISOString())
+       : executionTargetIsRemote && remoteRuntimeRootDir
+         ? buildRemoteSessionPath(remoteRuntimeRootDir, agent.id, new Date().toISOString())
+         : buildSessionPath(agent.id, new Date().toISOString());
+@@ -552,7 +560,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+       );
+     }
+ 
+-    if (!canResumeSession) {
++    if (!canResumeSession && !machineOwned) {
+       if (executionTargetIsRemote) {
+         await ensureAdapterExecutionTargetFile(runId, runtimeExecutionTarget, sessionPath, {
+           cwd,
+@@ -649,9 +657,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+       if (modelId) args.push("--model", modelId);
+       if (thinking) args.push("--thinking", thinking);
+ 
+-      args.push("--tools", "read,bash,edit,write,grep,find,ls");
++      args.push("--tools", machineOwned ? "read,bash,edit,write,grep,find,ls,paperclip_coordination" : "read,bash,edit,write,grep,find,ls");
+       args.push("--session", sessionFile);
+-      args.push("--skill", remoteSkillsDir ?? PI_AGENT_SKILLS_DIR);
++      if (!machineOwned) args.push("--skill", remoteSkillsDir ?? PI_AGENT_SKILLS_DIR);
+ 
+       if (extraArgs.length > 0) args.push(...extraArgs);
+ 
+@@ -745,6 +753,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+         onSpawn,
+         onRuntimeProgress: ctx.onRuntimeProgress,
+         onLog: bufferedOnLog,
++        callbackTransport: paperclipBridge?.callbackTransport,
+         runLogTail: paperclipBridge?.runLogTail,
+         settleRunDisposition: paperclipBridge?.settleRunDisposition,
+       });
 diff --git a/packages/plugins/sdk/src/define-plugin.ts b/packages/plugins/sdk/src/define-plugin.ts
 index 947a67cbb..45d259622 100644
 --- a/packages/plugins/sdk/src/define-plugin.ts
@@ -70,7 +297,7 @@ index 947a67cbb..45d259622 100644
    /**
     * Called when Paperclip scans issue/comment/document content and asks this
 diff --git a/packages/plugins/sdk/src/index.ts b/packages/plugins/sdk/src/index.ts
-index 57f862811..35689cc78 100644
+index 57f862811..b933b3eef 100644
 --- a/packages/plugins/sdk/src/index.ts
 +++ b/packages/plugins/sdk/src/index.ts
 @@ -49,6 +49,9 @@
@@ -78,19 +305,25 @@ index 57f862811..35689cc78 100644
  // ---------------------------------------------------------------------------
  
 +export type { PluginWebSocketOpen, PluginWebSocketEvent, PluginWebSocketReply, PluginWebSocketAdmission } from "./define-plugin.js";
-+export const PLUGIN_WEBSOCKET_SDK_VERSION = "1.0.0+outpost.2";
++export const PLUGIN_WEBSOCKET_SDK_VERSION = "1.0.0+outpost.3";
 +
  export { definePlugin } from "./define-plugin.js";
  export { createTestHarness, createEnvironmentTestHarness, createFakeEnvironmentDriver, filterEnvironmentEvents, assertEnvironmentEventOrder, assertLeaseLifecycle, assertWorkspaceRealizationLifecycle, assertExecutionLifecycle, assertEnvironmentError } from "./testing.js";
  export { createPluginBundlerPresets } from "./bundlers.js";
 diff --git a/packages/plugins/sdk/src/protocol.ts b/packages/plugins/sdk/src/protocol.ts
-index 9c08a45c4..306f2c318 100644
+index 9c08a45c4..6873ff2d2 100644
 --- a/packages/plugins/sdk/src/protocol.ts
 +++ b/packages/plugins/sdk/src/protocol.ts
-@@ -704,6 +704,11 @@ export interface PluginEnvironmentRealizeWorkspaceResult {
+@@ -1,3 +1,4 @@
++import type { RunCallbackTransport } from "@paperclipai/shared";
+ import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paperclipai/shared";
+ /**
+  * JSON-RPC 2.0 message types and protocol helpers for the host ↔ worker IPC
+@@ -704,6 +705,12 @@ export interface PluginEnvironmentRealizeWorkspaceResult {
  }
  
  export interface PluginEnvironmentExecuteParams extends PluginEnvironmentDriverBaseParams {
++  callbackTransport?: RunCallbackTransport;
 +  /** Host-authored identities, independent of a reusable lease. */
 +  runId?: string;
 +  operationId?: string;
@@ -99,7 +332,7 @@ index 9c08a45c4..306f2c318 100644
    lease: PluginEnvironmentLease;
    command: string;
    args?: string[];
-@@ -1212,6 +1217,11 @@ export function decodeChannelBytes(value: unknown): Uint8Array | null {
+@@ -1212,6 +1219,11 @@ export function decodeChannelBytes(value: unknown): Uint8Array | null {
  
  /** The open request for one persistent duplex channel. The worker registers the channel by `hostRouteId`. */
  export interface PluginDuplexChannelOpenParams {
@@ -111,7 +344,7 @@ index 9c08a45c4..306f2c318 100644
    /** The host-owned opaque route identifier. The worker registers the channel by it. */
    hostRouteId: string;
    /** The environment driver key, for the worker sandbox scope. */
-@@ -1323,6 +1333,9 @@ export const DUPLEX_CHANNEL_EXIT_NOTIFICATION = "duplexChannel.exit";
+@@ -1323,6 +1335,9 @@ export const DUPLEX_CHANNEL_EXIT_NOTIFICATION = "duplexChannel.exit";
   * ensure type safety across the IPC boundary.
   */
  export interface HostToWorkerMethods {
@@ -121,7 +354,7 @@ index 9c08a45c4..306f2c318 100644
    /** @see PLUGIN_SPEC.md §13.1 */
    initialize: [params: InitializeParams, result: InitializeResult];
    /** @see PLUGIN_SPEC.md §13.2 */
-@@ -1476,6 +1489,9 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[]
+@@ -1476,6 +1491,9 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[]
    "runJob",
    "handleWebhook",
    "handleApiRequest",
@@ -184,6 +417,46 @@ index ab10a20e1..38d99a0d3 100644
    "claude_local",
    "codex_local",
    "paperclip_runner",
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index 00f7a8d8e..7c2af71c5 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -2826,3 +2826,5 @@ export { aiConnectionRouterSlug, aiConnectionRouterAppDefinition, aiConnectionRo
+ export { isAppAggregator, aggregatorManagementUrl, aggregatorAppsSyncSchema, aggregatorAppsRefreshSchema, arcadeDiscoverySetupSchema, type AggregatorAppSnapshot, type AggregatorAppsResponse, type ArcadeDiscoverySetupInput } from "./aggregator-apps.js";
+ 
+ export * from "./connection-instructions.js";
++
++export type { RunCallbackTransport } from "./types/environment.js";
+diff --git a/packages/shared/src/types/environment.ts b/packages/shared/src/types/environment.ts
+index 54251055a..c7ea053b2 100644
+--- a/packages/shared/src/types/environment.ts
++++ b/packages/shared/src/types/environment.ts
+@@ -175,3 +175,15 @@ export interface EnvironmentLease {
+   createdAt: Date;
+   updatedAt: Date;
+ }
++
++/** Trusted per-run callback transport, separate from ordinary runtime environment. */
++export interface RunCallbackTransport {
++  instance: string;
++  companyId: string;
++  agentId: string;
++  taskId: string;
++  runId: string;
++  queueDir: string;
++  token: string;
++  expiresAt: string;
++}
+diff --git a/packages/shared/src/types/index.ts b/packages/shared/src/types/index.ts
+index 6d899e083..f98bbf210 100644
+--- a/packages/shared/src/types/index.ts
++++ b/packages/shared/src/types/index.ts
+@@ -1075,3 +1075,5 @@ export type { AgentInstructionErrorCode, AgentInstructionErrorDetails, AgentInst
+ export type { AgentInstructionCandidate } from "./agent.js";
+ 
+ export * from "./skill-source.js";
++
++export type { RunCallbackTransport } from "./environment.js";
 diff --git a/packages/shared/src/types/plugin.ts b/packages/shared/src/types/plugin.ts
 index 42643d3b0..89c57a041 100644
 --- a/packages/shared/src/types/plugin.ts
@@ -634,7 +907,7 @@ index 684e7cc13..8985f9c3a 100644
    // "set-cookie" is normally a response header; keep the request-side
 diff --git a/server/src/realtime/plugin-ws.ts b/server/src/realtime/plugin-ws.ts
 new file mode 100644
-index 000000000..a48b1ddcd
+index 000000000..2810319fd
 --- /dev/null
 +++ b/server/src/realtime/plugin-ws.ts
 @@ -0,0 +1,132 @@
@@ -658,7 +931,7 @@ index 000000000..a48b1ddcd
 +  try { commit = execFileSync("git", ["rev-parse", "HEAD"], {
 +    cwd: fileURLToPath(new URL("../../../", import.meta.url)), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1000,
 +  }).trim(); } catch { /* Packaged hosts must carry the build commit stamp. */ }
-+  const host = { commit, sdk: PLUGIN_WEBSOCKET_SDK_VERSION, transport: 2 };
++  const host = { commit, sdk: PLUGIN_WEBSOCKET_SDK_VERSION, transport: 3 };
 +  let admitted = 0, opening = 0, stopping = false;
 +  const pending = new Set<import("node:stream").Duplex>();
 +  server.on("upgrade", (req, socket, head) => {
@@ -820,7 +1093,7 @@ index aab87b273..46a1aa005 100644
    db: Db,
    provider: string,
 diff --git a/server/src/services/environment-execution-target.ts b/server/src/services/environment-execution-target.ts
-index d1aefd34f..d162e262f 100644
+index d1aefd34f..5e95de642 100644
 --- a/server/src/services/environment-execution-target.ts
 +++ b/server/src/services/environment-execution-target.ts
 @@ -1,3 +1,4 @@
@@ -828,25 +1101,40 @@ index d1aefd34f..d162e262f 100644
  import type { Db } from "@paperclipai/db";
  import type { Environment, EnvironmentLease } from "@paperclipai/shared";
  import { adapterSupportsRemoteManagedEnvironments } from "@paperclipai/shared";
-@@ -221,6 +222,7 @@ function setSandboxExecSpanFailure(
+@@ -221,6 +222,8 @@ function setSandboxExecSpanFailure(
  }
  
  export async function resolveEnvironmentExecutionTarget(input: {
++  remoteCwd?: string;
 +  runId?: string;
    db: Db;
    companyId: string;
    adapterType: string;
-@@ -473,6 +475,9 @@ export async function resolveEnvironmentExecutionTarget(input: {
+@@ -268,10 +271,10 @@ export async function resolveEnvironmentExecutionTarget(input: {
+       return null;
+     }
+ 
+-    const remoteCwd =
++    const remoteCwd = input.remoteCwd ?? (
+       typeof input.leaseMetadata?.remoteCwd === "string" && input.leaseMetadata.remoteCwd.trim().length > 0
+         ? input.leaseMetadata.remoteCwd.trim()
+-        : DEFAULT_SANDBOX_REMOTE_CWD;
++        : DEFAULT_SANDBOX_REMOTE_CWD);
+     const timeoutMs = "timeoutMs" in parsed.config ? parsed.config.timeoutMs : null;
+     const shellCommand =
+       input.leaseMetadata?.shellCommand === "bash" || input.leaseMetadata?.shellCommand === "sh"
+@@ -473,6 +476,10 @@ export async function resolveEnvironmentExecutionTarget(input: {
                  let result;
                  try {
                    result = await input.environmentRuntime!.execute({
++                    callbackTransport: commandInput.callbackTransport,
 +                    runId: input.runId,
 +                    operationId: commandInput.operationId ?? randomUUID(),
 +                    purpose: commandInput.purpose ?? "control",
                      environment: input.environment as Environment,
                      lease: input.lease!,
                      command: commandInput.command,
-@@ -616,6 +621,9 @@ export async function resolveEnvironmentExecutionTarget(input: {
+@@ -616,6 +623,9 @@ export async function resolveEnvironmentExecutionTarget(input: {
                ? {
                    openDuplexChannel: (channelInput) =>
                      input.environmentRuntime!.openDuplexChannel({
@@ -857,7 +1145,7 @@ index d1aefd34f..d162e262f 100644
                        lease: input.lease!,
                        command: channelInput.command,
 diff --git a/server/src/services/environment-run-orchestrator.ts b/server/src/services/environment-run-orchestrator.ts
-index 91f887ac7..ae77fd64d 100644
+index 91f887ac7..be308d437 100644
 --- a/server/src/services/environment-run-orchestrator.ts
 +++ b/server/src/services/environment-run-orchestrator.ts
 @@ -458,6 +458,9 @@ export function environmentRunOrchestrator(
@@ -870,22 +1158,29 @@ index 91f887ac7..ae77fd64d 100644
            environment,
            lease,
            command: "bash",
-@@ -519,6 +522,7 @@ export function environmentRunOrchestrator(
+@@ -519,6 +522,8 @@ export function environmentRunOrchestrator(
      let executionTarget: AdapterExecutionTarget | null;
      try {
        executionTarget = await resolveEnvironmentExecutionTarget({
++        remoteCwd: realizedCwd,
 +        runId: heartbeatRunId,
          db,
          companyId,
          adapterType,
 diff --git a/server/src/services/environment-runtime.ts b/server/src/services/environment-runtime.ts
-index 4105ec664..3b69a174e 100644
+index 4105ec664..a7d6ad1a5 100644
 --- a/server/src/services/environment-runtime.ts
 +++ b/server/src/services/environment-runtime.ts
-@@ -529,6 +529,10 @@ export interface EnvironmentDriverRealizeWorkspaceInput extends EnvironmentDrive
+@@ -1,3 +1,4 @@
++import type { RunCallbackTransport } from "@paperclipai/shared";
+ import { hasStopOnlyCleanup, prepareSandboxStopAndRetain, readStopOnlyCleanup, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
+ import { readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
+ import { remoteTerminationReceipt } from "./remote-execution-termination.js";
+@@ -529,6 +530,11 @@ export interface EnvironmentDriverRealizeWorkspaceInput extends EnvironmentDrive
  }
  
  export interface EnvironmentDriverExecuteInput extends EnvironmentDriverLeaseInput {
++  callbackTransport?: RunCallbackTransport;
 +  runId?: string;
 +  operationId?: string;
 +  purpose?: "agent_execution" | "control";
@@ -893,7 +1188,7 @@ index 4105ec664..3b69a174e 100644
    command: string;
    args?: string[];
    cwd?: string;
-@@ -568,6 +572,10 @@ export interface EnvironmentDriverSyncInput extends EnvironmentDriverLeaseInput
+@@ -568,6 +574,10 @@ export interface EnvironmentDriverSyncInput extends EnvironmentDriverLeaseInput
  }
  
  export interface EnvironmentDriverOpenDuplexChannelInput extends EnvironmentDriverLeaseInput {
@@ -904,17 +1199,18 @@ index 4105ec664..3b69a174e 100644
    /**
     * The command argument vector the sandbox runs as the duplex channel child
     * process. Element 0 is the program. The worker runs the vector with no
-@@ -2913,6 +2921,9 @@ function createSandboxEnvironmentDriver(
+@@ -2913,6 +2923,10 @@ function createSandboxEnvironmentDriver(
            });
            const sanitizedConfig = stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig);
            return await pluginWorkerManager.call(pluginId, "environmentExecute", {
++            callbackTransport: input.callbackTransport,
 +            runId: input.runId,
 +            operationId: input.operationId,
 +            purpose: input.purpose,
              driverKey: providerKey,
              companyId: input.lease.companyId,
              environmentId: input.environment.id,
-@@ -3001,6 +3012,9 @@ function createSandboxEnvironmentDriver(
+@@ -3001,6 +3015,9 @@ function createSandboxEnvironmentDriver(
          throw new Error(`Plugin worker "${pluginId}" is not running for the duplex channel.`);
        }
        const managerInput: WorkerManagerDuplexChannelOpenInput = {
@@ -967,7 +1263,7 @@ index c63a3974a..6dc9e7f89 100644
          .select({ companyId: builtInManagedResources.companyId })
          .from(builtInManagedResources)
 diff --git a/server/src/services/heartbeat.ts b/server/src/services/heartbeat.ts
-index 9e8617e2f..83675aa92 100644
+index 9e8617e2f..c4cd720f5 100644
 --- a/server/src/services/heartbeat.ts
 +++ b/server/src/services/heartbeat.ts
 @@ -1,4 +1,5 @@
@@ -1071,6 +1367,33 @@ index 9e8617e2f..83675aa92 100644
          const repositoryRows = await db.select().from(projectWorkspaces).where(and(
            eq(projectWorkspaces.companyId, agent.companyId),
            eq(projectWorkspaces.projectId, executionWorkspace.projectId),
+@@ -22970,7 +22993,7 @@ export function heartbeatService(
+       } else {
+         delete context.paperclipScratch;
+       }
+-      const gitExecutionEnv = await prepareGitHubExecutionEnvironment({
++      const gitExecutionEnv = executionEnvironmentOwnsWorkspace ? Object.fromEntries(Object.entries(parseObject(runtimeConfig.env)).filter((entry): entry is [string, string] => typeof entry[1] === "string")) : await prepareGitHubExecutionEnvironment({
+         target: executionTarget,
+         cwd: executionWorkspace.cwd,
+         env: Object.fromEntries(
+@@ -22988,7 +23011,7 @@ export function heartbeatService(
+       runtimeConfig = { ...runtimeConfig, env: gitExecutionEnv };
+       for (const key of MANAGED_GITHUB_TOKEN_KEYS) secretKeys.add(key);
+       context.githubAuthenticationMode = useHostGitHub ? "host" : "managed";
+-      if (!useHostGitHub) {
++      if (!useHostGitHub && !executionEnvironmentOwnsWorkspace) {
+         const githubLaunchers = await prepareHeartbeatGitHubLaunchers({
+           native: agent.adapterType === "paperclip_runner",
+           githubConfigured: githubSelection.configured,
+@@ -23653,7 +23676,7 @@ export function heartbeatService(
+         const hasInstructionFilesystem = nativeRuntimeResolution.kind !== "native"
+           ? adapter.supportsInstructionsBundle === true
+           : !["claude_managed_agents_api", "aws_agentcore_harness_api"].includes(nativeRuntimeResolution.profile.backend);
+-        if (hasInstructionFilesystem) {
++        if (hasInstructionFilesystem && !executionEnvironmentOwnsWorkspace) {
+           try {
+             // Missing contract fields on a restored session mean the deployed
+             // legacy format. New sessions opt into whole-directory persistence.
 diff --git a/server/src/services/plugin-worker-manager.ts b/server/src/services/plugin-worker-manager.ts
 index af6721f3d..c477ceae5 100644
 --- a/server/src/services/plugin-worker-manager.ts

@@ -4,10 +4,11 @@ import { StringDecoder } from "node:string_decoder";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import type { PluginEnvironmentAcquireLeaseParams, PluginEnvironmentExecuteParams, PluginEnvironmentRealizeWorkspaceParams } from "@paperclipai/plugin-sdk/protocol";
 
+type CallbackTransport = NonNullable<PluginEnvironmentExecuteParams["callbackTransport"]>;
 type Identity = { runId:string; operationId:string; purpose:"agent_execution"|"control" };
 type OperationRequest =
   | {type:"inspect";cwd:string;deadline:string}
-  | Identity & {type:"execute";command:string;args?:string[];cwd:string;env?:Record<string,string>;stdin?:string;deadline:string};
+  | Identity & {type:"execute";command:string;args?:string[];cwd:string;env?:Record<string,string>;callbackTransport?:CallbackTransport;stdin?:string;deadline:string};
 type Inspection = {cwd:string};
 type Outcome = {exitCode:number|null;signal?:string;timedOut:boolean;error?:string};
 type OutputFrame = {type:"output";requestId:string;runId:string;operationId:string;stream:"stdout"|"stderr";data:string};
@@ -100,14 +101,14 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
     const id=outpost(input);
     if (!online(input.companyId,id)) throw new Error("Outpost is offline");
     if (!input.runId) throw new Error("An explicit run is required");
-    if (input.adapterType !== "process") throw new Error("This Outpost release supports bounded process commands; runtime adapter integration is pending");
+    if (!["process","pi_local"].includes(input.adapterType ?? "")) throw new Error("This Outpost release supports process and pi_local adapters");
     return {providerLeaseId:randomUUID()};
   };
   const realize = async (input:PluginEnvironmentRealizeWorkspaceParams) => {
     const cwd=input.workspace.remotePath ?? input.workspace.localPath;
     if (!cwd?.startsWith("/")) throw new Error("An existing absolute workspace path is required");
     const result=await dispatch(input.companyId,outpost(input),{type:"inspect",cwd,deadline:new Date(Date.now()+10000).toISOString()},readInspection);
-    return {cwd:result.cwd,metadata:{mode:"in_place",remoteCwd:result.cwd}};
+    return {cwd:result.cwd,metadata:{mode:"in_place",remoteCwd:result.cwd,workspaceRealization:{mode:"in_place",authoritativeRoot:result.cwd,pathAliases:[],outboundRestorePaths:[]}}};
   };
   const execute = async (input:PluginEnvironmentExecuteParams) => {
     if (!input.runId || !input.operationId || (input.purpose!=="agent_execution" && input.purpose!=="control")) throw new Error("Paperclip must author execution identity and purpose");
@@ -118,7 +119,7 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
     const log=AsyncLocalStorage.bind((stream:"stdout"|"stderr",chunk:string) => ctx.execution.log(stream,chunk));
     const result = await dispatch(input.companyId,outpost(input),{
       type:"execute",runId:input.runId,operationId:input.operationId,purpose:input.purpose,
-      command:input.command,args:input.args,cwd:input.cwd,env:input.env,stdin:input.stdin,
+      command:input.command,args:input.args,cwd:input.cwd,env:input.env,callbackTransport:input.callbackTransport,stdin:input.stdin,
       deadline:new Date(Date.now()+timeout).toISOString(),
     },readOutcome,frame => {
       const chunk=decoders[frame.stream].write(Buffer.from(frame.data,"base64"));

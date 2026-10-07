@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import WebSocket from 'ws';
+import { createServer } from 'node:http';
 import { versions as supportedVersions } from '../plugin/versions.ts';
 
 const root = resolve('.');
@@ -112,7 +113,7 @@ test('the Go daemon connects outbound and the operator observes its authenticate
   await eventually(async () => {
     assert.equal(daemon.exitCode, null, output);
     const status = await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`);
-    return status.connected === true;
+    return status.connected === true && output.includes('connected');
   });
   assert.ok(output.includes('connected'));
   daemon.kill('SIGTERM');
@@ -154,8 +155,8 @@ test('execution runs a bounded command through the selected outpost and preserve
   }
 });
 
-async function startExecutionDaemon() {
-  const daemon=spawn(join(root,'bin/outpost'),['daemon','--private-dir',privateDir],{stdio:['ignore','pipe','pipe']});
+async function startExecutionDaemon(env={}) {
+  const daemon=spawn(join(root,'bin/outpost'),['daemon','--private-dir',privateDir],{env:{...process.env,...env},stdio:['ignore','pipe','pipe']});
   processes.push(daemon);
   let output=''; daemon.stdout.on('data',data => {output+=data;}); daemon.stderr.on('data',data => {output+=data;});
   await eventually(async () => {
@@ -168,6 +169,106 @@ async function stopExecutionDaemon(daemon) {
   daemon.kill('SIGTERM');
   await eventually(async () => !(await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).connected);
 }
+
+test('actual Pi reads its assigned task through the callback bridge and retains machine runtime assets', {timeout:240000}, async t => {
+  const workspace=join(home,'workspaces','pi'); mkdirSync(workspace);
+  const runtime=join(home,'pi-runtime'); mkdirSync(runtime);
+  const agentDir=join(runtime,'agent'); mkdirSync(agentDir);
+  const state=join(runtime,'state'); mkdirSync(state,{mode:0o700});
+  const sessions=join(runtime,'sessions'); mkdirSync(sessions);
+  const policyPath=join(runtime,'policy.json'),workerPath=join(runtime,'worker.json');
+  const node22=process.env.OUTPOST_TEST_NODE22 ?? execFileSync('mise',['where','node@22.22.1'],{encoding:'utf8'}).trim()+'/bin/node';
+  let calls=0;
+  const provider=createServer(async (req,res) => {
+    let input=''; for await(const chunk of req) input+=chunk;
+    const body=JSON.parse(input);
+    assert.equal(req.headers.authorization,'Bearer machine-provider-key');
+    const steps=[
+      ['paperclip_coordination',{operation:'task'}],
+      ['paperclip_coordination',{operation:'progress',comment:'Pi completed the local fixture check.'}],
+      ['paperclip_coordination',{operation:'progress',comment:'x'.repeat(4001)}],
+      ['read',{path:workerPath}],
+      ['write',{path:policyPath,content:'forbidden config change'}],
+      ['bash',{command:'printf \'%s\\n\' "$HOME"'}],
+      ...(calls < 8 ? [] : [['read',{path:'pi-effect.txt'}]]),
+      ['write',{path:calls < 8 ? 'pi-effect.txt' : 'pi-second-effect.txt',content:'machine-owned Pi effect\n'}],
+    ];
+    const step=steps[calls < 8 ? calls : (calls-8) % 9];
+    if(calls === 15) assert.ok(JSON.stringify(body.messages.at(-1)).includes('machine-owned Pi effect'), 'Second run must read the existing first-run effect');
+    if(calls === 1 || calls === 9) assert.ok(JSON.stringify(body.messages.at(-1)).includes('Read the assigned task and report progress'), 'Task callback must return the assigned issue');
+    calls++;
+    const delta=step ? {role:'assistant',tool_calls:[{index:0,id:`fixture-${calls}`,type:'function',function:{name:step[0],arguments:JSON.stringify(step[1])}}]} : {role:'assistant',content:'Assigned task completed.'};
+    res.writeHead(200,{'content-type':'text/event-stream'});
+    const event=(delta,finish_reason)=>({id:'fixture',object:'chat.completion.chunk',created:1,model:'fixture',choices:[{index:0,delta,finish_reason}]});
+    res.write(`data: ${JSON.stringify(event(delta,null))}\n\n`);
+    res.write(`data: ${JSON.stringify(event({},step?'tool_calls':'stop'))}\n\n`);
+    res.end('data: [DONE]\n\n');
+  });
+  await new Promise(r=>provider.listen(0,'127.0.0.1',r));
+  t.after(async()=>{provider.closeAllConnections(); await new Promise(r=>provider.close(r));});
+  const modelConfig=JSON.stringify({providers:{fixture:{baseUrl:`http://127.0.0.1:${provider.address().port}/v1`,api:'openai-completions',apiKey:'${OPENAI_API_KEY}',models:[{id:'fixture',reasoning:false,input:['text'],cost:{input:0,output:0,cacheRead:0,cacheWrite:0},contextWindow:128000,maxTokens:4096}]}}});
+  writeFileSync(join(agentDir,'models.json'),modelConfig);
+  const authConfig='{"fixture":{"type":"api_key","key":"${OPENAI_API_KEY}"}}';
+  writeFileSync(join(agentDir,'auth.json'),authConfig);
+  const serverSecret=await json(`/api/companies/${company.id}/secrets`,{name:"Server provider fixture",value:"server-key-must-not-replace-machine-auth"});
+  const agent=await json(`/api/companies/${company.id}/agents`,{
+    name:'Actual Pi',role:'engineer',adapterType:'pi_local',defaultEnvironmentId:registered.environmentId,
+    adapterConfig:{command:join(root,'.cache/pi-config/scripts/paperclip-pi'),cwd:workspace,model:'fixture/fixture',timeoutSec:60,machineSessionDir:sessions,
+      env:{OPENAI_API_KEY:{type:'secret_ref',secretId:serverSecret.id},PI_CODING_AGENT_DIR:'/server/runtime/must-not-be-used'}},
+  });
+  const task=await json(`/api/companies/${company.id}/issues`,{title:'Read the assigned task and report progress',status:'backlog',assigneeAgentId:agent.id});
+  const policy=JSON.parse(readFileSync(join(root,'.cache/pi-config/policies/personal.example.json'),'utf8'));
+  Object.assign(policy,{projectRoot:workspace,scratchRoots:[],scripts:[]});
+  writeFileSync(policyPath,JSON.stringify(policy),{mode:0o600});
+  writeFileSync(workerPath,JSON.stringify({version:1,apiUrl:origin,companyId:company.id,agentId:agent.id,workerId:'fixture',generation:'one',expirySeconds:3600,hostInputs:[]}),{mode:0o600});
+  execFileSync('git',['init',workspace],{stdio:'ignore'});
+  execFileSync('git',['-C',workspace,'-c','user.name=Fixture','-c','user.email=fixture@outpost.test','commit','--allow-empty','-m','Machine Pi history'],{stdio:'ignore'});
+  const history=execFileSync('git',['-C',workspace,'rev-parse','HEAD'],{encoding:'utf8'});
+  // Configure writable runtime state locally through the registration CLI.
+  const piPrivate=join(home,'pi-private');
+  const piRegistration=JSON.parse(cli(['register','--instance',origin,'--company',company.id,'--name','Pi worker',
+    '--private-dir',piPrivate,'--workspace-root',join(home,'workspaces'),'--scratch-root',join(home,'scratch')],
+    {operatorAuthorization:`Bearer ${boardToken}`,runtimeRoots:[state,sessions,agentDir],runtimeEnv:['OPENAI_API_KEY']}));
+  await json(`/api/agents/${agent.id}`,{defaultEnvironmentId:piRegistration.environmentId},undefined,'PATCH');
+  const daemon=spawn(join(root,'bin/outpost'),['daemon','--private-dir',piPrivate],{env:{...process.env,PATH:node22.slice(0,-5)+':/usr/bin:/bin',
+    OPENAI_API_KEY:'machine-provider-key',PI_CODING_AGENT_DIR:agentDir,PI_APPROVAL_POLICY:policyPath,PI_APPROVAL_STATE:state,PI_APPROVAL_PAPERCLIP:workerPath},stdio:['ignore','pipe','pipe']});
+  processes.push(daemon);
+  await eventually(async()=>(await json(`/api/plugins/yelqo.outpost/api/outposts/${piRegistration.outpostId}?companyId=${company.id}`)).connected);
+  try {
+    for(let attempt=0;attempt<2;attempt++) {
+      const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{payload:{issueId:task.id}});
+      let outcome;
+      await eventually(async()=>{outcome=await json(`/api/heartbeat-runs/${run.id}`);return !['queued','running'].includes(outcome.status);},90000);
+      assert.equal(outcome.status,'succeeded',JSON.stringify({error:outcome.error,stderr:outcome.stderrExcerpt.slice(-3000),stdout:outcome.stdoutExcerpt.slice(-3000)}));
+      const log=await json(`/api/heartbeat-runs/${run.id}/log`);
+      assert.match(log.content,/Assigned task completed/);
+      assert.match(log.content,/Protected approval\/configuration state/);
+      assert.match(log.content,/\/tmp\/pi-home/);
+      assert.ok(!log.content.includes('server-key-must-not-replace-machine-auth'));
+      assert.ok(!log.content.includes('machine-provider-key'));
+      const comments=await json(`/api/issues/${task.id}/comments`);
+      assert.equal(comments.length,attempt+1);
+      assert.equal(readFileSync(join(workspace,'pi-effect.txt'),'utf8'),'machine-owned Pi effect\n');
+      assert.equal(execFileSync('git',['-C',workspace,'rev-parse','HEAD'],{encoding:'utf8'}),history);
+    }
+    assert.equal(readFileSync(join(workspace,'pi-second-effect.txt'),'utf8'),'machine-owned Pi effect\n');
+    assert.equal(readFileSync(join(agentDir,'models.json'),'utf8'),modelConfig);
+    assert.equal(readFileSync(join(agentDir,'auth.json'),'utf8'),authConfig);
+    assert.equal(readFileSync(policyPath,'utf8'),JSON.stringify(policy));
+    assert.equal(execFileSync('git',['-C',workspace,'rev-parse','HEAD'],{encoding:'utf8'}),history);
+    // A loopback URL supplied as ordinary runtime environment never becomes
+    // trusted instance identity, even with explicit server env forwarding.
+    const allowedConfig={...agent.adapterConfig,allowServerRuntimeConfig:true,env:{PI_APPROVAL_CALLBACK_URL:'http://127.0.0.1:9'}};
+    await json(`/api/agents/${agent.id}`,{adapterConfig:allowedConfig},undefined,'PATCH');
+    const providerCalls=calls;
+    const rejected=await terminalRun(await json(`/api/agents/${agent.id}/heartbeat/invoke`,{payload:{issueId:task.id}}));
+    assert.equal(rejected.status,'failed');
+    assert.equal(calls,providerCalls,'Untrusted transport must fail before calling the provider');
+  } finally {
+    daemon.kill('SIGTERM');
+    await eventually(async()=>!(await json(`/api/plugins/yelqo.outpost/api/outposts/${piRegistration.outpostId}?companyId=${company.id}`)).connected);
+  }
+});
 async function commandAgent(cwd,args,extra={}) {
   return json(`/api/companies/${company.id}/agents`,{
     name:'Execution fixture',role:'engineer',adapterType:'process',defaultEnvironmentId:registered.environmentId,

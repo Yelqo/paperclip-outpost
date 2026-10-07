@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -34,10 +35,14 @@ type Connection struct {
 	WorkspaceRoot string            `json:"workspaceRoot"`
 	ScratchRoot   string            `json:"scratchRoot"`
 	Headers       map[string]string `json:"headers,omitempty"`
+	RuntimeRoots  []string          `json:"runtimeRoots,omitempty"`
+	RuntimeEnv    []string          `json:"runtimeEnv,omitempty"`
 }
 type enrollment struct {
 	OperatorAuthorization string            `json:"operatorAuthorization"`
 	Headers               map[string]string `json:"headers"`
+	RuntimeRoots          []string          `json:"runtimeRoots,omitempty"`
+	RuntimeEnv            []string          `json:"runtimeEnv,omitempty"`
 }
 
 func Run(args []string, input io.Reader, output io.Writer) error {
@@ -76,6 +81,9 @@ func Run(args []string, input io.Reader, output io.Writer) error {
 		if err := validateHeaders(auth.Headers); err != nil {
 			return err
 		}
+		if err := validateRuntimeEnv(auth.RuntimeEnv); err != nil {
+			return err
+		}
 		var result struct {
 			OutpostID  string   `json:"outpostId"`
 			Credential string   `json:"credential"`
@@ -97,7 +105,11 @@ func Run(args []string, input io.Reader, output io.Writer) error {
 			revoke(origin, *company, result.OutpostID, auth)
 			return err
 		}
-		c := Connection{origin, *company, result.OutpostID, environment.ID, *name, result.Credential, *workspace, *scratch, auth.Headers}
+		c := Connection{Instance: origin, CompanyID: *company, OutpostID: result.OutpostID, EnvironmentID: environment.ID, Name: *name, Credential: result.Credential, WorkspaceRoot: *workspace, ScratchRoot: *scratch, Headers: auth.Headers, RuntimeRoots: auth.RuntimeRoots, RuntimeEnv: auth.RuntimeEnv}
+		if err := validateRuntimeRoots(*privateDir, c); err != nil {
+			revoke(origin, *company, result.OutpostID, auth)
+			return err
+		}
 		if err := save(*privateDir, c); err != nil {
 			revoke(origin, *company, result.OutpostID, auth)
 			return err
@@ -260,7 +272,46 @@ func load(dir string) (Connection, error) {
 	if err := validateHeaders(c.Headers); err != nil {
 		return c, err
 	}
+	if err := validateRuntimeRoots(dir, c); err != nil {
+		return c, err
+	}
+	if err := validateRuntimeEnv(c.RuntimeEnv); err != nil {
+		return c, err
+	}
 	return c, nil
+}
+
+var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// Provider variables are selected on the machine, never inferred from server
+// settings or from the controller's credential-bearing environment.
+func validateRuntimeEnv(names []string) error {
+	for _, name := range names {
+		if !envName.MatchString(name) || name == "TMPDIR" || name == "PI_APPROVAL_TRANSPORT" || name == "PI_APPROVAL_CALLBACK_URL" || strings.HasPrefix(name, "OUTPOST_") || strings.HasPrefix(name, "PAPERCLIP_") || strings.HasPrefix(name, "CF_ACCESS_") {
+			return errors.New("runtime environment must select local variables outside reserved transport namespaces")
+		}
+	}
+	return nil
+}
+
+// Writable runtime state is selected locally, never by an execution request.
+func validateRuntimeRoots(privateDir string, c Connection) error {
+	for _, root := range c.RuntimeRoots {
+		canonical, err := filepath.EvalSymlinks(root)
+		info, statErr := os.Stat(root)
+		if err != nil || statErr != nil || !filepath.IsAbs(root) || canonical != filepath.Clean(root) || !info.IsDir() || !owned(info) {
+			return errors.New("runtime roots must be existing canonical worker-owned directories")
+		}
+		for _, protected := range []string{privateDir, c.WorkspaceRoot, c.ScratchRoot} {
+			if containsPath(root, protected) || containsPath(protected, root) {
+				return errors.New("runtime state must be separate from private, workspace and scratch roots")
+			}
+		}
+		if root == "/home" || root == "/tmp" || root == "/var/tmp" || (!containsPath("/home", root) && !containsPath("/tmp", root) && !containsPath("/var/tmp", root)) {
+			return errors.New("runtime state must be under a worker home or temporary directory")
+		}
+	}
+	return nil
 }
 
 func owned(info os.FileInfo) bool {

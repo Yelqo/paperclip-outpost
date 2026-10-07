@@ -2,7 +2,7 @@
 
 Issue #3 implements registration, named environment selection and the outbound
 connection. Issue #4 adds [bounded process command execution](execution.md).
-Pi and other runtime adapters require their subsequent integration milestones.
+Issue #5 adds [Pi with machine-owned assets and scoped callbacks](pi.md).
 
 ## Supported development installation
 
@@ -15,6 +15,7 @@ submitted or released upstream.
 mise trust
 mise install
 pnpm prepare:host
+pnpm prepare:pi
 pnpm install --frozen-lockfile
 pnpm build
 pnpm check
@@ -34,8 +35,9 @@ the pinned host/SDK patch with frozen dependencies, builds the plugin and daemon
 checks plugin and host TypeScript plus Go, and runs the host routing/authorization
 regressions and public workflow suite. The Ubuntu 24.04 runner installs bubblewrap
 and permits unprivileged user namespaces for the protection tests. This setting
-applies only to the disposable CI runner. No additional repository secrets or
-external service accounts are required.
+applies only to the disposable CI runner. Pi preparation requires the read-only
+`PI_CONFIG_READ_TOKEN` secret because pi-config is private. No model-provider or
+external service account is required for the deterministic acceptance fixture.
 
 Install the built plugin directory through Paperclip's existing instance-admin
 plugin installation API or UI. Use the pinned, patched host for that instance;
@@ -159,14 +161,16 @@ bin/outpost protect --private-dir /home/worker/.outpost-private -- COMMAND ARG..
 It uses bubblewrap with a read-only host filesystem, writable workspace/scratch
 binds, a private PID namespace and `/proc`, a fresh `/dev`, hidden `/sys`, and an
 empty mount over the private state directory. It provides a small environment
-allowlist; connection, operator and proxy credentials are not forwarded. Missing
+allowlist plus locally selected `runtimeEnv` provider variables; connection,
+operator and proxy credentials are not forwarded. See [Pi worker setup](pi.md)
+for local runtime state and provider configuration. Missing
 bubblewrap or unavailable namespaces cause failure, with no unsandboxed fallback.
 The public workflow test proves that same-UID access is possible outside this
 profile and that the profile hides both the credential file and host process
 environment paths.
 
-Future execution integration must use this profile (or a separately verified
-equivalent) in addition to each runtime's existing sandbox. Do not run arbitrary
+Execution uses this profile in addition to each runtime's existing sandbox.
+Do not run arbitrary
 same-UID agent processes outside that boundary, expose host `/proc` through
 another mount, or make hard-link copies of private credentials in agent-readable
 paths. This is an isolation mechanism for prepared Linux hosts, not a claim

@@ -1,12 +1,13 @@
 {
   "name": "@yelqo/paperclip-outpost",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "paperclipPlugin": {"manifest": "./dist/manifest.js", "worker": "./dist/worker.js"},
   "scripts": {
     "generate:versions": "node scripts/generate-versions.mjs",
     "prepare:host": "node scripts/generate-versions.mjs && node scripts/prepare-host.mjs",
+    "prepare:pi": "node scripts/prepare-pi.mjs",
     "build": "node scripts/generate-versions.mjs && tsc --noEmit && node scripts/build-plugin.mjs && go build -o bin/outpost ./cmd/outpost",
     "check:format": "node scripts/check-go-format.mjs",
     "check": "node scripts/generate-versions.mjs --check && pnpm check:format && tsc --noEmit && go vet ./...",

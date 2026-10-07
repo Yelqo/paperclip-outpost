@@ -1,0 +1,171 @@
+diff --git a/scripts/paperclip-pi.ts b/scripts/paperclip-pi.ts
+index 97cdee6..e5f6b75 100644
+--- a/scripts/paperclip-pi.ts
++++ b/scripts/paperclip-pi.ts
+@@ -1,13 +1,19 @@
+ import { spawn } from "node:child_process";
+-import { lstat, readFile, realpath } from "node:fs/promises";
+-import { resolve } from "node:path";
++import { lstat, readFile, realpath, unlink, writeFile } from "node:fs/promises";
++import { join, resolve } from "node:path";
+ import { fileURLToPath } from "node:url";
+ import { DefaultResourceLoader, getAgentDir, SettingsManager, VERSION } from "@earendil-works/pi-coding-agent";
+ import { canonical, digest, physical, within } from "../src/identity.ts";
+ import { loadPolicy } from "../src/policy.ts";
+-import { loadWorkerConfig, paperclipRevision } from "../src/paperclip.ts";
++import { loadRunTransport, loadWorkerConfig, paperclipRevision } from "../src/paperclip.ts";
+ import { Store } from "../src/store.ts";
+ 
++let gateway: ReturnType<typeof spawn> | undefined;
++let finalizedTransport: string | undefined;
++async function cleanup(): Promise<void> {
++  gateway?.kill();
++  if (finalizedTransport) await unlink(finalizedTransport).catch(() => {});
++}
+ async function main(): Promise<void> {
+   const args = process.argv.slice(2);
+   if (process.version !== "v22.22.1" || VERSION !== "1.0.3") throw new Error("Worker Node/Pi versions do not match the pinned runtime");
+@@ -27,6 +33,30 @@ async function main(): Promise<void> {
+   const cwd = await realpath(process.cwd());
+   const policy = await loadPolicy(policyPath, cwd, state);
+   if ([policy.projectRoot, ...policy.scratchRoots].some(root => within(packageRoot, root))) throw new Error("Install the gate outside writable project/scratch paths");
++  let bridge: ReturnType<typeof spawn> | undefined;
++  if (process.env.PI_APPROVAL_TRANSPORT) {
++    const transport = await loadRunTransport(process.env.PI_APPROVAL_TRANSPORT, policy);
++    // Verify static instance and every run binding before starting any listener.
++    await loadWorkerConfig(workerPath, policy);
++    await unlink(join(transport.queueDir, "ready.json")).catch(error => { if (error.code !== "ENOENT") throw error; });
++    bridge = spawn(process.execPath, [resolve(packageRoot, "runtime/callback-bridge.mjs")], { env: {
++      ...process.env, PAPERCLIP_API_BRIDGE_MODE: "queue_v1", PAPERCLIP_BRIDGE_HOST: "127.0.0.1", PAPERCLIP_BRIDGE_PORT: "0",
++      PAPERCLIP_BRIDGE_QUEUE_DIR: transport.queueDir, PAPERCLIP_BRIDGE_TOKEN: transport.token,
++    }, stdio: ["ignore", "ignore", "inherit"] });
++    gateway = bridge;
++    bridge.on("error", () => { process.exitCode = 1; });
++    const readyFile = join(transport.queueDir, "ready.json");
++    let ready: { baseUrl: string; pid: number; host: string; port: number } | undefined;
++    for (let i = 0; i < 100; i++) {
++      if (bridge.exitCode !== null) throw new Error("Callback gateway exited before readiness");
++      try { ready = JSON.parse(await readFile(readyFile, "utf8")); break; } catch {}
++      await new Promise(r => setTimeout(r, 50));
++    }
++    if (!ready || ready.pid !== bridge.pid || ready.host !== "127.0.0.1" || !Number.isInteger(ready.port) || ready.port < 1 || ready.port > 65535 || ready.baseUrl !== `http://127.0.0.1:${ready.port}`) { bridge.kill(); throw new Error("Callback gateway did not become ready"); }
++    finalizedTransport = join(state, `transport-${transport.runId}.json`);
++    await writeFile(finalizedTransport, JSON.stringify({ ...transport, callbackUrl: ready.baseUrl }), { flag: "wx", mode: 0o600 });
++    process.env.PI_APPROVAL_TRANSPORT = finalizedTransport;
++  }
+   const { config } = await loadWorkerConfig(workerPath, policy);
+   await new Store(state, [policy.projectRoot, ...policy.scratchRoots]).init();
+   const agentDir = await physical(getAgentDir());
+@@ -64,7 +94,8 @@ async function main(): Promise<void> {
+   { cwd, env: process.env, stdio: ["ignore", "inherit", "inherit"], detached: true });
+   for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) process.on(signal, () => { try { process.kill(-child.pid!, signal); } catch {} });
+   child.on("error", () => { process.stderr.write("Pinned Pi failed to start\n"); process.exitCode = 1; });
+-  child.on("close", (code, signal) => { process.exitCode = code ?? (signal ? 128 : 1); });
++  bridge?.on("exit", () => { if (child.exitCode === null) child.kill("SIGTERM"); });
++  child.on("close", (code, signal) => { void cleanup(); process.exitCode = code ?? (signal ? 128 : 1); });
+ }
+ 
+-main().catch(() => { process.stderr.write("Approval worker preflight failed; verify pinned versions and operator-owned configuration\n"); process.exitCode = 1; });
++main().catch(async () => { await cleanup(); process.stderr.write("Approval worker preflight failed; verify pinned versions and operator-owned configuration\n"); process.exitCode = 1; });
+diff --git a/src/file-operations.ts b/src/file-operations.ts
+index 587a000..8a3c231 100644
+--- a/src/file-operations.ts
++++ b/src/file-operations.ts
+@@ -26,8 +26,11 @@ export function fileOperations(policy: Policy, signal?: AbortSignal) {
+       cwd: policy.projectRoot, env: policy.environment, encoding: "buffer",
+       timeout: policy.maxExecutionSeconds * 1000, maxBuffer: 20 * 1024 * 1024, signal,
+     });
++    let inputError: Error | undefined;
++    pending.child.stdin?.on("error", error => { inputError = error; });
+     pending.child.stdin?.end(content ?? "");
+     const result = await pending;
++    if (inputError) throw new Error("Sandbox file operation input delivery failed");
+     return result.stdout;
+   }
+   return {
+diff --git a/src/paperclip.ts b/src/paperclip.ts
+index b7f71ea..7c3fa9b 100644
+--- a/src/paperclip.ts
++++ b/src/paperclip.ts
+@@ -4,14 +4,14 @@ import { Effect, Schema } from "effect";
+ import { canonical, digest, within } from "./identity.ts";
+ import type { Policy } from "./types.ts";
+ 
+-export const paperclipRevision = "59015846ae02f935411afc620e0867ce812378fb";
++export const paperclipRevision = "f858207161ba29c01c82f4674aef83d91b74480f";
+ const ConfigSchema = Schema.Struct({
+   version: Schema.Literal(1), apiUrl: Schema.String, companyId: Schema.String,
+   agentId: Schema.String, workerId: Schema.String, generation: Schema.String,
+   expirySeconds: Schema.Number, hostInputs: Schema.Array(Schema.String),
+ });
+ export type WorkerConfig = typeof ConfigSchema.Type;
+-export interface RunIdentity { taskId: string; runId: string; token: string }
++export interface RunIdentity { taskId: string; runId: string; token: string; apiUrl?: string }
+ export interface ProposalCard { key: string; details: string }
+ export interface Interaction {
+   id: string; companyId: string; issueId: string; kind: string; idempotencyKey: string;
+@@ -29,14 +29,31 @@ export interface ApprovalChannel {
+   withdraw(card: ProposalCard, signal: AbortSignal): Promise<void>;
+ }
+ 
+-const id = /^[a-f0-9-]{36}$/i;
+-export async function loadWorkerConfig(path: string, policy: Policy, env = process.env): Promise<{ config: WorkerConfig; run: RunIdentity }> {
++export interface RunTransport {
++  instance: string; companyId: string; agentId: string; taskId: string; runId: string;
++  queueDir: string; token: string; expiresAt: string; callbackUrl?: string;
++}
++async function readPrivateWorkerFile(path: string, policy: Policy): Promise<string> {
+   if (!isAbsolute(path) || await realpath(path) !== path || [policy.projectRoot, ...policy.scratchRoots].some(root => within(path, root))) {
+-    throw new Error("Paperclip worker configuration must be canonical and outside agent-writable roots");
++    throw new Error("Worker configuration/transport must be canonical and outside agent-writable roots");
+   }
+   const stat = await lstat(path);
+-  if (!stat.isFile() || stat.uid !== process.getuid?.() || stat.mode & 0o077 || stat.size > 16384) throw new Error("Worker config must be an owned private file (0600)");
+-  const config = Schema.decodeUnknownSync(Schema.fromJsonString(ConfigSchema))(await readFile(path, "utf8"));
++  if (!stat.isFile() || stat.uid !== process.getuid?.() || stat.mode & 0o077 || stat.size > 16384) throw new Error("Worker configuration/transport must be an owned private file (0600)");
++  policy.protectedRoots.push(path);
++  return readFile(path, "utf8");
++}
++export async function loadRunTransport(path: string, policy: Policy): Promise<RunTransport> {
++  const value: RunTransport = JSON.parse(await readPrivateWorkerFile(path, policy));
++  if (!value || typeof value.instance !== "string" || ![value.companyId, value.agentId, value.taskId, value.runId].every(x => typeof x === "string" && id.test(x)) ||
++      typeof value.token !== "string" || value.token.length < 32 || !isAbsolute(value.queueDir) || !within(value.queueDir, policy.projectRoot) ||
++      !Number.isFinite(Date.parse(value.expiresAt)) || Date.parse(value.expiresAt) <= Date.now()) throw new Error("Invalid or expired run transport");
++  return value;
++}
++
++const id = /^[a-f0-9-]{36}$/i;
++export async function loadWorkerConfig(path: string, policy: Policy, env = process.env): Promise<{ config: WorkerConfig; run: RunIdentity }> {
++  const config = Schema.decodeUnknownSync(Schema.fromJsonString(ConfigSchema))(await readPrivateWorkerFile(path, policy));
++  const transport = env.PI_APPROVAL_TRANSPORT ? await loadRunTransport(env.PI_APPROVAL_TRANSPORT, policy) : undefined;
+   const url = new URL(config.apiUrl);
+   if (url.username || url.password || url.search || url.hash || url.pathname !== "/" ||
+       !(url.protocol === "https:" || url.protocol === "http:" && ["127.0.0.1", "[::1]", "localhost"].includes(url.hostname))) {
+@@ -49,8 +66,16 @@ export async function loadWorkerConfig(path: string, policy: Policy, env = proce
+       env.PAPERCLIP_COMPANY_ID !== config.companyId || env.PAPERCLIP_AGENT_ID !== config.agentId || !env.PAPERCLIP_API_KEY) {
+     throw new Error("Invalid or mismatched Paperclip worker/run identity");
+   }
+-  policy.protectedRoots.push(path);
+-  return { config, run: { taskId: env.PAPERCLIP_TASK_ID!, runId: env.PAPERCLIP_RUN_ID!, token: env.PAPERCLIP_API_KEY! } };
++  if (transport && (transport.instance.replace(/\/$/, "") !== config.apiUrl.replace(/\/$/, "") || transport.companyId !== config.companyId ||
++      transport.agentId !== config.agentId || transport.taskId !== env.PAPERCLIP_TASK_ID || transport.runId !== env.PAPERCLIP_RUN_ID ||
++      transport.token !== env.PAPERCLIP_API_KEY || transport.queueDir !== env.PAPERCLIP_BRIDGE_QUEUE_DIR)) throw new Error("Run transport identity mismatch");
++  if (env.PI_APPROVAL_CALLBACK_URL) throw new Error("Environment-provided callback URLs are not trusted");
++  const transportUrl = transport?.callbackUrl;
++  if (transportUrl) {
++    const endpoint = new URL(transportUrl);
++    if (!transport || endpoint.protocol !== "http:" || endpoint.hostname !== "127.0.0.1" || endpoint.username || endpoint.password || endpoint.pathname !== "/" || endpoint.search || endpoint.hash) throw new Error("Untrusted callback transport");
++  }
++  return { config, run: { taskId: env.PAPERCLIP_TASK_ID!, runId: env.PAPERCLIP_RUN_ID!, token: env.PAPERCLIP_API_KEY!, ...(transportUrl ? { apiUrl: transportUrl } : {}) } };
+ }
+ 
+ // Only this operator-configured client holds the token. No arbitrary HTTP
+@@ -60,7 +85,7 @@ export class PaperclipChannel implements ApprovalChannel {
+ 
+   private request(path: string, method: "GET" | "POST" | "PATCH", body: unknown, signal: AbortSignal): Promise<any> {
+     const request = Effect.tryPromise({ try: async requestSignal => {
+-      const response = await fetch(new URL(path, this.config.apiUrl), {
++      const response = await fetch(new URL(path, this.run.apiUrl ?? this.config.apiUrl), {
+         method, redirect: "error", signal: requestSignal,
+         headers: { Authorization: `Bearer ${this.run.token}`, "X-Paperclip-Run-Id": this.run.runId, "Content-Type": "application/json" },
+         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
