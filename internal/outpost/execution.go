@@ -102,9 +102,19 @@ func newSupervisor(dir string, c Connection) (*supervisor, error) {
 		return nil, errors.New("daemon already running")
 	}
 	s := &supervisor{dir: dir, connection: c, records: map[string]executionRecord{}, owners: map[string]*workspaceOwnership{}, lock: lock}
+	ready := false
+	defer func() {
+		if !ready {
+			lock.Close()
+			for _, owner := range s.owners {
+				if owner.lock != nil {
+					owner.lock.Close()
+				}
+			}
+		}
+	}()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		lock.Close()
 		return nil, err
 	}
 	for _, entry := range entries {
@@ -114,7 +124,6 @@ func newSupervisor(dir string, c Connection) (*supervisor, error) {
 		data, readErr := os.ReadFile(filepath.Join(dir, entry.Name()))
 		var record executionRecord
 		if readErr != nil || json.Unmarshal(data, &record) != nil || record.OperationID == "" || record.RunID == "" || record.Workspace == "" {
-			lock.Close()
 			return nil, errors.New("cannot reconcile execution history")
 		}
 		s.records[record.OperationID] = record
@@ -125,7 +134,6 @@ func newSupervisor(dir string, c Connection) (*supervisor, error) {
 				s.owners[record.Workspace] = owner
 			}
 			if owner.runID != record.RunID {
-				lock.Close()
 				return nil, errors.New("cannot reconcile conflicting workspace ownership")
 			}
 			owner.operations[record.OperationID] = struct{}{}
@@ -134,7 +142,63 @@ func newSupervisor(dir string, c Connection) (*supervisor, error) {
 			}
 		}
 	}
+	if err := s.restoreWorkspaceLocks(); err != nil {
+		return nil, err
+	}
+	ready = true
 	return s, nil
+}
+
+// Restore directory exclusion before opening the transport. History stores the
+// actual device/inode, so locating it under the worker root also handles renamed
+// directories without changing the durable record format.
+func (s *supervisor) restoreWorkspaceLocks() error {
+	remaining := len(s.owners)
+	if remaining == 0 {
+		return nil
+	}
+	root, err := filepath.EvalSymlinks(s.connection.WorkspaceRoot)
+	if err != nil {
+		return errors.New("cannot restore uncertain workspace ownership")
+	}
+	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			// Unrelated unreadable subtrees need not prevent recovery. Any
+			// uncertain identity still missing after the scan fails startup.
+			return nil
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil
+		}
+		stat := info.Sys().(*syscall.Stat_t)
+		workspace := fmt.Sprintf("%d:%d", stat.Dev, stat.Ino)
+		owner := s.owners[workspace]
+		if owner == nil || owner.lock != nil {
+			return nil
+		}
+		file, actual, err := s.workspace(path)
+		if err != nil {
+			return err
+		}
+		if actual != workspace || syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+			file.Close()
+			return errors.New("cannot lock uncertain workspace")
+		}
+		owner.lock = file
+		remaining--
+		if remaining == 0 {
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if err != nil || remaining != 0 {
+		return errors.New("cannot restore uncertain workspace ownership")
+	}
+	return nil
 }
 
 func (s *supervisor) persist(record executionRecord, exclusive bool) error {

@@ -182,7 +182,9 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
       if(!sent || (error instanceof Error && "beforeLaunch" in error && error.beforeLaunch===true)) settle();
       if(error instanceof Error && "code" in error && error.code===PLUGIN_RPC_ERROR_CODES.EXECUTION_UNAVAILABLE) {
         settle();
-        if(!agentExecution || lease.executedAgent) throw new Error(error.message);
+        // Setup controls can defer too, but an outstanding operation or an
+        // already executed agent makes a replacement run unsafe.
+        if(lease.executedAgent || lease.operations.size>0) throw new Error(error.message);
       }
       throw error;
     }

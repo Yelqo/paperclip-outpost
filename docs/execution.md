@@ -82,6 +82,13 @@ it discards replay protection. Automatic interruption reconciliation, buffered
 output recovery, cancellation receipts and operator reconciliation belong to
 the recovery milestones. This release fails uncertain operations closed.
 
+On startup, the daemon locates uncertain workspace identities under its worker
+root and reacquires their directory locks before opening its transport. This
+preserves exclusion across other daemon registrations and directory renames,
+using the existing execution history format. Startup refuses to proceed if a
+recorded directory cannot be found or locked. Recovering uncertainty may require
+scanning the worker root; ordinary startup with only terminal records does not.
+
 ## Pending unavailable work
 
 An offline outpost, a busy workspace or occupied admission capacity produces an
@@ -99,6 +106,11 @@ admission rechecks that identity and local ownership before durable launch
 intent, including contention with another daemon registration. Control
 operations keep their own admission capacity and use their admitted run's
 workspace reservation.
+
+Before-launch control refusals, including Pi's command availability check, use
+the same deferral lane when no agent has executed and no other operation remains
+outstanding. Refusals during or after agent execution, or while another operation
+has an uncertain outcome, do not authorize a replacement run.
 
 Read-only workspace inspection and commands still awaiting transport dispatch
 can be deferred safely after disconnection. Once an execution request has been

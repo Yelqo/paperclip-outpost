@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -15,6 +16,15 @@ type executionFixture struct {
 	workspace  string
 	identity   string
 	root       string
+}
+
+func closeTestSupervisor(s *supervisor) {
+	for _, owner := range s.owners {
+		if owner.lock != nil {
+			owner.lock.Close()
+		}
+	}
+	s.lock.Close()
 }
 
 func newExecutionFixture(t *testing.T) executionFixture {
@@ -37,14 +47,7 @@ func newExecutionFixture(t *testing.T) executionFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		s.lock.Close()
-		for _, owner := range s.owners {
-			if owner.lock != nil {
-				owner.lock.Close()
-			}
-		}
-	})
+	t.Cleanup(func() { closeTestSupervisor(s) })
 	file, identity, err := s.workspace(c.WorkspaceRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -217,18 +220,142 @@ func TestUncertainControlRetainsOwnershipAfterSiblingCompletionAndRestart(t *tes
 	if err := os.Remove(blockedWrite); err != nil {
 		t.Fatal(err)
 	}
-	for _, owner := range f.supervisor.owners {
-		if owner.lock != nil {
-			owner.lock.Close()
-		}
-	}
-	f.supervisor.lock.Close()
+	closeTestSupervisor(f.supervisor)
 	restarted, err := newSupervisor(f.supervisor.dir, f.supervisor.connection)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer restarted.lock.Close()
+	defer closeTestSupervisor(restarted)
+	private := filepath.Join(f.root, "other-private")
+	if err := os.Mkdir(private, 0700); err != nil {
+		t.Fatal(err)
+	}
+	other, err := newSupervisor(private, f.supervisor.connection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.lock.Close()
+	marker := filepath.Join(f.workspace, "conflicting-effect")
+	for _, purpose := range []string{"agent_execution", "control"} {
+		op := f.operation("B", "other-after-restart-"+purpose, purpose)
+		op.Args = []string{"-c", "echo conflicting > \"$1\"", "conflict", marker}
+		if result := handleResult(t, other, op); result["errorCode"] != "execution_unavailable" {
+			t.Fatalf("another daemon admitted a conflicting %s after restart: %v", purpose, result)
+		}
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("conflicting work produced a workspace effect: %v", err)
+	}
 	if result := handleResult(t, restarted, f.operation("B", "after-restart", "agent_execution")); result["errorCode"] != "execution_unavailable" {
 		t.Fatalf("restart freed an uncertain control: %v", result)
 	}
+}
+
+func TestRestartLocksRenamedUncertainWorkspaces(t *testing.T) {
+	for _, purpose := range []string{"agent_execution", "control"} {
+		t.Run(purpose, func(t *testing.T) {
+			f := newExecutionFixture(t)
+			unreadable := filepath.Join(f.workspace, "a-unrelated")
+			if err := os.Mkdir(unreadable, 0000); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { os.Chmod(unreadable, 0700) })
+			path := filepath.Join(f.workspace, "project")
+			if err := os.Mkdir(path, 0700); err != nil {
+				t.Fatal(err)
+			}
+			file, identity, err := f.supervisor.workspace(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			file.Close()
+			// An intent-only record also represents a crash before process start.
+			if err := f.supervisor.persist(executionRecord{RunID: "A", OperationID: "uncertain", Purpose: purpose, Workspace: identity}, true); err != nil {
+				t.Fatal(err)
+			}
+			renamed := filepath.Join(f.workspace, "renamed")
+			if err := os.Rename(path, renamed); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(renamed, path); err != nil {
+				t.Fatal(err)
+			}
+			closeTestSupervisor(f.supervisor)
+			restarted, err := newSupervisor(f.supervisor.dir, f.supervisor.connection)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeTestSupervisor(restarted)
+			private := filepath.Join(f.root, "other-private")
+			if err := os.Mkdir(private, 0700); err != nil {
+				t.Fatal(err)
+			}
+			other, err := newSupervisor(private, f.supervisor.connection)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeTestSupervisor(other)
+			op := f.operation("B", "competing", "agent_execution")
+			op.Cwd, op.WorkspaceID = path, identity
+			if result := handleResult(t, other, op); result["errorCode"] != "execution_unavailable" {
+				t.Fatalf("another daemon admitted the renamed uncertain workspace: %v", result)
+			}
+			// Uncertainty in the child directory must not block another directory.
+			requireExecutionSuccess(t, handleResult(t, other, f.operation("B", "independent", "agent_execution")))
+		})
+	}
+}
+
+func TestFailedOwnershipRestorationReleasesStartupLocks(t *testing.T) {
+	f := newExecutionFixture(t)
+	for id, workspace := range map[string]string{"known": f.identity, "missing": "0:0"} {
+		if err := f.supervisor.persist(executionRecord{RunID: "A", OperationID: id, Purpose: "control", Workspace: workspace}, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	closeTestSupervisor(f.supervisor)
+	for i := 0; i < 2; i++ {
+		s, err := newSupervisor(f.supervisor.dir, f.supervisor.connection)
+		if err == nil {
+			closeTestSupervisor(s)
+			t.Fatal("startup ignored a missing uncertain workspace")
+		}
+		if err.Error() != "cannot restore uncertain workspace ownership" {
+			t.Fatalf("failed startup retained the daemon lock: %v", err)
+		}
+	}
+	file, _, err := f.supervisor.workspace(f.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("failed startup retained a directory lock: %v", err)
+	}
+}
+
+func TestRestartRefusesUncertainWorkspaceLockedByAnotherDaemon(t *testing.T) {
+	f := newExecutionFixture(t)
+	if err := f.supervisor.persist(executionRecord{RunID: "A", OperationID: "uncertain", Purpose: "control", Workspace: f.identity}, true); err != nil {
+		t.Fatal(err)
+	}
+	closeTestSupervisor(f.supervisor)
+	file, _, err := f.supervisor.workspace(f.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := newSupervisor(f.supervisor.dir, f.supervisor.connection); err == nil {
+		closeTestSupervisor(s)
+		t.Fatal("startup ignored another daemon's directory lock")
+	}
+	file.Close()
+	restarted, err := newSupervisor(f.supervisor.dir, f.supervisor.connection)
+	if err != nil {
+		t.Fatalf("startup could not retry once the competing lock was released: %v", err)
+	}
+	defer closeTestSupervisor(restarted)
 }
