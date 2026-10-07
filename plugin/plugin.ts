@@ -22,6 +22,10 @@ export default definePlugin({
   onEnvironmentValidateConfig(input) {
     return Effect.runPromise(workflows.validateEnvironment(input));
   },
+  onEnvironmentAcquireLease(input) { return workflows.execution.acquire(input); },
+  onEnvironmentRealizeWorkspace(input) { return workflows.execution.realize(input); },
+  onEnvironmentExecute(input) { return workflows.execution.execute(input); },
+  onEnvironmentReleaseLease() { return Promise.resolve(); },
   onWebSocketOpen(input) {
     return Effect.runPromise(workflows.open(input).pipe(Effect.catchAll(error => {
       if (error._tag === "PersistenceFailure") ctx.logger.error("Outpost persistence unavailable");

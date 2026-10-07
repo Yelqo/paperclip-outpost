@@ -3,6 +3,7 @@ import { Data, Effect, Exit, Scope } from "effect";
 import type { PluginContext, PluginApiRequestInput, PluginApiResponse, PluginWebSocketOpen, PluginWebSocketEvent, PluginWebSocketAdmission, PluginWebSocketReply } from "@paperclipai/plugin-sdk";
 import type { PluginEnvironmentValidateConfigParams } from "@paperclipai/plugin-sdk/protocol";
 import { versions } from "./versions.js";
+import { createExecutionWorkflows } from "./execution.js";
 
 export class InvalidCredentials extends Data.TaggedError("InvalidCredentials") { readonly message = "Invalid outpost credentials"; }
 export class RevokedOutpost extends Data.TaggedError("RevokedOutpost") { readonly message = "Outpost has been revoked"; }
@@ -27,6 +28,7 @@ function validVersions(value:unknown):boolean {
 /** SDK promises are adapted here; the workflows above this boundary use Effects. */
 export function createOutpostWorkflows(ctx:PluginContext) {
   const sessions = new Map<string,Session>();
+  const execution = createExecutionWorkflows(ctx,(companyId,outpostId) => [...sessions.values()].some(s => s.authenticated && s.companyId===companyId && s.outpostId===outpostId));
   const persistence = <A>(operation:() => Promise<A>) => Effect.tryPromise({try:operation, catch:() => new PersistenceFailure()});
   const read = (companyId:string,id:string) => persistence(() => ctx.state.get(stateKey(companyId,id))).pipe(Effect.map(value => value as Outpost | null));
   const write = (record:Outpost) => persistence(() => ctx.state.set(stateKey(record.companyId,record.id),record));
@@ -79,7 +81,10 @@ export function createOutpostWorkflows(ctx:PluginContext) {
         sessions.set(input.connectionId,session);
         return session;
       }), () => Effect.sync(() => {
-        if (sessions.get(input.connectionId) === session) sessions.delete(input.connectionId);
+        if (sessions.get(input.connectionId) === session) {
+          sessions.delete(input.connectionId);
+          if(session.authenticated) execution.close(session.companyId,session.outpostId);
+        }
       }));
       const record = yield* authenticate(input);
       yield* validateVersions(input);
@@ -97,8 +102,12 @@ export function createOutpostWorkflows(ctx:PluginContext) {
     const record = yield* read(session.companyId,session.outpostId);
     if (!record || record.revoked) return yield* Effect.fail(new RevokedOutpost());
     const data = yield* Effect.try({try:() => JSON.parse(input.data ?? ""),catch:() => new InvalidCredentials()});
-    if (data?.type !== "heartbeat" || Object.keys(data).length !== 1) return yield* Effect.fail(new InvalidCredentials());
-    return {messages:[JSON.stringify({type:"pong"})]};
+    if (data?.type === "heartbeat" && Object.keys(data).length === 1) return {messages:[JSON.stringify({type:"pong",operations:execution.drain(session.companyId,session.outpostId)})]};
+    if (data?.type === "output" || data?.type === "result") {
+      yield* Effect.try({try:() => execution.message(session.companyId,session.outpostId,data),catch:() => new InvalidCredentials()});
+      return {messages:[JSON.stringify({type:"ack",deliveryId:data.deliveryId})]};
+    }
+    return yield* Effect.fail(new InvalidCredentials());
   });
   const close = (connectionId:string) => Effect.suspend(() => {
     const session = sessions.get(connectionId);
@@ -111,5 +120,5 @@ export function createOutpostWorkflows(ctx:PluginContext) {
       ? {ok:true,normalizedConfig:{companyId,outpostId}}
       : {ok:false,errors:["A registered outpost and company are required"]};
   });
-  return {api,open,message,close,shutdown,validateEnvironment};
+  return {api,open,message,close,shutdown,validateEnvironment,execution};
 }

@@ -15,7 +15,8 @@ export default {
   ],
   environmentDrivers: [{
     driverKey:"outpost", kind:"sandbox_provider", displayName:"Outpost", companyScopeConfigKey:"companyId",
-    description:"A registered Outpost. Command execution is a separate integration milestone.",
+    workspaceRealization:"in_place",
+    description:"Bounded commands in an existing workspace on a registered Outpost.",
     configSchema:{type:"object", properties:{outpostId:{type:"string"},companyId:{type:"string"}}, required:["outpostId","companyId"], additionalProperties:false},
   }],
 } satisfies PaperclipPluginManifestV1;

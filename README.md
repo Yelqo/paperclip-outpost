@@ -15,11 +15,13 @@ human decisions.
 
 ## Current status
 
-Registration, named execution-environment selection and authenticated outbound
-connections are implemented in the Go CLI/daemon and TypeScript/Effect plugin.
+Registration, named execution-environment selection, authenticated outbound
+connections and bounded process commands in existing machine workspaces are
+implemented in the Go CLI/daemon and TypeScript/Effect plugin.
 See [setup, operator commands and protection boundaries](docs/connection.md).
+See [command execution and supervision](docs/execution.md).
 The required Paperclip host/SDK extension is carried as a reproducible patch
-against a pinned upstream commit. Agent execution, callback integration and
+against a pinned upstream commit. Pi runtime integration, callbacks and
 release/service installation remain subsequent milestones.
 
 The design was reconstructed with the operator on 2026-10-06. Its documents
