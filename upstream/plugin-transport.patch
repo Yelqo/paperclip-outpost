@@ -297,7 +297,7 @@ index 947a67cbb..45d259622 100644
    /**
     * Called when Paperclip scans issue/comment/document content and asks this
 diff --git a/packages/plugins/sdk/src/index.ts b/packages/plugins/sdk/src/index.ts
-index 57f862811..b933b3eef 100644
+index 57f862811..a3a3d4e8e 100644
 --- a/packages/plugins/sdk/src/index.ts
 +++ b/packages/plugins/sdk/src/index.ts
 @@ -49,6 +49,9 @@
@@ -305,13 +305,13 @@ index 57f862811..b933b3eef 100644
  // ---------------------------------------------------------------------------
  
 +export type { PluginWebSocketOpen, PluginWebSocketEvent, PluginWebSocketReply, PluginWebSocketAdmission } from "./define-plugin.js";
-+export const PLUGIN_WEBSOCKET_SDK_VERSION = "1.0.0+outpost.3";
++export const PLUGIN_WEBSOCKET_SDK_VERSION = "1.0.0+outpost.4";
 +
  export { definePlugin } from "./define-plugin.js";
  export { createTestHarness, createEnvironmentTestHarness, createFakeEnvironmentDriver, filterEnvironmentEvents, assertEnvironmentEventOrder, assertLeaseLifecycle, assertWorkspaceRealizationLifecycle, assertExecutionLifecycle, assertEnvironmentError } from "./testing.js";
  export { createPluginBundlerPresets } from "./bundlers.js";
 diff --git a/packages/plugins/sdk/src/protocol.ts b/packages/plugins/sdk/src/protocol.ts
-index 9c08a45c4..6873ff2d2 100644
+index 9c08a45c4..13a34434f 100644
 --- a/packages/plugins/sdk/src/protocol.ts
 +++ b/packages/plugins/sdk/src/protocol.ts
 @@ -1,3 +1,4 @@
@@ -319,7 +319,16 @@ index 9c08a45c4..6873ff2d2 100644
  import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paperclipai/shared";
  /**
   * JSON-RPC 2.0 message types and protocol helpers for the host ↔ worker IPC
-@@ -704,6 +705,12 @@ export interface PluginEnvironmentRealizeWorkspaceResult {
+@@ -266,6 +267,8 @@ export const PLUGIN_RPC_ERROR_CODES = {
+    * `multiCompanyConfig: true` on its definition.
+    */
+   CROSS_TENANT_CONFIG: -32006,
++  /** Environment refused the request before launch; safe to defer in the host scheduler. */
++  EXECUTION_UNAVAILABLE: -32007,
+   /** A catch-all for errors that do not fit other categories. */
+   UNKNOWN: -32099,
+ } as const;
+@@ -704,6 +707,12 @@ export interface PluginEnvironmentRealizeWorkspaceResult {
  }
  
  export interface PluginEnvironmentExecuteParams extends PluginEnvironmentDriverBaseParams {
@@ -332,7 +341,7 @@ index 9c08a45c4..6873ff2d2 100644
    lease: PluginEnvironmentLease;
    command: string;
    args?: string[];
-@@ -1212,6 +1219,11 @@ export function decodeChannelBytes(value: unknown): Uint8Array | null {
+@@ -1212,6 +1221,11 @@ export function decodeChannelBytes(value: unknown): Uint8Array | null {
  
  /** The open request for one persistent duplex channel. The worker registers the channel by `hostRouteId`. */
  export interface PluginDuplexChannelOpenParams {
@@ -344,7 +353,7 @@ index 9c08a45c4..6873ff2d2 100644
    /** The host-owned opaque route identifier. The worker registers the channel by it. */
    hostRouteId: string;
    /** The environment driver key, for the worker sandbox scope. */
-@@ -1323,6 +1335,9 @@ export const DUPLEX_CHANNEL_EXIT_NOTIFICATION = "duplexChannel.exit";
+@@ -1323,6 +1337,9 @@ export const DUPLEX_CHANNEL_EXIT_NOTIFICATION = "duplexChannel.exit";
   * ensure type safety across the IPC boundary.
   */
  export interface HostToWorkerMethods {
@@ -354,7 +363,7 @@ index 9c08a45c4..6873ff2d2 100644
    /** @see PLUGIN_SPEC.md §13.1 */
    initialize: [params: InitializeParams, result: InitializeResult];
    /** @see PLUGIN_SPEC.md §13.2 */
-@@ -1476,6 +1491,9 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[]
+@@ -1476,6 +1493,9 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[]
    "runJob",
    "handleWebhook",
    "handleApiRequest",
@@ -907,7 +916,7 @@ index 684e7cc13..8985f9c3a 100644
    // "set-cookie" is normally a response header; keep the request-side
 diff --git a/server/src/realtime/plugin-ws.ts b/server/src/realtime/plugin-ws.ts
 new file mode 100644
-index 000000000..2810319fd
+index 000000000..3919e5dfb
 --- /dev/null
 +++ b/server/src/realtime/plugin-ws.ts
 @@ -0,0 +1,132 @@
@@ -931,7 +940,7 @@ index 000000000..2810319fd
 +  try { commit = execFileSync("git", ["rev-parse", "HEAD"], {
 +    cwd: fileURLToPath(new URL("../../../", import.meta.url)), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1000,
 +  }).trim(); } catch { /* Packaged hosts must carry the build commit stamp. */ }
-+  const host = { commit, sdk: PLUGIN_WEBSOCKET_SDK_VERSION, transport: 3 };
++  const host = { commit, sdk: PLUGIN_WEBSOCKET_SDK_VERSION, transport: 4 };
 +  let admitted = 0, opening = 0, stopping = false;
 +  const pending = new Set<import("node:stream").Duplex>();
 +  server.on("upgrade", (req, socket, head) => {
@@ -1145,10 +1154,31 @@ index d1aefd34f..5e95de642 100644
                        lease: input.lease!,
                        command: channelInput.command,
 diff --git a/server/src/services/environment-run-orchestrator.ts b/server/src/services/environment-run-orchestrator.ts
-index 91f887ac7..be308d437 100644
+index 91f887ac7..351d17657 100644
 --- a/server/src/services/environment-run-orchestrator.ts
 +++ b/server/src/services/environment-run-orchestrator.ts
-@@ -458,6 +458,9 @@ export function environmentRunOrchestrator(
+@@ -1,3 +1,4 @@
++import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk/protocol";
+ /**
+  * Centralized environment run orchestrator.
+  *
+@@ -215,6 +216,7 @@ export function environmentRunOrchestrator(
+     try {
+       return await environmentRuntime.acquireRunLease(input);
+     } catch (err) {
++      if (err instanceof JsonRpcCallError && err.code === PLUGIN_RPC_ERROR_CODES.EXECUTION_UNAVAILABLE) throw err;
+       throw new EnvironmentRunError(
+         "lease_acquire_failed",
+         `Failed to acquire lease for environment "${input.environment.name}" (${input.environment.driver}): ${err instanceof Error ? err.message : String(err)}`,
+@@ -415,6 +417,7 @@ export function environmentRunOrchestrator(
+             : null;
+         workspaceRealization = parseObject(workspaceRealizationResult.metadata?.workspaceRealization);
+       } catch (err) {
++        if (err instanceof JsonRpcCallError && err.code === PLUGIN_RPC_ERROR_CODES.EXECUTION_UNAVAILABLE) throw err;
+         throw new EnvironmentRunError(
+           "workspace_realization_failed",
+           `Failed to realize workspace for environment "${environment.name}" (${environment.driver}): ${err instanceof Error ? err.message : String(err)}`,
+@@ -458,6 +461,9 @@ export function environmentRunOrchestrator(
      if (provisionCommand && !driverSkipsHostProvision) {
        try {
          const provisionResult = await environmentRuntime.execute({
@@ -1158,7 +1188,7 @@ index 91f887ac7..be308d437 100644
            environment,
            lease,
            command: "bash",
-@@ -519,6 +522,8 @@ export function environmentRunOrchestrator(
+@@ -519,6 +525,8 @@ export function environmentRunOrchestrator(
      let executionTarget: AdapterExecutionTarget | null;
      try {
        executionTarget = await resolveEnvironmentExecutionTarget({
@@ -1262,17 +1292,48 @@ index c63a3974a..6dc9e7f89 100644
        const rows = await db
          .select({ companyId: builtInManagedResources.companyId })
          .from(builtInManagedResources)
+diff --git a/server/src/services/execution-recovery-attempt.ts b/server/src/services/execution-recovery-attempt.ts
+index dec0d847c..094d554e2 100644
+--- a/server/src/services/execution-recovery-attempt.ts
++++ b/server/src/services/execution-recovery-attempt.ts
+@@ -42,7 +42,7 @@ function historicalFailureCount(run: RetryRun): number {
+ 
+ export function executionRetryAccounting(run: RetryRun): ExecutionRetryAccounting {
+   const saved = savedAccounting(run);
+-  const nonFailureLane = ["max_turns_continuation", "issue_disposition_repair", "workspace_busy", "ai_connection_busy", "ai_connection_pool_wait"].includes(run.scheduledRetryReason ?? "");
++  const nonFailureLane = ["max_turns_continuation", "issue_disposition_repair", "workspace_busy", "execution_unavailable", "ai_connection_busy", "ai_connection_pool_wait"].includes(run.scheduledRetryReason ?? "");
+   return {
+     version: 1,
+     failureRetries: Math.max(saved?.failureRetries ?? 0, saved && nonFailureLane ? 0 : historicalFailureCount(run)),
+@@ -57,7 +57,7 @@ export function executionFailureRetryCount(run: RetryRun): number {
+ }
+ 
+ export function executionRetryAttemptCount(run: RetryRun, reason: string): number {
+-  if (reason === "workspace_busy" || reason === "ai_connection_busy" || reason === "ai_connection_pool_wait") {
++  if (reason === "execution_unavailable" || reason === "workspace_busy" || reason === "ai_connection_busy" || reason === "ai_connection_pool_wait") {
+     return run.scheduledRetryReason === reason ? count(run.scheduledRetryAttempt) ?? 0 : 0;
+   }
+   const accounting = executionRetryAccounting(run);
+@@ -67,6 +67,6 @@ export function executionRetryAttemptCount(run: RetryRun, reason: string): numbe
+ export function accountingForScheduledRetry(run: RetryRun, reason: string, attempt: number): ExecutionRetryAccounting {
+   const accounting = executionRetryAccounting(run);
+   if (reason === "max_turns_continuation") accounting.maxTurnContinuations = attempt;
+-  else if (reason !== "workspace_busy" && reason !== "ai_connection_busy" && reason !== "ai_connection_pool_wait") accounting.failureRetries = attempt;
++  else if (reason !== "execution_unavailable" && reason !== "workspace_busy" && reason !== "ai_connection_busy" && reason !== "ai_connection_pool_wait") accounting.failureRetries = attempt;
+   return accounting;
+ }
 diff --git a/server/src/services/heartbeat.ts b/server/src/services/heartbeat.ts
-index 9e8617e2f..c4cd720f5 100644
+index 9e8617e2f..b4f559bac 100644
 --- a/server/src/services/heartbeat.ts
 +++ b/server/src/services/heartbeat.ts
-@@ -1,4 +1,5 @@
+@@ -1,4 +1,6 @@
++import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk/protocol";
  import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 +import { environmentOwnsWorkspace } from "./environment-config.js";
  import { prepareConnectionInstructionDelivery } from "./connection-instructions.js";
  import { resolveAssignedConnectionInstructionsForRun } from "./native-runtime/assigned-mcp-tools.js";
  import { externalObjectService } from "./external-objects.js";
-@@ -12453,7 +12454,7 @@ export function heartbeatService(
+@@ -12453,7 +12455,7 @@ export function heartbeatService(
      agent: typeof agents.$inferSelect,
      context: Record<string, unknown>,
      previousSessionParams: Record<string, unknown> | null,
@@ -1281,7 +1342,7 @@ index 9e8617e2f..c4cd720f5 100644
    ): Promise<ResolvedAnchorWorkspaceForRun> {
      const issueId =
        readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
-@@ -12512,6 +12513,15 @@ export function heartbeatService(
+@@ -12512,6 +12514,15 @@ export function heartbeatService(
        repoRef: readNonEmptyString(workspace.repoRef),
      }));
  
@@ -1297,7 +1358,7 @@ index 9e8617e2f..c4cd720f5 100644
      if (projectWorkspaceRows.length > 0) {
        const preferredWorkspace = preferredProjectWorkspaceId
          ? (projectWorkspaceRows.find(
-@@ -12696,6 +12706,8 @@ export function heartbeatService(
+@@ -12696,6 +12707,8 @@ export function heartbeatService(
      opts?: {
        useProjectWorkspace?: boolean | null;
        executionEnvironmentDriver?: string | null;
@@ -1306,7 +1367,7 @@ index 9e8617e2f..c4cd720f5 100644
        anchorWorkspace?: ResolvedAnchorWorkspaceForRun;
      },
    ): Promise<ResolvedWorkspaceForRun> {
-@@ -12705,7 +12717,7 @@ export function heartbeatService(
+@@ -12705,7 +12718,7 @@ export function heartbeatService(
        previousSessionParams,
        opts,
      );
@@ -1315,18 +1376,65 @@ index 9e8617e2f..c4cd720f5 100644
        return {
          ...anchor,
          additionalWorkspaces: [],
-@@ -22001,6 +22013,10 @@ export function heartbeatService(
+@@ -16557,6 +16570,31 @@ export function heartbeatService(
+     }).catch(() => undefined);
+   }
+ 
++  // Only an explicit before-launch refusal is retryable. Lost replies and
++  // disconnected admitted processes retain ownership and never enter this lane.
++  async function finalizeExecutionUnavailable(run: typeof heartbeatRuns.$inferSelect, error: Error) {
++    const now = new Date();
++    const cancelled = await setRunStatusIfRunning(run.id, "cancelled", {
++      error: error.message, errorCode: "execution_unavailable", finishedAt: now,
++      resultJson: { executionRecovery: { kind: "environment_wait", providerWorkStarted: false } },
++    });
++    if (!cancelled.updated || !cancelled.run) return;
++    await setWakeupStatus(run.wakeupRequestId, "cancelled", { finishedAt: now, error: error.message });
++    const agent = await getAgent(run.agentId);
++    const retry = agent ? await scheduleBoundedRetryForRun(cancelled.run, agent, {
++      now, retryReason: "execution_unavailable", wakeReason: "execution_unavailable_retry",
++      maxAttempts: executionRetryAttemptCount(cancelled.run, "execution_unavailable") + 1,
++      delayMs: 15000,
++    }) : null;
++    await appendRunEvent(cancelled.run, {
++      eventType: "lifecycle", stream: "system", level: "info",
++      message: `Deferred before launch: ${error.message}`,
++      payload: { retryScheduled: retry?.outcome === "scheduled" },
++    });
++    if (retry?.outcome !== "scheduled") await releaseIssueExecutionAndPromote(cancelled.run);
++    await finalizeAgentStatus(run.agentId, "cancelled", null, { wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run) });
++  }
++
+   async function scheduleInteractionContinuationInfrastructureRetryIfEligible(
+     run: typeof heartbeatRuns.$inferSelect,
+     agent: typeof agents.$inferSelect,
+@@ -21549,6 +21587,7 @@ export function heartbeatService(
+           : selectedEnvironmentId
+             ? await environmentsSvc.getById(selectedEnvironmentId)
+             : null;
++      const executionEnvironmentOwnsWorkspace = await environmentOwnsWorkspace(db,selectedEnvironmentForConfig);
+       const nativeChatWorkspaceScope = await findNativeChatWorkspaceScope(db, {
+         adapterType: agent.adapterType,
+         environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
+@@ -21618,6 +21657,7 @@ export function heartbeatService(
+             selectedEnvironmentForConfig?.driver ?? null;
+           const shouldSerialize =
+             sharedWorkspaceConcurrency !== "allow" &&
++            !executionEnvironmentOwnsWorkspace &&
+             (executionForcedToKubernetes ||
+               (environmentDriver !== "local" &&
+                 environmentDriver !== "ssh"));
+@@ -22001,6 +22041,9 @@ export function heartbeatService(
          const handoff = await getFreshSessionHandoff();
          if (handoff) context.paperclipFreshSessionHandoffMarkdown = handoff;
        }
-+      const executionEnvironmentOwnsWorkspace = await environmentOwnsWorkspace(db,selectedEnvironmentForConfig);
 +      if (executionEnvironmentOwnsWorkspace && (useIsolatedTaskDirectory || requestedExecutionWorkspaceMode === "isolated_workspace")) {
 +        throw new Error("The selected execution environment requires an existing workspace; host isolation/provisioning is unavailable");
 +      }
        const {
          selectedEnvironmentDriver: lowTrustPreflightEnvironmentDriver,
          workspace: resolvedWorkspace,
-@@ -22086,6 +22102,8 @@ export function heartbeatService(
+@@ -22086,6 +22129,8 @@ export function heartbeatService(
              {
                useProjectWorkspace:
                  requestedExecutionWorkspaceMode !== "agent_default",
@@ -1335,7 +1443,7 @@ index 9e8617e2f..c4cd720f5 100644
                // Thread the selected environment driver so run-workspace resolution can tell a local
                // target from a remote one, and a confined sandbox target from an unconfined remote
                // target. A remote run resolves referenced projects only for the confined sandbox
-@@ -22120,7 +22138,7 @@ export function heartbeatService(
+@@ -22120,7 +22165,7 @@ export function heartbeatService(
          repoRef: resolvedWorkspace.repoRef,
          additionalWorkspaces: resolvedWorkspace.additionalWorkspaces,
        } satisfies ExecutionWorkspaceInput;
@@ -1344,7 +1452,7 @@ index 9e8617e2f..c4cd720f5 100644
          requestedExecutionWorkspaceMode,
          config: hostExecutionWorkspaceConfig,
          issue: issueRef,
-@@ -22253,7 +22271,12 @@ export function heartbeatService(
+@@ -22253,7 +22298,12 @@ export function heartbeatService(
          executionWorkspace,
          reusedExecutionWorkspace,
          policy: resolvedWorkspaceReusePolicy,
@@ -1358,7 +1466,7 @@ index 9e8617e2f..c4cd720f5 100644
          {
            requestedShouldReuseExisting,
            existingExecutionWorkspaceId:
-@@ -22647,7 +22670,7 @@ export function heartbeatService(
+@@ -22647,7 +22697,7 @@ export function heartbeatService(
        }
        await bindIssueToPersistedExecutionWorkspace(persistedExecutionWorkspace);
        const projectRepositoryPaths: string[] = [];
@@ -1367,7 +1475,7 @@ index 9e8617e2f..c4cd720f5 100644
          const repositoryRows = await db.select().from(projectWorkspaces).where(and(
            eq(projectWorkspaces.companyId, agent.companyId),
            eq(projectWorkspaces.projectId, executionWorkspace.projectId),
-@@ -22970,7 +22993,7 @@ export function heartbeatService(
+@@ -22970,7 +23020,7 @@ export function heartbeatService(
        } else {
          delete context.paperclipScratch;
        }
@@ -1376,7 +1484,7 @@ index 9e8617e2f..c4cd720f5 100644
          target: executionTarget,
          cwd: executionWorkspace.cwd,
          env: Object.fromEntries(
-@@ -22988,7 +23011,7 @@ export function heartbeatService(
+@@ -22988,7 +23038,7 @@ export function heartbeatService(
        runtimeConfig = { ...runtimeConfig, env: gitExecutionEnv };
        for (const key of MANAGED_GITHUB_TOKEN_KEYS) secretKeys.add(key);
        context.githubAuthenticationMode = useHostGitHub ? "host" : "managed";
@@ -1385,7 +1493,7 @@ index 9e8617e2f..c4cd720f5 100644
          const githubLaunchers = await prepareHeartbeatGitHubLaunchers({
            native: agent.adapterType === "paperclip_runner",
            githubConfigured: githubSelection.configured,
-@@ -23653,7 +23676,7 @@ export function heartbeatService(
+@@ -23653,7 +23703,7 @@ export function heartbeatService(
          const hasInstructionFilesystem = nativeRuntimeResolution.kind !== "native"
            ? adapter.supportsInstructionsBundle === true
            : !["claude_managed_agents_api", "aws_agentcore_harness_api"].includes(nativeRuntimeResolution.profile.backend);
@@ -1394,6 +1502,39 @@ index 9e8617e2f..c4cd720f5 100644
            try {
              // Missing contract fields on a restored session mean the deployed
              // legacy format. New sessions opt into whole-directory persistence.
+@@ -26091,6 +26141,10 @@ export function heartbeatService(
+           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+         });
+       } catch (err) {
++        if (err instanceof JsonRpcCallError && err.code === PLUGIN_RPC_ERROR_CODES.EXECUTION_UNAVAILABLE) {
++          await finalizeExecutionUnavailable(run, err);
++          return;
++        }
+         if (err instanceof NativeControllerDetachedForRestartError) {
+           nativeSessionResumeScheduled = true;
+           return;
+@@ -26453,6 +26507,8 @@ export function heartbeatService(
+           eventMessage: "stale execution continuation cancelled before dispatch",
+           suppressImmediateRecovery: true,
+         });
++      } else if (outerErr instanceof JsonRpcCallError && outerErr.code === PLUGIN_RPC_ERROR_CODES.EXECUTION_UNAVAILABLE) {
++        await finalizeExecutionUnavailable(run, outerErr);
+       } else if (isWorkspaceBusyDeferral(outerErr)) {
+         // Expected contention on a shared project workspace, not a
+         // failure: park the run as a bounded scheduled retry and leave the
+diff --git a/server/src/services/legacy-execution-recovery.ts b/server/src/services/legacy-execution-recovery.ts
+index 64c4c7f2d..d6ad3db51 100644
+--- a/server/src/services/legacy-execution-recovery.ts
++++ b/server/src/services/legacy-execution-recovery.ts
+@@ -43,6 +43,8 @@ export function legacyExecutionNeedsReconciliation(
+       evidence?.kind === "ai_connection_wait" && evidence.providerWorkStarted === false) return false;
+   if (run.status === "cancelled" && run.errorCode === "workspace_busy" &&
+       evidence?.kind === "workspace_wait" && evidence.providerWorkStarted === false) return false;
++  if (run.status === "cancelled" && run.errorCode === "execution_unavailable" &&
++      evidence?.kind === "environment_wait" && evidence.providerWorkStarted === false) return false;
+   // Setup owns the bounded retry budget for temporary workspace scans. Its
+   // exhaustion needs workspace repair, not reconciliation of provider actions
+   // that the bootstrap evidence proves never started. Keep unknown outcomes held.
 diff --git a/server/src/services/plugin-worker-manager.ts b/server/src/services/plugin-worker-manager.ts
 index af6721f3d..c477ceae5 100644
 --- a/server/src/services/plugin-worker-manager.ts

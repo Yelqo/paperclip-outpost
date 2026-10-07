@@ -20,6 +20,11 @@ import (
 
 const maxOutputBytes = 1024 * 1024
 
+// These refusals precede durable intent and are safe for Paperclip to defer.
+type executionUnavailable struct{ message string }
+
+func (e *executionUnavailable) Error() string { return e.message }
+
 type operation struct {
 	Type              string             `json:"type"`
 	RequestID         string             `json:"requestId"`
@@ -27,6 +32,7 @@ type operation struct {
 	OperationID       string             `json:"operationId"`
 	Purpose           string             `json:"purpose"`
 	Cwd               string             `json:"cwd"`
+	WorkspaceID       string             `json:"workspaceId"`
 	Command           string             `json:"command"`
 	Args              []string           `json:"args"`
 	Env               map[string]string  `json:"env"`
@@ -47,10 +53,11 @@ type callbackTransport struct {
 }
 
 type processOutcome struct {
-	ExitCode *int   `json:"exitCode"`
-	Signal   string `json:"signal,omitempty"`
-	TimedOut bool   `json:"timedOut"`
-	Error    string `json:"error,omitempty"`
+	ExitCode           *int   `json:"exitCode"`
+	Signal             string `json:"signal,omitempty"`
+	TimedOut           bool   `json:"timedOut"`
+	Error              string `json:"error,omitempty"`
+	OwnershipUncertain bool   `json:"ownershipUncertain,omitempty"`
 }
 
 type executionRecord struct {
@@ -176,10 +183,16 @@ func (s *supervisor) workspace(path string) (*os.File, string, error) {
 }
 
 func (s *supervisor) handle(ctx context.Context, op operation, send func(any) error) {
+	admitted := false
 	reply := func(value any, err error) {
 		message := map[string]any{"type": "result", "requestId": op.RequestID, "runId": op.RunID, "operationId": op.OperationID, "result": value}
 		if err != nil {
 			message["error"] = err.Error()
+			message["beforeLaunch"] = !admitted
+			var unavailable *executionUnavailable
+			if errors.As(err, &unavailable) {
+				message["errorCode"] = "execution_unavailable"
+			}
 		}
 		_ = send(message)
 	}
@@ -190,7 +203,21 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 	}
 	defer file.Close()
 	if op.Type == "inspect" {
-		reply(map[string]string{"cwd": op.Cwd}, nil)
+		s.mu.Lock()
+		owner := s.owners[workspace]
+		s.mu.Unlock()
+		if owner == "" {
+			if syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+				reply(nil, &executionUnavailable{"workspace is busy"})
+				return
+			}
+			_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		}
+		reply(map[string]string{"cwd": file.Name(), "workspaceId": workspace, "ownerRunId": owner}, nil)
+		return
+	}
+	if op.WorkspaceID != workspace {
+		reply(nil, &executionUnavailable{"workspace changed before launch; inspect it again"})
 		return
 	}
 	deadline, err := time.Parse(time.RFC3339Nano, op.Deadline)
@@ -230,17 +257,19 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 	owner := s.owners[workspace]
 	if (op.Purpose == "agent_execution" && (owner != "" || s.activeAgents >= 16)) || (op.Purpose == "control" && ((owner != "" && owner != op.RunID) || s.activeControls >= 16)) {
 		s.mu.Unlock()
-		reply(nil, errors.New("workspace is busy or its previous process outcome is uncertain"))
+		reply(nil, &executionUnavailable{"workspace is busy or its previous process outcome is uncertain"})
 		return
 	}
 	// A directory flock also excludes a second registration/daemon with another
 	// private directory, including a symlink or bind-mount alias of this workspace.
 	if op.Purpose == "agent_execution" && syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
 		s.mu.Unlock()
-		reply(nil, errors.New("workspace is busy"))
+		reply(nil, &executionUnavailable{"workspace is busy"})
 		return
 	}
 	record := executionRecord{RunID: op.RunID, OperationID: op.OperationID, Purpose: op.Purpose, Workspace: workspace, Deadline: op.Deadline}
+
+	admitted = true
 	s.records[op.OperationID] = record
 	if op.Purpose == "agent_execution" {
 		s.owners[workspace] = op.RunID
@@ -341,6 +370,7 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 		}
 	} else {
 		outcome.Error = "process ended but its durable outcome is uncertain"
+		outcome.OwnershipUncertain = true
 	}
 	s.mu.Unlock()
 	reply(outcome, nil)
