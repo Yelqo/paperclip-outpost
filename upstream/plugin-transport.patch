@@ -1630,7 +1630,7 @@ index 64c4c7f2d..d6ad3db51 100644
    // exhaustion needs workspace repair, not reconciliation of provider actions
    // that the bootstrap evidence proves never started. Keep unknown outcomes held.
 diff --git a/server/src/services/plugin-worker-manager.ts b/server/src/services/plugin-worker-manager.ts
-index af6721f3d..9f7ba9c0c 100644
+index af6721f3d..4a0bb8d14 100644
 --- a/server/src/services/plugin-worker-manager.ts
 +++ b/server/src/services/plugin-worker-manager.ts
 @@ -527,6 +527,8 @@ interface PendingRequest {
@@ -1733,18 +1733,30 @@ index af6721f3d..9f7ba9c0c 100644
          reject(
            new Error(
              `Cannot call "${method}" — worker for "${pluginId}" is not running`,
-@@ -3303,6 +3332,10 @@ export function createPluginWorkerHandle(
+@@ -3303,7 +3332,21 @@ export function createPluginWorkerHandle(
        }
  
        const id = nextRequestId++;
+-      const timeout = resolveRpcCallTimeoutMs(timeoutMs, rpcTimeoutMs);
 +      // Only a worker response can prove whether this execution was refused or
 +      // completed. Losing the response cannot authorize an automatic new run.
 +      const outpostExecution = options.manifest.id === "yelqo.outpost" && method === "environmentExecute";
 +      if (onWorkerCompleted) workerCompletions.set(id, onWorkerCompleted);
-       const timeout = resolveRpcCallTimeoutMs(timeoutMs, rpcTimeoutMs);
++      // Outpost bounds omitted/unlimited execution to 60 seconds. The generic
++      // 30-second RPC default must not expire before that operation can finish
++      // and deliver its result through the plugin's reconciliation grace.
++      const requestedExecutionTimeout = outpostExecution
++        ? (params as HostToWorkerMethods["environmentExecute"][0]).timeoutMs
++        : undefined;
++      const outpostRpcTimeout = outpostExecution
++        ? Math.min(Number.isFinite(requestedExecutionTimeout) && (requestedExecutionTimeout ?? 0) > 0
++          ? requestedExecutionTimeout! : 60_000, 3_600_000) + 30_000
++        : undefined;
++      const timeout = resolveRpcCallTimeoutMs(timeoutMs ?? outpostRpcTimeout, rpcTimeoutMs);
        const invocationScope = deriveInvocationScope(method, params);
        const invocation = invocationScope ? registerInvocation(invocationScope) : null;
-@@ -3334,8 +3367,8 @@ export function createPluginWorkerHandle(
+       // Register the host-owned execute route only for an execute call that
+@@ -3334,8 +3377,8 @@ export function createPluginWorkerHandle(
          settle(
            reject,
            new JsonRpcCallError({
@@ -1755,7 +1767,7 @@ index af6721f3d..9f7ba9c0c 100644
            }),
          );
        }, timeout);
-@@ -3343,6 +3376,7 @@ export function createPluginWorkerHandle(
+@@ -3343,6 +3386,7 @@ export function createPluginWorkerHandle(
        const pending: PendingRequest = {
          id,
          method,
@@ -1763,7 +1775,7 @@ index af6721f3d..9f7ba9c0c 100644
          resolve: (response: JsonRpcResponse) => {
            if (isJsonRpcSuccessResponse(response)) {
              settle(resolve, response.result as HostToWorkerMethods[M][1]);
-@@ -3366,6 +3400,8 @@ export function createPluginWorkerHandle(
+@@ -3366,6 +3410,8 @@ export function createPluginWorkerHandle(
          };
          sendMessage(request);
        } catch (err) {
@@ -1772,7 +1784,7 @@ index af6721f3d..9f7ba9c0c 100644
          clearTimeout(timer);
          pendingRequests.delete(id);
          clearInvocation(invocation);
-@@ -3435,6 +3471,22 @@ export function createPluginWorkerHandle(
+@@ -3435,6 +3481,22 @@ export function createPluginWorkerHandle(
        return callInternal(method, params, timeoutMs, executeLogSink);
      },
  

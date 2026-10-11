@@ -32,7 +32,7 @@ export function createServerAdapter(adapterType='process') {
       }
       const result=config.scenario==='replay'
         ? await execute('acceptance:stable-operation','agent_execution','echo effect >> launches; echo stable-output')
-        : await execute(`${runId}:agent`,'agent_execution',config.args[1]);
+        : await execute(`${runId}:agent`,'agent_execution',config.args[1],(config.timeoutSec ?? 5)*1000);
       return {...result,resultJson:{stdout:result.stdout,stderr:result.stderr}};
     },
     async testEnvironment() { return {ok:true,checks:[]}; },

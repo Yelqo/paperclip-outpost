@@ -228,6 +228,8 @@ and sequence cursor in company-scoped plugin state. A repeated sequence must
 match its saved bytes and stream; it does not append duplicate adapter output.
 The daemon fsyncs its local acknowledgement cursor before advancing. A lost
 acknowledgement, connection or daemon restart can replay the same chunk safely.
+Paperclip serializes output writes per operation across connections so a delayed
+handler from a closed socket cannot overwrite a newer acknowledgement cursor.
 Successful terminal results are delivered only after all preceding output is
 acknowledged. Paperclip saves the terminal receipt before acknowledging that
 result. Only then does the daemon delete the operation's output spool and
@@ -257,9 +259,15 @@ Continuation requires a separate operator-authorized attempt.
 
 A transient transport outage keeps the original pending adapter execution
 alive until its original deadline plus the existing 10-second reconciliation
-grace. Reconnection resumes delivery, never dispatch. If the plugin worker or
-host restarts, or that grace expires, the heartbeat attempt can fail; recovered
-output and terminal receipts remain inspectable and never rewrite a completed
+grace. Reconnection resumes delivery, never dispatch. For an Outpost execute
+call without an explicit RPC timeout, the host uses the bounded execution
+timeout plus 30 seconds of transport overhead. This covers the default
+60-second operation and its reconciliation grace, beyond the generic
+30-second RPC default. Explicit RPC deadlines remain enforced.
+
+If the plugin worker or host restarts, or that grace expires, the heartbeat
+attempt can fail; recovered output and terminal receipts remain inspectable
+and never rewrite a completed
 attempt. Grace expiry after dispatch reports `EXECUTION_OUTCOME_UNCERTAIN`;
 Paperclip records `execution_outcome_uncertain` and blocks automatic recovery,
 including Pi conversation continuation. Losing an already sent Outpost execution

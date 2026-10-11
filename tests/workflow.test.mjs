@@ -912,6 +912,89 @@ test('a disconnected execution recovers ordered output and succeeds without anot
   } finally { transport.reconnect(); await removeExecutionAdapter(); }
 });
 
+test('default execution survives an outage beyond the host RPC default and repeated reconnects', {timeout:120000}, async t => {
+  await installExecutionAdapter();
+  const transport=await bufferedOutpost(t,'default-outage');
+  const {outpost,statusPath}=transport;
+  const workspace=join(home,'workspaces','default-outage'); mkdirSync(workspace);
+  try {
+    const agent=await commandAgent(workspace,'echo launch >> launches; printf started; while ! test -e release; do sleep .1; done; printf finished; echo preserved > completed',
+      {defaultEnvironmentId:outpost.environmentId,timeoutSec:0});
+    const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{});
+    await eventually(async ()=>{
+      const response=await api(`/api/heartbeat-runs/${run.id}/log`);
+      return response.ok && (await response.json()).content.includes('started');
+    });
+    transport.disconnect();
+    await eventually(async ()=>!(await json(statusPath)).connected);
+    transport.reconnect();
+    await eventually(async ()=>(await json(statusPath)).executionReady);
+    const active=(await json(statusPath)).executionHistory.find(record=>record.runId===run.id);
+    assert.equal(active.status,'running');
+    const competingAgent=await commandAgent(workspace,'echo conflicting > conflicting',{defaultEnvironmentId:outpost.environmentId});
+    const competing=await terminalRun(await json(`/api/agents/${competingAgent.id}/heartbeat/invoke`,{}));
+    assert.equal(competing.status,'cancelled',JSON.stringify(competing));
+    assert.equal(competing.errorCode,'execution_unavailable');
+    await scheduledRetry(competing);
+    assert.equal(existsSync(join(workspace,'conflicting')),false,'reconnecting must preserve the active workspace owner');
+    transport.disconnect();
+    await eventually(async ()=>!(await json(statusPath)).connected);
+    writeFileSync(join(workspace,'release'),'');
+    await eventually(()=>existsSync(join(workspace,'completed')));
+    // The host's generic RPC deadline is 30 seconds; Outpost's original
+    // default execution deadline is 60 seconds, plus reconciliation grace.
+    await delay(32000);
+    assert.equal((await json(`/api/heartbeat-runs/${run.id}`)).status,'running');
+    transport.reconnect();
+    // The daemon's retry backoff is bounded at 30 seconds after a long outage.
+    const outcome=await terminalRun(run,35000);
+    assert.equal(outcome.status,'succeeded',JSON.stringify(outcome));
+    assert.equal(outcome.resultJson.stdout,'startedfinished');
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'launch\n');
+    assert.equal(readFileSync(join(workspace,'completed'),'utf8'),'preserved\n');
+    const log=await json(`/api/heartbeat-runs/${run.id}/log`);
+    assert.equal(log.content.split('started').length-1,1);
+    assert.equal(log.content.split('finished').length-1,1);
+    await eventually(async ()=>{
+      const runs=await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${competingAgent.id}`);
+      return runs.some(value=>value.status==='succeeded');
+    },30000);
+    assert.equal(readFileSync(join(workspace,'conflicting'),'utf8'),'conflicting\n');
+  } finally { transport.reconnect(); await removeExecutionAdapter(); }
+});
+
+test('a disconnected execution reaches its original deadline and reconciles timeout without relaunch', {timeout:60000}, async t => {
+  await installExecutionAdapter();
+  const transport=await bufferedOutpost(t,'outage-deadline');
+  const {outpost,statusPath}=transport;
+  const workspace=join(home,'workspaces','outage-deadline'); mkdirSync(workspace);
+  try {
+    const agent=await commandAgent(workspace,'echo launch >> launches; printf started; (sleep 4; echo escaped > escaped) & wait',
+      {defaultEnvironmentId:outpost.environmentId,timeoutSec:2});
+    const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{});
+    await eventually(async ()=>{
+      const response=await api(`/api/heartbeat-runs/${run.id}/log`);
+      return response.ok && (await response.json()).content.includes('started');
+    });
+    const active=(await json(statusPath)).executionHistory.find(record=>record.runId===run.id);
+    transport.disconnect();
+    await eventually(async ()=>!(await json(statusPath)).connected);
+    await delay(2500);
+    assert.equal((await json(`/api/heartbeat-runs/${run.id}`)).status,'running');
+    transport.reconnect();
+    const outcome=await terminalRun(run);
+    assert.equal(outcome.status,'timed_out',JSON.stringify(outcome));
+    assert.equal(outcome.resultJson.stdout,'started');
+    const terminal=(await json(statusPath)).executionHistory.find(record=>record.runId===run.id);
+    assert.equal(terminal.status,'terminal');
+    assert.equal(terminal.deadline,active.deadline);
+    assert.equal(terminal.outcome.timedOut,true);
+    await delay(2000);
+    assert.equal(existsSync(join(workspace,'escaped')),false,'the original deadline must stop descendants during an outage');
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'launch\n');
+  } finally { transport.reconnect(); await removeExecutionAdapter(); }
+});
+
 test('late recovered exhaustion cannot automatically continue a Pi task after grace expiry', {timeout:90000}, async t => {
   await installExecutionAdapter('pi_local');
   const transport=await bufferedOutpost(t,'late-exhaustion',['--output-buffer-bytes','4096','--output-total-bytes','8192']);
