@@ -3,6 +3,7 @@
 Issue #3 implements registration, named environment selection and the outbound
 connection. Issue #4 adds [bounded process command execution](execution.md).
 Issue #5 adds [Pi with machine-owned assets and scoped callbacks](pi.md).
+Issue #8 adds local access-layer configuration, correction and connectivity checks.
 
 ## Supported development installation
 
@@ -50,7 +51,79 @@ Prepare a dedicated, unprivileged worker account and existing workspace and
 scratch directories. Choose a private directory outside both roots. The CLI
 requires absolute paths, resolves aliases, rejects overlapping private and
 writable roots, and creates mode 0700 private state with a mode 0600 connection
-file. Existing connection files are not overwritten.
+file. Registration refuses an existing registered identity; configuration
+updates replace the private file atomically.
+
+### Optional access layer
+
+For an instance behind an existing access layer, configure its connection
+credentials before registration:
+
+```sh
+bin/outpost configure --instance https://paperclip.example.com \
+  --private-dir /home/worker/.outpost-private \
+  --workspace-root /home/worker/workspaces --scratch-root /home/worker/scratch
+bin/outpost check --private-dir /home/worker/.outpost-private
+```
+
+Supply a JSON object on `configure` stdin through a private input pipe or secret
+manager. Existing Cloudflare Access service tokens use this shape (replace the
+placeholder values in the private input source):
+
+```json
+{"headers":{"CF-Access-Client-Id":"EXISTING_SERVICE_TOKEN_ID","CF-Access-Client-Secret":"EXISTING_SERVICE_TOKEN_SECRET"}}
+```
+
+The accepted optional headers are these two Cloudflare Access headers. Outpost
+does not create or manage Cloudflare resources, applications, policies or tokens,
+and never needs access-provider account or management API credentials. The
+operator maintains the existing service token and its access policy.
+
+`configure` saves mode 0600 state inside the mode 0700 private directory. It
+prints only a status, and checks and diagnostics omit the header values.
+Before registration, `check` requests `/api/health` through the saved HTTPS
+origin and headers without operator authentication. Success reports `reachable`;
+it verifies reachability and the health response, while registration and the
+post-registration check verify their own routes. The access policy must cover
+both the registration API routes and the WebSocket transport route. Outpost
+never retries without the configured headers or through a different origin.
+
+Register using the saved settings; supply only Paperclip operator authentication
+and any local runtime options on stdin:
+
+```sh
+bin/outpost register --private-dir /home/worker/.outpost-private \
+  --company COMPANY_UUID --name 'Ubuntu worker'
+bin/outpost check --private-dir /home/worker/.outpost-private
+```
+
+Registration inherits the saved instance, roots and headers. Passing a different
+instance or roots, or attempting to override configured headers in registration
+input, fails locally. After registration, `check` verifies an authenticated
+WebSocket connection, including machine identity and version compatibility,
+and reports `connected` before exiting.
+
+To correct or rotate existing access credentials, stop the daemon, run
+`configure --private-dir /home/worker/.outpost-private` with the new headers on
+stdin, run `check`, then restart the daemon. The update atomically replaces the
+private connection file while retaining its outpost identity, credential,
+runtime options and roots. A running daemon retains the settings it loaded at
+startup, so a restart is required. Failed validation preserves the previous
+settings. Use `{"headers":{}}` to clear optional headers when the instance no
+longer requires an access layer. The saved instance and roots remain fixed.
+
+An HTTP 401/403 rejection can come from the access layer or Paperclip: verify the
+existing service token and policy, and the operator or outpost authorization.
+Redirects (including an access login page) are rejected without following the
+`Location` header. Network failures report DNS, TLS trust and connectivity checks;
+an unexpected health response calls for checking the instance origin and access
+configuration. Response bodies, redirects, credentials and raw network errors
+are excluded from diagnostics. Normal TLS certificate verification remains on.
+
+### Ordinary registration
+
+Instances without an optional access layer can register directly with no
+`configure` step, optional headers or Cloudflare dependency:
 
 ```sh
 bin/outpost register --instance https://paperclip.example.com \
@@ -62,9 +135,10 @@ bin/outpost register --instance https://paperclip.example.com \
 Supply one JSON object on stdin, containing `operatorAuthorization` with the
 existing Paperclip CLI/board bearer authentication. A secret manager or private
 input pipe can supply it without putting it in command arguments or shell
-history. Optional `headers` accepts existing `CF-Access-Client-Id` and
-`CF-Access-Client-Secret` values. They are used for registration and retained for
-daemon connections. Outpost does not provision Access resources. Redirects are
+history. For compatibility, direct registration without prior configuration can
+also accept optional `headers` with existing `CF-Access-Client-Id` and
+`CF-Access-Client-Secret` values; these are retained for daemon connections and
+can subsequently be updated with `configure`. Redirects are
 rejected so credentials cannot be forwarded to another origin.
 
 Registration issues a random 256-bit outpost credential, stores only its SHA-256
@@ -95,7 +169,8 @@ bin/outpost daemon --private-dir /home/worker/.outpost-private
 `connect` validates one connection and exits. `daemon` reconnects after transient
 failures with a bounded backoff, and stops on authentication/version rejection.
 SIGTERM/SIGINT closes its connection. `diagnose` emits identity and version
-metadata without credentials or optional access headers.
+metadata without credentials or optional access headers. `check` after
+registration performs the same authenticated connection check as `connect`.
 
 Revoke using the operator-authenticated API:
 `POST /api/plugins/yelqo.outpost/api/outposts/OUTPOST_UUID/revoke`, with

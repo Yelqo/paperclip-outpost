@@ -47,7 +47,7 @@ type enrollment struct {
 
 func Run(args []string, input io.Reader, output io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: outpost register|connect|daemon|diagnose")
+		return errors.New("usage: outpost configure|check|register|connect|daemon|diagnose|protect")
 	}
 	f := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	f.SetOutput(io.Discard)
@@ -60,17 +60,38 @@ func Run(args []string, input io.Reader, output io.Writer) error {
 	if f.Parse(args[1:]) != nil || (f.NArg() != 0 && args[0] != "protect") {
 		return errors.New("invalid command arguments")
 	}
+	if args[0] == "configure" {
+		var settings struct {
+			Headers map[string]string `json:"headers"`
+		}
+		if decode(input, &settings) != nil || settings.Headers == nil {
+			return errors.New("configure requires connection headers JSON on stdin (use an empty headers object to clear them)")
+		}
+		if err := validateHeaders(settings.Headers); err != nil {
+			return err
+		}
+		c, existing, err := prepareConnection(*privateDir, Connection{Instance: *instance, WorkspaceRoot: *workspace, ScratchRoot: *scratch})
+		if err != nil {
+			return err
+		}
+		c.Headers = settings.Headers
+		if err := persist(*privateDir, c, existing); err != nil {
+			return err
+		}
+		return json.NewEncoder(output).Encode(map[string]string{"status": "configured"})
+	}
 	if args[0] == "register" {
 		if *company == "" || *name == "" {
 			return errors.New("company and name are required")
 		}
-		origin, err := validateOrigin(*instance)
+		c, configured, err := prepareConnection(*privateDir, Connection{Instance: *instance, WorkspaceRoot: *workspace, ScratchRoot: *scratch})
 		if err != nil {
 			return err
 		}
-		if err := preparePrivate(*privateDir, *workspace, *scratch); err != nil {
-			return err
+		if c.Credential != "" {
+			return errors.New("connection state already exists; this outpost is registered")
 		}
+		origin := c.Instance
 		var auth enrollment
 		if err := decode(input, &auth); err != nil {
 			return errors.New("registration requires operator authentication JSON on stdin")
@@ -80,6 +101,12 @@ func Run(args []string, input io.Reader, output io.Writer) error {
 		}
 		if err := validateHeaders(auth.Headers); err != nil {
 			return err
+		}
+		if configured && auth.Headers != nil {
+			return errors.New("connection headers are already configured; use configure to update them")
+		}
+		if configured {
+			auth.Headers = c.Headers
 		}
 		if err := validateRuntimeEnv(auth.RuntimeEnv); err != nil {
 			return err
@@ -105,12 +132,13 @@ func Run(args []string, input io.Reader, output io.Writer) error {
 			revoke(origin, *company, result.OutpostID, auth)
 			return err
 		}
-		c := Connection{Instance: origin, CompanyID: *company, OutpostID: result.OutpostID, EnvironmentID: environment.ID, Name: *name, Credential: result.Credential, WorkspaceRoot: *workspace, ScratchRoot: *scratch, Headers: auth.Headers, RuntimeRoots: auth.RuntimeRoots, RuntimeEnv: auth.RuntimeEnv}
+		c.CompanyID, c.OutpostID, c.EnvironmentID, c.Name, c.Credential = *company, result.OutpostID, environment.ID, *name, result.Credential
+		c.Headers, c.RuntimeRoots, c.RuntimeEnv = auth.Headers, auth.RuntimeRoots, auth.RuntimeEnv
 		if err := validateRuntimeRoots(*privateDir, c); err != nil {
 			revoke(origin, *company, result.OutpostID, auth)
 			return err
 		}
-		if err := save(*privateDir, c); err != nil {
+		if err := persist(*privateDir, c, configured); err != nil {
 			revoke(origin, *company, result.OutpostID, auth)
 			return err
 		}
@@ -125,7 +153,15 @@ func Run(args []string, input io.Reader, output io.Writer) error {
 		return protect(*privateDir, c, f.Args(), output)
 	case "diagnose":
 		return json.NewEncoder(output).Encode(map[string]any{"instance": c.Instance, "companyId": c.CompanyID, "outpostId": c.OutpostID, "environmentId": c.EnvironmentID, "versions": supported})
+	case "check":
+		if c.Credential == "" {
+			return checkConnection(c, output)
+		}
+		return connect(*privateDir, c, output, false)
 	case "connect", "daemon":
+		if c.Credential == "" {
+			return errors.New("outpost is not registered; run check then register")
+		}
 		return connect(*privateDir, c, output, args[0] == "daemon")
 	default:
 		return errors.New("unknown outpost command")
@@ -163,7 +199,7 @@ func validateHeaders(headers map[string]string) error {
 		if name != "CF-Access-Client-Id" && name != "CF-Access-Client-Secret" {
 			return errors.New("only Cloudflare Access connection headers are supported")
 		}
-		if len(value) > 4096 || strings.ContainsAny(value, "\r\n") {
+		if len(value) > 4096 || strings.IndexFunc(value, func(r rune) bool { return r < 32 || r == 127 }) >= 0 {
 			return errors.New("invalid connection header")
 		}
 	}
@@ -187,7 +223,7 @@ func request(origin, path string, body any, auth enrollment, target any) error {
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return fmt.Errorf("Paperclip request rejected (HTTP %d)", res.StatusCode)
+		return fmt.Errorf("Paperclip request rejected (HTTP %d): verify operator authorization and existing access credentials; use configure then check before retrying", res.StatusCode)
 	}
 	if target != nil && json.NewDecoder(io.LimitReader(res.Body, 65536)).Decode(target) != nil {
 		return errors.New("invalid Paperclip response")
@@ -197,6 +233,27 @@ func request(origin, path string, body any, auth enrollment, target any) error {
 func revoke(origin, company, id string, auth enrollment) {
 	_ = request(origin, "/api/plugins/yelqo.outpost/api/outposts/"+url.PathEscape(id)+"/revoke", map[string]string{"companyId": company}, auth, nil)
 }
+
+func prepareConnection(dir string, requested Connection) (Connection, bool, error) {
+	_, statErr := os.Lstat(filepath.Join(dir, "connection.json"))
+	if !os.IsNotExist(statErr) {
+		c, err := load(dir)
+		if err != nil {
+			return c, true, err
+		}
+		if (requested.Instance != "" && requested.Instance != c.Instance) || (requested.WorkspaceRoot != "" && requested.WorkspaceRoot != c.WorkspaceRoot) || (requested.ScratchRoot != "" && requested.ScratchRoot != c.ScratchRoot) {
+			return c, true, errors.New("connection must use the configured instance and roots")
+		}
+		return c, true, nil
+	}
+	origin, err := validateOrigin(requested.Instance)
+	if err != nil {
+		return requested, false, err
+	}
+	requested.Instance = origin
+	return requested, false, preparePrivate(dir, requested.WorkspaceRoot, requested.ScratchRoot)
+}
+
 func preparePrivate(dir, workspace, scratch string) error {
 	if !filepath.IsAbs(dir) || !filepath.IsAbs(workspace) || !filepath.IsAbs(scratch) {
 		return errors.New("private, workspace and scratch roots must be absolute")
@@ -229,7 +286,22 @@ func validatePrivate(dir, workspace, scratch string) error {
 	}
 	return nil
 }
-func save(dir string, c Connection) error {
+func persist(dir string, c Connection, replace bool) error {
+	if replace {
+		file, err := os.CreateTemp(dir, ".connection-*")
+		if err != nil {
+			return errors.New("cannot update private connection state")
+		}
+		defer os.Remove(file.Name())
+		if json.NewEncoder(file).Encode(c) != nil || file.Sync() != nil {
+			file.Close()
+			return errors.New("cannot persist connection state")
+		}
+		if file.Close() != nil || os.Rename(file.Name(), filepath.Join(dir, "connection.json")) != nil {
+			return errors.New("cannot update private connection state")
+		}
+		return syncPrivate(dir)
+	}
 	file, err := os.OpenFile(filepath.Join(dir, "connection.json"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return errors.New("connection state already exists or cannot be created")
@@ -238,6 +310,10 @@ func save(dir string, c Connection) error {
 	if json.NewEncoder(file).Encode(c) != nil || file.Sync() != nil {
 		return errors.New("cannot persist connection state")
 	}
+	return syncPrivate(dir)
+}
+
+func syncPrivate(dir string) error {
 	root, err := os.Open(dir)
 	if err != nil {
 		return errors.New("cannot persist private directory")

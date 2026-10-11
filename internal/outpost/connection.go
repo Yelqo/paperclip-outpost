@@ -19,7 +19,35 @@ import (
 )
 
 var errRejected = errors.New("outpost connection rejected: verify registration, revocation and supported versions")
-var errDisconnected = errors.New("outpost connection unavailable")
+var errDisconnected = errors.New("outpost connection unavailable: verify instance address, DNS, TLS trust, network connectivity and WebSocket support")
+
+// Before registration, check the same origin and headers without operator or
+// access-provider management authority. After registration, check uses WSS.
+func checkConnection(c Connection, output io.Writer) error {
+	req, err := http.NewRequest(http.MethodGet, c.Instance+"/api/health", nil)
+	if err != nil {
+		return errors.New("invalid connection settings")
+	}
+	for name, value := range c.Headers {
+		req.Header.Set(name, value)
+	}
+	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	res, err := client.Do(req)
+	if err != nil {
+		return errors.New("connection check failed: verify instance address, DNS, TLS trust and network connectivity")
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("connection check rejected (HTTP %d): verify existing access credentials and policies with the operator", res.StatusCode)
+	}
+	var health struct {
+		Status string `json:"status"`
+	}
+	if json.NewDecoder(io.LimitReader(res.Body, 65536)).Decode(&health) != nil || health.Status != "ok" {
+		return errors.New("connection check received an unexpected response: verify the Paperclip origin and access-layer configuration")
+	}
+	return json.NewEncoder(output).Encode(map[string]string{"status": "reachable"})
+}
 
 func connect(privateDir string, c Connection, output io.Writer, daemon bool) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -81,8 +109,8 @@ func session(ctx context.Context, c Connection, output io.Writer, daemon bool, s
 	ws, response, err := websocket.Dial(dialCtx, u.String(), &websocket.DialOptions{HTTPHeader: headers, HTTPClient: client, CompressionMode: websocket.CompressionDisabled})
 	cancel()
 	if err != nil {
-		if response != nil && response.StatusCode >= 400 && response.StatusCode < 500 {
-			return errRejected
+		if response != nil && response.StatusCode >= 300 && response.StatusCode < 500 {
+			return fmt.Errorf("%w (HTTP %d): verify existing access credentials and policies; use configure then check before restarting the daemon", errRejected, response.StatusCode)
 		}
 		return errDisconnected
 	}

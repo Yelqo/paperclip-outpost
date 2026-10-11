@@ -19,6 +19,8 @@ Registration, named execution-environment selection, authenticated outbound
 connections and bounded process commands in existing machine workspaces are
 implemented in the Go CLI/daemon and TypeScript/Effect plugin.
 See [setup, operator commands and protection boundaries](docs/connection.md).
+Optional access credentials can be configured and checked locally before
+registration, then corrected or rotated while retaining the outpost identity.
 See [command execution and supervision](docs/execution.md).
 The required Paperclip host/SDK extension is carried as a reproducible patch
 against a pinned upstream commit. [Pi integration](docs/pi.md) uses machine-owned
