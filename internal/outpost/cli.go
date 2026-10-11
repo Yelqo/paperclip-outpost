@@ -274,6 +274,13 @@ func prepareConnection(dir string, requested Connection) (Connection, bool, erro
 		if err != nil {
 			return c, true, err
 		}
+		if requested.Instance != "" {
+			origin, err := validateOrigin(requested.Instance)
+			if err != nil {
+				return c, true, err
+			}
+			requested.Instance = origin
+		}
 		if (requested.Instance != "" && requested.Instance != c.Instance) || (requested.WorkspaceRoot != "" && requested.WorkspaceRoot != c.WorkspaceRoot) || (requested.ScratchRoot != "" && requested.ScratchRoot != c.ScratchRoot) {
 			return c, true, errors.New("connection must use the configured instance and roots")
 		}

@@ -139,6 +139,31 @@ test('operator configures existing access credentials before registration and ch
   }
 });
 
+test('configuration updates and registration accept the same instance origin with a trailing slash', async () => {
+  const dir = join(home,'trailing-slash');
+  const args = ['configure','--instance',`${origin}/`,'--private-dir',dir,
+    '--workspace-root',workspace,'--scratch-root',scratch];
+  const configured = await cli(args,{headers:{...headers,'CF-Access-Client-Secret':'wrong-secret'}});
+  assert.equal(configured.code,0,configured.stderr);
+  const corrected = await cli(args,{headers});
+  assert.equal(corrected.code,0,corrected.stderr);
+  assert.equal((await cli(['check','--private-dir',dir])).code,0);
+  const registered = await cli(['register','--instance',`${origin}/`,'--private-dir',dir,
+    '--company','fixture-company','--name','Trailing slash worker'],{operatorAuthorization:'Bearer operator-secret'});
+  assert.equal(registered.code,0,registered.stderr);
+  const saved = readFileSync(join(dir,'connection.json'),'utf8');
+  assert.equal(JSON.parse(saved).instance,origin);
+  for (const instance of ['https://different.example.com/','https://user:secret@example.com/']) {
+    const requestsBefore = requests.length;
+    const invalid = await cli(['configure','--instance',instance,'--private-dir',dir],{headers:{}});
+    assert.equal(invalid.code,1);
+    assert.equal(readFileSync(join(dir,'connection.json'),'utf8'),saved);
+    assert.equal(requests.length,requestsBefore);
+    assert.ok(!invalid.stderr.includes('secret'));
+  }
+  assert.equal((await cli(['check','--private-dir',dir])).code,0);
+});
+
 test('checking a connected daemon explains the conflict and succeeds after the daemon stops', async () => {
   const dir = join(home,'active-daemon');
   assert.equal((await configure(dir)).code,0);
