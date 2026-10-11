@@ -19,6 +19,7 @@ import (
 )
 
 var errRejected = errors.New("outpost connection rejected: verify registration, revocation and supported versions")
+var errAlreadyConnected = errors.New("outpost already connected (HTTP 409): stop the active daemon before running a standalone check or connect; only one connection is allowed")
 var errDisconnected = errors.New("outpost connection unavailable: verify instance address, DNS, TLS trust, network connectivity and WebSocket support")
 
 // Before registration, check the same origin and headers without operator or
@@ -67,7 +68,7 @@ func connect(privateDir string, c Connection, output io.Writer, daemon bool) err
 		if ctx.Err() != nil {
 			return nil
 		}
-		if !daemon || errors.Is(err, errRejected) {
+		if !daemon || errors.Is(err, errRejected) || errors.Is(err, errAlreadyConnected) {
 			return err
 		}
 		// Neither request errors nor remote payloads cross the diagnostic boundary.
@@ -109,6 +110,9 @@ func session(ctx context.Context, c Connection, output io.Writer, daemon bool, s
 	ws, response, err := websocket.Dial(dialCtx, u.String(), &websocket.DialOptions{HTTPHeader: headers, HTTPClient: client, CompressionMode: websocket.CompressionDisabled})
 	cancel()
 	if err != nil {
+		if response != nil && response.StatusCode == http.StatusConflict {
+			return errAlreadyConnected
+		}
 		if response != nil && response.StatusCode >= 300 && response.StatusCode < 500 {
 			return fmt.Errorf("%w (HTTP %d): verify existing access credentials and policies; use configure then check before restarting the daemon", errRejected, response.StatusCode)
 		}

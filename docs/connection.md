@@ -103,7 +103,10 @@ Registration inherits the saved instance, roots and headers. Passing a different
 instance or roots, or attempting to override configured headers in registration
 input, fails locally. After registration, `check` verifies an authenticated
 WebSocket connection, including machine identity and version compatibility,
-and reports `connected` before exiting.
+and reports `connected` before exiting. Stop a running daemon before using
+`check` or `connect`: only one authenticated connection is allowed for an
+outpost. If the daemon is already connected, the standalone check reports an
+HTTP 409 conflict and leaves the daemon's connection active.
 
 To correct or rotate existing access credentials, stop the daemon, run
 `configure --private-dir /home/worker/.outpost-private` with the new headers on

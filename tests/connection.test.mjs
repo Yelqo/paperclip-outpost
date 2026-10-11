@@ -1,6 +1,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
+import { once } from 'node:events';
 import { mkdtempSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,6 +16,7 @@ let server, sockets, origin;
 let requireAccess = true;
 let redirectTo;
 let registrationHandler;
+let rejectDuplicateConnections = false;
 const requests = [];
 
 function cli(args, input, stopWhenConnected = false) {
@@ -65,6 +67,7 @@ before(async () => {
     if (redirectTo) return socket.end(`HTTP/1.1 302 Found\r\nLocation: ${redirectTo}\r\nContent-Length: 0\r\n\r\n`);
     if (!authenticate(req)) return socket.end('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n');
     if (req.headers.authorization !== 'Bearer outpost-machine-secret') return socket.end('HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n');
+    if (rejectDuplicateConnections && sockets.clients.size > 0) return socket.end('HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n');
     sockets.handleUpgrade(req,socket,head,ws => {
       ws.send(JSON.stringify({type:'ready',outpostId:'fixture-outpost',companyId:'fixture-company',versions}));
       ws.on('message', () => ws.send('{"type":"pong","operations":[]}'));
@@ -134,6 +137,54 @@ test('operator configures existing access credentials before registration and ch
   for (const secret of ['operator-secret','outpost-machine-secret',...Object.values(headers)]) {
     assert.ok(![configured,checked,registered,connected,diagnostic].some(result => (result.stdout+result.stderr).includes(secret)));
   }
+});
+
+test('checking a connected daemon explains the conflict and succeeds after the daemon stops', async () => {
+  const dir = join(home,'active-daemon');
+  assert.equal((await configure(dir)).code,0);
+  assert.equal((await register(dir)).code,0);
+  rejectDuplicateConnections = true;
+  const daemon = spawn(join(process.cwd(),'bin/outpost'),['daemon','--private-dir',dir], {
+    env:{...process.env,SSL_CERT_FILE:join(home,'cert.pem')},stdio:['ignore','pipe','pipe'],
+  });
+  const exited = once(daemon,'close');
+  const connected = Promise.withResolvers();
+  let stdout = '', stderr = '';
+  daemon.stdout.on('data',data => {
+    stdout += data;
+    if (stdout.includes('"status":"connected"')) connected.resolve();
+  });
+  daemon.stderr.on('data',data => {stderr += data;});
+  daemon.on('error',connected.reject);
+  daemon.on('close',() => connected.reject(new Error(`Daemon exited before connecting: ${stderr}`)));
+  const timer = setTimeout(() => connected.reject(new Error('Daemon connection timed out')),15000);
+  let disconnected;
+  try {
+    await connected.promise;
+    assert.equal(sockets.clients.size,1);
+    disconnected = once([...sockets.clients][0],'close');
+    const competingDir = join(home,'competing-daemon');
+    assert.equal((await configure(competingDir)).code,0);
+    assert.equal((await register(competingDir)).code,0);
+    for (const [command, privateDir] of [['check',dir],['connect',dir],['daemon',competingDir]]) {
+      const result = await cli([command,'--private-dir',privateDir]);
+      assert.equal(result.code,1);
+      assert.match(result.stderr,/already connected.*HTTP 409.*stop.*daemon.*check/);
+      assert.doesNotMatch(result.stderr,/access credentials|registration|revocation|configure/);
+      for (const secret of ['outpost-machine-secret',...Object.values(headers)]) assert.ok(!result.stderr.includes(secret));
+      assert.equal(daemon.exitCode,null,'a rejected connection must leave the daemon connected');
+      assert.equal(sockets.clients.size,1);
+    }
+  } finally {
+    clearTimeout(timer);
+    daemon.kill('SIGTERM');
+    await exited;
+    if (disconnected) await disconnected;
+    rejectDuplicateConnections = false;
+  }
+  const checked = await cli(['check','--private-dir',dir]);
+  assert.equal(checked.code,0,checked.stderr);
+  assert.match(checked.stdout,/connected/);
 });
 
 test('ordinary authenticated WSS needs no optional headers and clearing old access settings preserves identity', async () => {

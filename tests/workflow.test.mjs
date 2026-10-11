@@ -126,7 +126,14 @@ test('the Go daemon connects outbound and the operator observes its authenticate
     return status.connected === true && output.includes('connected');
   });
   assert.ok(output.includes('connected'));
-  daemon.kill('SIGTERM');
+  try {
+    assert.throws(() => cli(['check','--private-dir',privateDir]),error => {
+      assert.match(error.stderr.toString(),/already connected.*HTTP 409.*stop.*daemon.*check/);
+      assert.doesNotMatch(error.stderr.toString(),/access credentials|registration|revocation|configure/);
+      return true;
+    });
+    assert.equal((await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).connected,true);
+  } finally { daemon.kill('SIGTERM'); }
   await eventually(async () => !(await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).connected);
 });
 
