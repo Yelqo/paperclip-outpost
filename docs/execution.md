@@ -88,6 +88,8 @@ records `resultJson.executionCancellation.state: "requested"` on the original
 run and durably fences further operations for that run. The request is delivered
 to every outstanding agent and control operation using their original identities.
 Cancellation has its own delivery lane and consumes no execution admission slot.
+Unresolved cancellation for one operation does not block cancellation delivery or
+admission checks for other workspaces.
 
 The daemon records the request before cancelling the supervised launcher. Its
 protected PID namespace terminates the process tree, including descendants.

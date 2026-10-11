@@ -56,6 +56,7 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
   const output=createOutputHistory(ctx);
   const pending = new Map<string,Pending>();
   const cancelledRuns = new Set<string>();
+  const cancellationCursor = new Map<string,string>();
   const queues = new Map<string,Array<OperationRequest & {requestId:string}>>();
   type Lease = {runId:string;outpostKey:string;workspaceId?:string;workspaceKey?:string;operations:Map<string,Identity["purpose"]>;released:boolean;executedAgent:boolean};
   const leases = new Map<string,Lease>();
@@ -96,27 +97,34 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
     });
   };
   const drain = async (companyId:string,outpostId:string) => {
-    const cancellation=(await history.all(companyId,outpostId)).find(record=>record.cancelRequested && (!record.outcome || record.outcome.ownershipUncertain));
-    if(cancellation) return [{type:"cancel",runId:cancellation.runId,operationId:cancellation.operationId}];
+    const outpostKey=key(companyId,outpostId);
+    const cancellations=(await history.all(companyId,outpostId)).filter(record=>record.cancelRequested && (!record.outcome || record.outcome.ownershipUncertain));
+    const previous=cancellations.findIndex(record=>record.operationId===cancellationCursor.get(outpostKey));
+    const cancellation=cancellations.length ? cancellations[(previous+1)%cancellations.length] : undefined;
+    // Bound each poll to one cancellation plus one queued operation. Rotate
+    // retries so missing evidence cannot starve other stops or workspace checks.
+    const operations=cancellation ? [{type:"cancel" as const,runId:cancellation.runId,operationId:cancellation.operationId}] : [];
+    if(cancellation) cancellationCursor.set(outpostKey,cancellation.operationId);
+    else cancellationCursor.delete(outpostKey);
     const queue=queues.get(key(companyId,outpostId));
     const message=queue?.shift();
     const request=message && pending.get(message.requestId);
     if(request && message?.type==="execute") {
       if(await ctx.state.get(cancellationScope(companyId,outpostId,message.runId))===true) {
         request.reject(Object.assign(new Error("Run cancelled before dispatch"),{beforeLaunch:true}));
-        return [];
+        return operations;
       }
       try {
         await history.prepare(companyId,outpostId,{runId:message.runId,operationId:message.operationId,purpose:message.purpose,
           workspace:message.workspaceId,deadline:message.deadline,status:"uncertain"});
-      } catch(error) { request.reject(Object.assign(new Error(error instanceof Error ? error.message : "Cannot persist delivery witness"),{beforeLaunch:true})); return []; }
+      } catch(error) { request.reject(Object.assign(new Error(error instanceof Error ? error.message : "Cannot persist delivery witness"),{beforeLaunch:true})); return operations; }
       if(pending.get(message.requestId)!==request) {
         await history.refuse(companyId,outpostId,message.operationId,message.runId);
-        return [];
+        return operations;
       }
     }
     if(request) { request.sent=true; request.onSent?.(); }
-    return message ? [message] : [];
+    return message ? [...operations,message] : operations;
   };
   const message = async (companyId:string,outpostId:string,value:unknown) => {
     const frame=readFrame(value);
@@ -135,6 +143,7 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
   const close = (companyId:string,outpostId:string) => {
     for (const request of [...pending.values()]) if (request.companyId===companyId && request.outpostId===outpostId && (!request.sent || !request.identity)) request.reject(unavailable("Outpost disconnected before launch"));
     queues.delete(key(companyId,outpostId));
+    cancellationCursor.delete(key(companyId,outpostId));
   };
   const reconcile = (companyId:string,outpostId:string,record:ExecutionRecord) => {
     const workspaceKey=`${key(companyId,outpostId)}:${record.workspace}`;
