@@ -77,10 +77,9 @@ Exceeding the output limit terminates the process and reports failure.
 The daemon records the terminal process outcome durably before releasing its
 workspace ownership. A killed process namespace also terminates descendants.
 If an operation's outcome is uncertain after a crash or a failed terminal write,
-conflicting dispatch remains blocked. Preserve the private history; deleting
-it discards replay protection. Automatic interruption reconciliation, buffered
-output recovery, cancellation receipts and operator reconciliation belong to
-the recovery milestones. This release fails uncertain operations closed.
+conflicting dispatch remains blocked until recovery establishes termination.
+Preserve the private history. Buffered output recovery, cancellation receipts
+and operator resolution of missing history remain subsequent milestones.
 
 On startup, the daemon locates uncertain workspace identities under its worker
 root and reacquires their directory locks before opening its transport. This
@@ -119,8 +118,76 @@ of the admitted run. Releasing the host lease preserves that workspace's server
 reservation until every dispatched agent and control operation has a known
 termination. The daemon also preserves uncertain ownership across restart, so
 conflicting pending work keeps waiting instead of
-launching. Full reconciliation of uncertain operations belongs to the recovery
-milestones.
+launching. Reconciliation follows the rules below.
+
+## Interruption recovery and durable history
+
+Before delivering an execution request, the plugin commits a delivery witness
+to Paperclip's company-scoped plugin state. It contains the original run and
+operation identities, purpose, filesystem workspace identity and absolute
+deadline. It contains no command, environment, callback credential or output.
+Each operation identity remains consumed indefinitely. Before-launch refusals
+and requests withdrawn before dispatch receive durable no-launch receipts;
+those receipts do not claim that a process ran or reserve its workspace.
+
+On every daemon connection, both sides compare bounded pages of canonical
+record fingerprints, then exchange unmatched records one at a time. Matching
+history still restores workspace reservations; fingerprints never authorize
+launches. This avoids rewriting every historical callback receipt on reconnect.
+All exchanges stay within the transport's frame limit. Paperclip refuses new execution admission
+until reconciliation finishes. `connected` reports the authenticated socket;
+`executionReady` reports completed reconciliation. The operator's existing
+outpost status API also exposes `executionHistory`, including original
+identities and `running`, `terminal`, `interrupted` or `uncertain` receipts.
+Reconciliation updates these receipts and workspace ownership. It does not
+rewrite a completed Paperclip heartbeat attempt or schedule a replacement run.
+Known terminal results remain inspectable after lost acknowledgements or
+plugin restart. Recovery itself never dispatches an execute request.
+
+The local journal records Linux's boot identity before launch and, when
+available, the protected PID namespace's init PID and `/proc` start time after
+launch. Bubblewrap's [`--info-fd` implementation](https://github.com/containers/bubblewrap/blob/v0.9.0/bubblewrap.c)
+reports that namespace process. A different boot establishes process loss.
+Within the same boot, disappearance of that process, a different start time
+at the same PID, or its terminal zombie/dead state establishes namespace loss
+and therefore termination of its descendants. A live process or unreadable
+process evidence keeps ownership blocked. An intent with no recorded process
+identity stays uncertain within that boot, even when its deadline has expired;
+a deadline alone never proves termination. Legacy records without boot evidence
+also stay uncertain. The daemon periodically rechecks uncertain process evidence.
+
+Verified process loss produces an `interrupted` outcome, durably recorded before
+releasing ownership. The original workspace, Git history and terminal receipt
+remain available. An explicitly scheduled distinct run may then use the
+workspace; neither redelivery nor recovery can relaunch the consumed operation.
+All outstanding agent and control operations must have known termination before
+their run's workspace reservation is released.
+
+Launch intent uses exclusive file creation followed by file and directory
+`fsync`. Process evidence and terminal updates use a private temporary file,
+file `fsync`, atomic rename and directory `fsync`. Uncommitted `.tmp` files are
+ignored at startup; malformed authoritative records refuse startup. Any failed
+durability barrier prevents launch or retains ownership. These guarantees assume
+a local filesystem and storage stack that honor `fsync` and atomic rename.
+A crash after intent but before launch consumes the operation without inventing
+permission to execute it. A crash after launch but before process evidence may
+require a verified reboot to resolve interruption.
+
+Paperclip's independent witness detects missing local records and regressions
+of previously observed process or terminal history, including restored VM
+snapshots. The daemon durably records a missing-history fence, reports
+`historyMissing: true` with `uncertain` status, and retains workspace ownership.
+Reboot does not repair missing consumption history. Terminal acknowledgements
+cannot erase this fence. Do not delete the witness or private history to force
+a retry. Restoring Paperclip and the machine together can also roll back the
+witness and cannot be detected using these two copies alone; revoke the restored
+outpost and resolve external effects before authorizing further work.
+
+The journal and daemon lock live in the private connection directory, outside
+workspace, scratch and runtime roots. Mode `0700`/`0600` is supplemented by the
+actual launcher's read-only root, private-directory mask, separate mount/PID
+namespaces and dropped capabilities. Same-UID agent processes cannot read or
+modify consumption records or access the supervisor through `/proc`.
 
 ## Acceptance
 
@@ -130,4 +197,10 @@ An acceptance adapter installed through Paperclip's public adapter API exercises
 stable redelivery and associated controls at the execution-driver seam.
 Assertions use public run state/logs, workspace effects, Git history and launch
 counts, without inspecting private transport frames or execution records.
+Recovery additionally checks the operator's public execution-history receipts,
+restores a disposable machine snapshot and kills the actual daemon. Focused Go
+subprocess faults exercise intent, launch, terminal-record and acknowledgement
+boundaries; live-process tests verify exclusion until termination is established.
+The public protection test attempts to read and overwrite an actual journal
+record through the same-UID protected launcher.
 The bounded process tests require no model provider or deployed Paperclip instance.

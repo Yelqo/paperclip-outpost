@@ -6,15 +6,19 @@ import { createExecutionWorkflows } from '../plugin/execution.ts';
 function fixture() {
   const scope={companyId:'company',config:{companyId:'company',outpostId:'outpost'},adapterType:'pi_local'};
   let online=true;
-  const execution=createExecutionWorkflows({execution:{log(){}}},()=>online);
-  const drain=() => execution.drain('company','outpost')[0];
+  const states=new Map();
+  const execution=createExecutionWorkflows({execution:{log(){}},state:{
+    async get(input){return structuredClone(states.get(input.stateKey) ?? null);},
+    async set(input,value){states.set(input.stateKey,structuredClone(value));},
+  }},()=>online);
+  const drain=async () => (await execution.drain('company','outpost'))[0];
   const reply=(request,result,extra={}) => execution.message('company','outpost',{
     type:'result',requestId:request.requestId,runId:request.runId ?? '',operationId:request.operationId ?? '',result,...extra,
   });
   const admit=async runId => {
     const lease=await execution.acquire({...scope,runId});
     const realized=execution.realize({...scope,lease,workspace:{localPath:'/workspace'}});
-    reply(drain(),{cwd:'/workspace',workspaceId:'1:2',ownerRunId:''});
+    reply(await drain(),{cwd:'/workspace',workspaceId:'1:2',ownerRunId:''});
     await realized;
     return lease;
   };
@@ -30,7 +34,7 @@ test('the first control stays retryable when the outpost goes offline after admi
   const lease=await f.admit('A');
   f.offline();
   await assert.rejects(f.execute(lease,'A','probe'),{code:PLUGIN_RPC_ERROR_CODES.EXECUTION_UNAVAILABLE});
-  assert.equal(f.drain(),undefined,'an offline command must never be dispatched');
+  assert.equal(await f.drain(),undefined,'an offline command must never be dispatched');
   await f.release(lease);
 });
 
@@ -39,7 +43,7 @@ test('an explicit busy refusal of a setup control stays retryable',async () => {
   const lease=await f.admit('A');
   const control=f.execute(lease,'A','probe');
   const refused=assert.rejects(control,{code:PLUGIN_RPC_ERROR_CODES.EXECUTION_UNAVAILABLE});
-  f.reply(f.drain(),null,{error:'busy',errorCode:'execution_unavailable',beforeLaunch:true});
+  f.reply(await f.drain(),null,{error:'busy',errorCode:'execution_unavailable',beforeLaunch:true});
   await refused;
   await f.release(lease);
   await f.admit('B');
@@ -49,7 +53,7 @@ test('a refused control cannot schedule a replacement while an agent is still ex
   const f=fixture();
   const lease=await f.admit('A');
   const agent=f.execute(lease,'A','agent','agent_execution');
-  const request=f.drain();
+  const request=await f.drain();
   f.offline();
   await assert.rejects(f.execute(lease,'A','control'),error => error.code!==PLUGIN_RPC_ERROR_CODES.EXECUTION_UNAVAILABLE);
   f.reply(request,{exitCode:0,timedOut:false});
@@ -61,7 +65,7 @@ test('a refused control cannot schedule a replacement after an agent has execute
   const f=fixture();
   const lease=await f.admit('A');
   const agent=f.execute(lease,'A','agent','agent_execution');
-  f.reply(f.drain(),{exitCode:0,timedOut:false});
+  f.reply(await f.drain(),{exitCode:0,timedOut:false});
   await agent;
   f.offline();
   await assert.rejects(f.execute(lease,'A','control'),error => error.code!==PLUGIN_RPC_ERROR_CODES.EXECUTION_UNAVAILABLE);
@@ -73,7 +77,7 @@ test('a refused control cannot schedule a replacement while a prior control is u
   const lease=await f.admit('A');
   const control=f.execute(lease,'A','control');
   const rejected=assert.rejects(control,/durable outcome is uncertain/);
-  f.reply(f.drain(),{exitCode:0,timedOut:false,ownershipUncertain:true,error:'durable outcome is uncertain'});
+  f.reply(await f.drain(),{exitCode:0,timedOut:false,ownershipUncertain:true,error:'durable outcome is uncertain'});
   await rejected;
   f.offline();
   await assert.rejects(f.execute(lease,'A','probe'),error => error.code!==PLUGIN_RPC_ERROR_CODES.EXECUTION_UNAVAILABLE);
@@ -85,7 +89,7 @@ test('a lost control reply preserves ownership after lease release',async () => 
   const lease=await f.admit('A');
   const control=f.execute(lease,'A','control');
   const rejected=assert.rejects(control,/outcome is uncertain/);
-  f.drain();
+  await f.drain();
   f.execution.close('company','outpost');
   await rejected;
   await f.release(lease);
@@ -96,10 +100,10 @@ test('agent completion cannot release an outstanding control',async () => {
   const f=fixture();
   const lease=await f.admit('A');
   const agent=f.execute(lease,'A','agent','agent_execution');
-  const agentRequest=f.drain();
+  const agentRequest=await f.drain();
   const control=f.execute(lease,'A','control');
   const rejected=assert.rejects(control,/outcome is uncertain/);
-  f.drain();
+  await f.drain();
   f.reply(agentRequest,{exitCode:0,timedOut:false});
   await agent;
   f.execution.close('company','outpost');
@@ -113,10 +117,10 @@ test('a known sibling outcome does not clear a control with uncertain durable te
   const lease=await f.admit('A');
   const control=f.execute(lease,'A','control');
   const rejected=assert.rejects(control,/durable outcome is uncertain/);
-  f.reply(f.drain(),{exitCode:0,timedOut:false,ownershipUncertain:true,error:'durable outcome is uncertain'});
+  f.reply(await f.drain(),{exitCode:0,timedOut:false,ownershipUncertain:true,error:'durable outcome is uncertain'});
   await rejected;
   const agent=f.execute(lease,'A','agent','agent_execution');
-  f.reply(f.drain(),{exitCode:0,timedOut:false});
+  f.reply(await f.drain(),{exitCode:0,timedOut:false});
   await agent;
   await f.release(lease);
   await assert.rejects(f.admit('B'),/busy|uncertain/);
@@ -127,11 +131,11 @@ test('a before-launch refusal clears only its own operation',async () => {
   const lease=await f.admit('A');
   const control=f.execute(lease,'A','control');
   const rejected=assert.rejects(control,/durable outcome is uncertain/);
-  f.reply(f.drain(),{exitCode:0,timedOut:false,ownershipUncertain:true,error:'durable outcome is uncertain'});
+  f.reply(await f.drain(),{exitCode:0,timedOut:false,ownershipUncertain:true,error:'durable outcome is uncertain'});
   await rejected;
   const agent=f.execute(lease,'A','agent','agent_execution');
   const refused=assert.rejects(agent,/busy/);
-  f.reply(f.drain(),null,{error:'busy',errorCode:'execution_unavailable',beforeLaunch:true});
+  f.reply(await f.drain(),null,{error:'busy',errorCode:'execution_unavailable',beforeLaunch:true});
   await refused;
   await f.release(lease);
   await assert.rejects(f.admit('B'),/busy|uncertain/);
@@ -152,9 +156,9 @@ test('lease release waits for every control to settle and then frees the workspa
   const f=fixture();
   const lease=await f.admit('A');
   const first=f.execute(lease,'A','first');
-  const firstRequest=f.drain();
+  const firstRequest=await f.drain();
   const second=f.execute(lease,'A','second');
-  const secondRequest=f.drain();
+  const secondRequest=await f.drain();
   await f.release(lease);
   f.reply(firstRequest,{exitCode:0,timedOut:false});
   await first;

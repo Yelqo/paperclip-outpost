@@ -121,10 +121,11 @@ func session(ctx context.Context, c Connection, output io.Writer, daemon bool, s
 	defer ws.CloseNow()
 	ws.SetReadLimit(64 * 1024)
 	var ready struct {
-		Type      string   `json:"type"`
-		OutpostID string   `json:"outpostId"`
-		CompanyID string   `json:"companyId"`
-		Versions  Versions `json:"versions"`
+		Type             string   `json:"type"`
+		OutpostID        string   `json:"outpostId"`
+		CompanyID        string   `json:"companyId"`
+		Versions         Versions `json:"versions"`
+		RecoveryRequired bool     `json:"recoveryRequired"`
 	}
 	readCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	err = wsjson.Read(readCtx, ws, &ready)
@@ -134,6 +135,11 @@ func session(ctx context.Context, c Connection, output io.Writer, daemon bool, s
 	}
 	if ready.Type != "ready" || ready.OutpostID != c.OutpostID || ready.CompanyID != c.CompanyID || ready.Versions != supported {
 		return errRejected
+	}
+	if daemon && ready.RecoveryRequired {
+		if err := reconcileSession(ctx, ws, s); err != nil {
+			return err
+		}
 	}
 	if err := json.NewEncoder(output).Encode(map[string]string{"status": "connected", "outpostId": c.OutpostID, "companyId": c.CompanyID}); err != nil {
 		return errors.New("cannot write daemon status")
@@ -213,6 +219,15 @@ func session(ctx context.Context, c Connection, output io.Writer, daemon bool, s
 		}
 	}
 	for {
+		reports, reportErr := s.recoveryReports(false)
+		if reportErr != nil {
+			return reportErr
+		}
+		for _, record := range reports {
+			if err := send(map[string]any{"type": "history", "record": record}); err != nil {
+				return errDisconnected
+			}
+		}
 		if err = write(map[string]string{"type": "heartbeat"}); err != nil {
 			return errDisconnected
 		}

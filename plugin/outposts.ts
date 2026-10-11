@@ -4,6 +4,7 @@ import type { PluginContext, PluginApiRequestInput, PluginApiResponse, PluginWeb
 import type { PluginEnvironmentValidateConfigParams } from "@paperclipai/plugin-sdk/protocol";
 import { versions } from "./versions.js";
 import { createExecutionWorkflows } from "./execution.js";
+import { readExecutionRecord, recordDigest, type ExecutionRecord } from "./recovery.js";
 
 export class InvalidCredentials extends Data.TaggedError("InvalidCredentials") { readonly message = "Invalid outpost credentials"; }
 export class RevokedOutpost extends Data.TaggedError("RevokedOutpost") { readonly message = "Outpost has been revoked"; }
@@ -15,7 +16,8 @@ export class ConnectionConflict extends Data.TaggedError("ConnectionConflict") {
 export type OutpostError = InvalidCredentials | RevokedOutpost | IncompatibleVersions | PersistenceFailure | InvalidRegistration | OutpostNotFound | ConnectionConflict;
 
 type Outpost = { id:string; companyId:string; name:string; credentialHash:string; revoked:boolean };
-type Session = { outpostId:string; companyId:string; scope:Scope.CloseableScope; authenticated?:boolean };
+type Session = { outpostId:string; companyId:string; scope:Scope.CloseableScope; authenticated?:boolean; reconciled?:boolean;
+  expected?:ExecutionRecord[]; inventory?:Map<string,string>; recovery?:Array<{operationId:string;record?:ExecutionRecord}>; recoveryIndex?:number };
 const uuid = (value:unknown):value is string => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 const digest = (value:string) => createHash("sha256").update(value).digest();
 const stateKey = (companyId:string, id:string) => ({scopeKind:"company" as const, scopeId:companyId, stateKey:`outpost:${id}`});
@@ -28,7 +30,7 @@ function validVersions(value:unknown):boolean {
 /** SDK promises are adapted here; the workflows above this boundary use Effects. */
 export function createOutpostWorkflows(ctx:PluginContext) {
   const sessions = new Map<string,Session>();
-  const execution = createExecutionWorkflows(ctx,(companyId,outpostId) => [...sessions.values()].some(s => s.authenticated && s.companyId===companyId && s.outpostId===outpostId));
+  const execution = createExecutionWorkflows(ctx,(companyId,outpostId) => [...sessions.values()].some(s => s.authenticated && s.reconciled && s.companyId===companyId && s.outpostId===outpostId));
   const persistence = <A>(operation:() => Promise<A>) => Effect.tryPromise({try:operation, catch:() => new PersistenceFailure()});
   const read = (companyId:string,id:string) => persistence(() => ctx.state.get(stateKey(companyId,id))).pipe(Effect.map(value => value as Outpost | null));
   const write = (record:Outpost) => persistence(() => ctx.state.set(stateKey(record.companyId,record.id),record));
@@ -55,7 +57,9 @@ export function createOutpostWorkflows(ctx:PluginContext) {
     if (!record) return yield* Effect.fail(new OutpostNotFound());
     if (input.routeKey === "revoke") return yield* revoke(record);
     const connected = [...sessions.values()].some(session => session.authenticated && session.companyId === record.companyId && session.outpostId === record.id);
-    return {headers:{"Cache-Control":"no-store"},body:{outpostId:record.id,name:record.name,companyId:record.companyId,revoked:record.revoked,connected}};
+    const executionReady = [...sessions.values()].some(session => session.authenticated && session.reconciled && session.companyId === record.companyId && session.outpostId === record.id);
+    const executionHistory=yield* persistence(()=>execution.history.all(record.companyId,record.id));
+    return {headers:{"Cache-Control":"no-store"},body:{outpostId:record.id,name:record.name,companyId:record.companyId,revoked:record.revoked,connected,executionReady,executionHistory}};
   });
   const authenticate = (input:PluginWebSocketOpen) => Effect.gen(function* () {
     const id = input.query.outpostId;
@@ -92,7 +96,7 @@ export function createOutpostWorkflows(ctx:PluginContext) {
       if ([...sessions.values()].some(value => value !== session && value.authenticated && value.outpostId === record.id))
         return yield* Effect.fail(new ConnectionConflict());
       session.authenticated = true;
-      return {status:101,principalId:record.id,messages:[JSON.stringify({type:"ready",outpostId:record.id,companyId:record.companyId,versions})]} satisfies PluginWebSocketAdmission;
+      return {status:101,principalId:record.id,messages:[JSON.stringify({type:"ready",outpostId:record.id,companyId:record.companyId,versions,recoveryRequired:true})]} satisfies PluginWebSocketAdmission;
     });
     return yield* admission.pipe(Effect.provideService(Scope.Scope,scope),Effect.onError(() => Scope.close(scope,Exit.void)));
   });
@@ -102,8 +106,59 @@ export function createOutpostWorkflows(ctx:PluginContext) {
     const record = yield* read(session.companyId,session.outpostId);
     if (!record || record.revoked) return yield* Effect.fail(new RevokedOutpost());
     const data = yield* Effect.try({try:() => JSON.parse(input.data ?? ""),catch:() => new InvalidCredentials()});
-    if (data?.type === "heartbeat" && Object.keys(data).length === 1) return {messages:[JSON.stringify({type:"pong",operations:execution.drain(session.companyId,session.outpostId)})]};
+    const nextRecovery=() => {
+      const expected=session.recovery?.[session.recoveryIndex ?? 0];
+      return {messages:[JSON.stringify(expected ? {type:"recovery_probe",...expected} : {type:"recovery_upload"})]};
+    };
+    if(data?.type==="recovery_begin" && !session.inventory && !session.reconciled) {
+      session.expected=yield* persistence(()=>execution.history.all(session.companyId,session.outpostId));
+      session.inventory=new Map();
+      session.recoveryIndex=0;
+      return {messages:[JSON.stringify({type:"recovery_inventory"})]};
+    }
+    if(data?.type==="recovery_inventory" && session.inventory && !session.recovery) {
+      if(!Array.isArray(data.records) || data.records.length>100) return yield* Effect.fail(new InvalidCredentials());
+      for(const entry of data.records) {
+        if(!Array.isArray(entry) || entry.length!==2 || typeof entry[0]!=="string" || !entry[0] || typeof entry[1]!=="string" ||
+          !/^[0-9a-f]{64}$/.test(entry[1]) || session.inventory.has(entry[0])) return yield* Effect.fail(new InvalidCredentials());
+        session.inventory.set(entry[0],entry[1]);
+      }
+      return {messages:[JSON.stringify({type:"ack"})]};
+    }
+    if(data?.type==="recovery_inventory_complete" && session.inventory && session.expected && !session.recovery) {
+      const known=new Set(session.expected.map(record=>record.operationId));
+      session.recovery=session.expected.filter(record=>session.inventory!.get(record.operationId)!==recordDigest(record)).map(record=>({operationId:record.operationId,record}));
+      for(const operationId of session.inventory.keys()) if(!known.has(operationId)) session.recovery.push({operationId});
+      return nextRecovery();
+    }
+    if(data?.type==="history" || data?.type==="recovery_record") {
+      const report=yield* Effect.try({try:()=>readExecutionRecord(data.record),catch:()=>new InvalidCredentials()});
+      if(data.type==="recovery_record" && session.recovery?.[session.recoveryIndex ?? 0]?.operationId!==report.operationId) return yield* Effect.fail(new InvalidCredentials());
+      const accepted=yield* persistence(()=>execution.history.report(session.companyId,session.outpostId,report));
+      yield* persistence(async ()=>{await execution.reconcile(session.companyId,session.outpostId,accepted);});
+      if(data.type==="recovery_record") { session.recoveryIndex=(session.recoveryIndex ?? 0)+1; return nextRecovery(); }
+      return {messages:[JSON.stringify({type:"ack",deliveryId:data.deliveryId})]};
+    }
+    if(data?.type==="recovery_complete" && session.recovery && session.recoveryIndex===session.recovery.length) {
+      const records=yield* persistence(()=>execution.history.all(session.companyId,session.outpostId));
+      execution.restore(session.companyId,session.outpostId,records);
+      session.reconciled=true;
+      return {messages:[JSON.stringify({type:"recovery_ready"})]};
+    }
+    if (data?.type === "heartbeat" && Object.keys(data).length === 1) {
+      const operations=session.reconciled ? yield* persistence(()=>execution.drain(session.companyId,session.outpostId)) : [];
+      return {messages:[JSON.stringify({type:"pong",operations})]};
+    }
     if (data?.type === "output" || data?.type === "result") {
+      if(!session.reconciled) return yield* Effect.fail(new InvalidCredentials());
+      if(data.record!==undefined) {
+        const report=yield* Effect.try({try:()=>readExecutionRecord(data.record),catch:()=>new InvalidCredentials()});
+        if(report.operationId!==data.operationId || report.runId!==data.runId) return yield* Effect.fail(new InvalidCredentials());
+        const accepted=yield* persistence(()=>execution.history.report(session.companyId,session.outpostId,report));
+        yield* persistence(async ()=>{await execution.reconcile(session.companyId,session.outpostId,accepted);});
+      } else if(data.type==="result" && data.error && data.beforeLaunch===true && data.operationId) {
+        yield* persistence(()=>execution.history.refuse(session.companyId,session.outpostId,data.operationId,data.runId));
+      }
       yield* Effect.try({try:() => execution.message(session.companyId,session.outpostId,data),catch:() => new InvalidCredentials()});
       return {messages:[JSON.stringify({type:"ack",deliveryId:data.deliveryId})]};
     }

@@ -2,7 +2,7 @@
 export const versions = {
   "host": "f858207161ba29c01c82f4674aef83d91b74480f",
   "sdk": "1.0.0+outpost.5",
-  "plugin": "0.5.0",
-  "daemon": "0.5.0",
+  "plugin": "0.6.0",
+  "daemon": "0.6.0",
   "protocol": 5
 } as const;

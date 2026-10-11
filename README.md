@@ -22,6 +22,8 @@ See [setup, operator commands and protection boundaries](docs/connection.md).
 Optional access credentials can be configured and checked locally before
 registration, then corrected or rotated while retaining the outpost identity.
 See [command execution and supervision](docs/execution.md).
+Daemon recovery reconciles durable execution receipts with Paperclip without
+repeating launches, and blocks conflicting work when history is uncertain.
 The required Paperclip host/SDK extension is carried as a reproducible patch
 against a pinned upstream commit. [Pi integration](docs/pi.md) uses machine-owned
 runtime assets, scoped callbacks and human approval continuation with session
