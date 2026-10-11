@@ -1,10 +1,10 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { createHash } from "node:crypto";
 
-export type Outcome = {exitCode:number|null;signal?:string;timedOut:boolean;error?:string;ownershipUncertain?:boolean;interrupted?:boolean};
+export type Outcome = {exitCode:number|null;signal?:string;timedOut:boolean;error?:string;ownershipUncertain?:boolean;interrupted?:boolean;cancelled?:boolean};
 export type ExecutionRecord = {
   runId:string; operationId:string; purpose:"agent_execution"|"control"; workspace:string; deadline:string;
-  bootId?:string; processId?:number; processStart?:string; historyMissing?:boolean; refused?:boolean;
+  bootId?:string; processId?:number; processStart?:string; historyMissing?:boolean; refused?:boolean; cancelRequested?:boolean;
   status:"running"|"uncertain"|"terminal"|"interrupted"; outcome?:Outcome;
 };
 
@@ -15,7 +15,7 @@ export function recordDigest(record:ExecutionRecord):string {
   const outcome=record.outcome;
   const tuple=[record.runId,record.operationId,record.purpose,record.workspace,record.deadline,record.bootId ?? "",record.processId ?? 0,
     record.processStart ?? "",record.historyMissing ?? false,record.refused ?? false,record.status,
-    outcome ? [outcome.exitCode,outcome.signal ?? "",outcome.timedOut,outcome.error ?? "",outcome.ownershipUncertain ?? false,outcome.interrupted ?? false] : null];
+    outcome ? [outcome.exitCode,outcome.signal ?? "",outcome.timedOut,outcome.error ?? "",outcome.ownershipUncertain ?? false,outcome.interrupted ?? false,outcome.cancelled ?? false] : null,record.cancelRequested ?? false];
   const serialized=JSON.stringify(tuple).replace(/[<>&\u2028\u2029]/g,value=>"\\u"+value.charCodeAt(0).toString(16).padStart(4,"0"));
   return createHash("sha256").update(serialized).digest("hex");
 }
@@ -29,9 +29,10 @@ export function readOutcome(value:unknown):Outcome {
   const result=object(value);
   if((result.exitCode!==null && (!Number.isInteger(result.exitCode) || typeof result.exitCode!=="number")) || typeof result.timedOut!=="boolean" ||
     (result.signal!==undefined && typeof result.signal!=="string") || (result.error!==undefined && typeof result.error!=="string") ||
-    (result.ownershipUncertain!==undefined && typeof result.ownershipUncertain!=="boolean") || (result.interrupted!==undefined && typeof result.interrupted!=="boolean")) throw new Error("Invalid process outcome");
+    (result.ownershipUncertain!==undefined && typeof result.ownershipUncertain!=="boolean") || (result.interrupted!==undefined && typeof result.interrupted!=="boolean") ||
+    (result.cancelled!==undefined && typeof result.cancelled!=="boolean")) throw new Error("Invalid process outcome");
   return {exitCode:result.exitCode as number|null,timedOut:result.timedOut,signal:result.signal as string|undefined,error:result.error as string|undefined,
-    ownershipUncertain:result.ownershipUncertain as boolean|undefined,interrupted:result.interrupted as boolean|undefined};
+    ownershipUncertain:result.ownershipUncertain as boolean|undefined,interrupted:result.interrupted as boolean|undefined,cancelled:result.cancelled as boolean|undefined};
 }
 
 export function readExecutionRecord(value:unknown):ExecutionRecord {
@@ -42,13 +43,13 @@ export function readExecutionRecord(value:unknown):ExecutionRecord {
     !["running","uncertain","terminal","interrupted"].includes(record.status as string) ||
     (record.bootId!==undefined && typeof record.bootId!=="string") || (record.processId!==undefined && (!Number.isInteger(record.processId) || (record.processId as number)<=0)) ||
     (record.processStart!==undefined && typeof record.processStart!=="string") || (record.historyMissing!==undefined && typeof record.historyMissing!=="boolean") ||
-    (record.refused!==undefined && typeof record.refused!=="boolean")) throw new Error("Invalid execution history identity");
+    (record.refused!==undefined && typeof record.refused!=="boolean") || (record.cancelRequested!==undefined && typeof record.cancelRequested!=="boolean")) throw new Error("Invalid execution history identity");
   const outcome=record.outcome===undefined ? undefined : readOutcome(record.outcome);
   if((record.status==="terminal" || record.status==="interrupted") !== (outcome!==undefined && !outcome.ownershipUncertain)) throw new Error("Invalid execution history status");
   if((record.status==="interrupted") !== (outcome?.interrupted===true) || (record.historyMissing===true && record.status!=="uncertain")) throw new Error("Invalid recovery outcome");
   return {runId:record.runId,operationId:record.operationId,purpose:record.purpose,workspace:record.workspace,deadline:record.deadline,
     status:record.status as ExecutionRecord["status"],outcome,bootId:record.bootId as string|undefined,processId:record.processId as number|undefined,
-    processStart:record.processStart as string|undefined,historyMissing:record.historyMissing as boolean|undefined,refused:record.refused as boolean|undefined};
+    processStart:record.processStart as string|undefined,historyMissing:record.historyMissing as boolean|undefined,refused:record.refused as boolean|undefined,cancelRequested:record.cancelRequested as boolean|undefined};
 }
 
 /** The instance's durable delivery witness is independent of VM snapshots.
@@ -86,6 +87,7 @@ export function createRecoveryHistory(ctx:PluginContext) {
     // A stale live report cannot erase a terminal result or missing-history fence.
     if(prior?.historyMissing && !record.historyMissing) return prior;
     if(prior?.outcome && !record.outcome && !record.historyMissing) return prior;
+    if(prior?.cancelRequested) record={...record,cancelRequested:true};
     if(index<0) records.push(record); else records[index]=record;
     return record;
   });
@@ -96,5 +98,8 @@ export function createRecoveryHistory(ctx:PluginContext) {
     record.status="terminal";
     record.outcome={exitCode:null,timedOut:false,error:"execution refused before launch"};
   });
-  return {all,prepare,report,refuse};
+  const cancelRun=(companyId:string,outpostId:string,runId:string) => update(companyId,outpostId,records => {
+    for(const record of records) if(record.runId===runId && (!record.outcome || record.outcome.ownershipUncertain)) record.cancelRequested=true;
+  });
+  return {all,prepare,report,refuse,cancelRun};
 }

@@ -1,3 +1,26 @@
+diff --git a/doc/run-log-events.md b/doc/run-log-events.md
+index 1757c04fe..72d67a2c2 100644
+--- a/doc/run-log-events.md
++++ b/doc/run-log-events.md
+@@ -5,6 +5,18 @@ Run-log events write to the `heartbeat_run_events` table
+ Paperclip Telemetry events, and they are not OpenTelemetry exports. A run-log
+ event needs no operator endpoint.
+ 
++## Plugin run cancellation reconciliation
++
++Providers that advertise `environmentCancelRun` receive the original company and
++run identity. A requested cancellation stays pending until every admitted
++operation has machine termination evidence. If the executor has already ended,
++the scheduler appends a `lifecycle` event with message
++`machine termination reconciled after cancellation` and payload `{ outcome }`.
++The outcome contains exit code, signal, timeout, cancellation or interruption,
++and any bounded supervisor error. It contains no command, credentials or output.
++Natural completion retains its evidenced status. This event stays in the
++instance's run log and does not emit Telemetry or OpenTelemetry data.
++
+ ## Native PRP Run-Log Events
+ 
+ The hidden native coordinator writes each validated PRP event to the bound
 diff --git a/packages/adapter-utils/src/command-managed-runtime.ts b/packages/adapter-utils/src/command-managed-runtime.ts
 index 9abfd933c..cb9c13ae3 100644
 --- a/packages/adapter-utils/src/command-managed-runtime.ts
@@ -306,10 +329,19 @@ index 9ad14d6f2..b984e7803 100644
    },
    getDisplayId(params: Record<string, unknown> | null) {
 diff --git a/packages/plugins/sdk/src/define-plugin.ts b/packages/plugins/sdk/src/define-plugin.ts
-index 947a67cbb..45d259622 100644
+index 947a67cbb..2756d2020 100644
 --- a/packages/plugins/sdk/src/define-plugin.ts
 +++ b/packages/plugins/sdk/src/define-plugin.ts
-@@ -176,6 +176,21 @@ export interface PluginApiRequestInput {
+@@ -54,6 +54,8 @@ import type { PluginContext } from "./types.js";
+ import type {
+   PluginEnvironmentAcquireLeaseParams,
+   PluginEnvironmentDestroyLeaseParams,
++  PluginEnvironmentCancelRunParams,
++  PluginEnvironmentCancelRunResult,
+   PluginEnvironmentExecuteParams,
+   PluginEnvironmentExecuteResult,
+   PluginEnvironmentRunnerIngressEndpointParams,
+@@ -176,6 +178,21 @@ export interface PluginApiRequestInput {
    headers: Record<string, string>;
  }
  
@@ -331,7 +363,7 @@ index 947a67cbb..45d259622 100644
  export interface PluginApiResponse {
    status?: number;
    headers?: Record<string, string>;
-@@ -327,6 +342,9 @@ export interface PluginDefinition {
+@@ -327,6 +344,9 @@ export interface PluginDefinition {
     * access, capabilities, and checkout policy.
     */
    onApiRequest?(input: PluginApiRequestInput): Promise<PluginApiResponse>;
@@ -341,8 +373,17 @@ index 947a67cbb..45d259622 100644
  
    /**
     * Called when Paperclip scans issue/comment/document content and asks this
+@@ -409,6 +429,8 @@ export interface PluginDefinition {
+   ): Promise<PluginEnvironmentRealizeWorkspaceResult>;
+ 
+   /** Called to execute a command inside the provider lease. */
++  onEnvironmentCancelRun?(params: PluginEnvironmentCancelRunParams): Promise<PluginEnvironmentCancelRunResult>;
++
+   onEnvironmentExecute?(
+     params: PluginEnvironmentExecuteParams,
+   ): Promise<PluginEnvironmentExecuteResult>;
 diff --git a/packages/plugins/sdk/src/index.ts b/packages/plugins/sdk/src/index.ts
-index 57f862811..61db6b04b 100644
+index 57f862811..41fd1c4b5 100644
 --- a/packages/plugins/sdk/src/index.ts
 +++ b/packages/plugins/sdk/src/index.ts
 @@ -49,6 +49,9 @@
@@ -350,13 +391,22 @@ index 57f862811..61db6b04b 100644
  // ---------------------------------------------------------------------------
  
 +export type { PluginWebSocketOpen, PluginWebSocketEvent, PluginWebSocketReply, PluginWebSocketAdmission } from "./define-plugin.js";
-+export const PLUGIN_WEBSOCKET_SDK_VERSION = "1.0.0+outpost.7";
++export const PLUGIN_WEBSOCKET_SDK_VERSION = "1.0.0+outpost.8";
 +
  export { definePlugin } from "./define-plugin.js";
  export { createTestHarness, createEnvironmentTestHarness, createFakeEnvironmentDriver, filterEnvironmentEvents, assertEnvironmentEventOrder, assertLeaseLifecycle, assertWorkspaceRealizationLifecycle, assertExecutionLifecycle, assertEnvironmentError } from "./testing.js";
  export { createPluginBundlerPresets } from "./bundlers.js";
+@@ -187,6 +190,8 @@ export type {
+   PluginEnvironmentDestroyLeaseParams,
+   PluginEnvironmentRealizeWorkspaceParams,
+   PluginEnvironmentRealizeWorkspaceResult,
++  PluginEnvironmentCancelRunParams,
++  PluginEnvironmentCancelRunResult,
+   PluginEnvironmentExecuteParams,
+   PluginEnvironmentExecuteResult,
+   PluginEnvironmentRunnerIngressEndpointParams,
 diff --git a/packages/plugins/sdk/src/protocol.ts b/packages/plugins/sdk/src/protocol.ts
-index 9c08a45c4..0dc8b9bb4 100644
+index 9c08a45c4..97b05af74 100644
 --- a/packages/plugins/sdk/src/protocol.ts
 +++ b/packages/plugins/sdk/src/protocol.ts
 @@ -1,3 +1,4 @@
@@ -377,9 +427,22 @@ index 9c08a45c4..0dc8b9bb4 100644
    /** A catch-all for errors that do not fit other categories. */
    UNKNOWN: -32099,
  } as const;
-@@ -704,6 +711,12 @@ export interface PluginEnvironmentRealizeWorkspaceResult {
+@@ -703,7 +710,25 @@ export interface PluginEnvironmentRealizeWorkspaceResult {
+   metadata?: Record<string, unknown>;
  }
  
++export interface PluginEnvironmentCancelRunParams extends PluginEnvironmentDriverBaseParams {
++  runId: string;
++  queryOnly?: boolean;
++}
++
++/** Confirmation requires durable machine evidence for every operation of the run. */
++export type PluginEnvironmentCancelRunResult = { state: "requested" } | {
++  state: "confirmed";
++  outcome: { exitCode: number | null; signal?: string; timedOut: boolean;
++    cancelled?: boolean; interrupted?: boolean; error?: string };
++};
++
  export interface PluginEnvironmentExecuteParams extends PluginEnvironmentDriverBaseParams {
 +  callbackTransport?: RunCallbackTransport;
 +  /** Host-authored identities, independent of a reusable lease. */
@@ -390,7 +453,7 @@ index 9c08a45c4..0dc8b9bb4 100644
    lease: PluginEnvironmentLease;
    command: string;
    args?: string[];
-@@ -1212,6 +1225,11 @@ export function decodeChannelBytes(value: unknown): Uint8Array | null {
+@@ -1212,6 +1237,11 @@ export function decodeChannelBytes(value: unknown): Uint8Array | null {
  
  /** The open request for one persistent duplex channel. The worker registers the channel by `hostRouteId`. */
  export interface PluginDuplexChannelOpenParams {
@@ -402,7 +465,7 @@ index 9c08a45c4..0dc8b9bb4 100644
    /** The host-owned opaque route identifier. The worker registers the channel by it. */
    hostRouteId: string;
    /** The environment driver key, for the worker sandbox scope. */
-@@ -1323,6 +1341,9 @@ export const DUPLEX_CHANNEL_EXIT_NOTIFICATION = "duplexChannel.exit";
+@@ -1323,6 +1353,9 @@ export const DUPLEX_CHANNEL_EXIT_NOTIFICATION = "duplexChannel.exit";
   * ensure type safety across the IPC boundary.
   */
  export interface HostToWorkerMethods {
@@ -412,7 +475,15 @@ index 9c08a45c4..0dc8b9bb4 100644
    /** @see PLUGIN_SPEC.md §13.1 */
    initialize: [params: InitializeParams, result: InitializeResult];
    /** @see PLUGIN_SPEC.md §13.2 */
-@@ -1476,6 +1497,9 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[]
+@@ -1392,6 +1425,7 @@ export interface HostToWorkerMethods {
+     params: PluginEnvironmentRealizeWorkspaceParams,
+     result: PluginEnvironmentRealizeWorkspaceResult,
+   ];
++  environmentCancelRun: [params: PluginEnvironmentCancelRunParams, result: PluginEnvironmentCancelRunResult];
+   environmentExecute: [
+     params: PluginEnvironmentExecuteParams,
+     result: PluginEnvironmentExecuteResult,
+@@ -1476,6 +1510,9 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[]
    "runJob",
    "handleWebhook",
    "handleApiRequest",
@@ -423,10 +494,19 @@ index 9c08a45c4..0dc8b9bb4 100644
    "performAction",
    "executeTool",
 diff --git a/packages/plugins/sdk/src/worker-rpc-host.ts b/packages/plugins/sdk/src/worker-rpc-host.ts
-index 0f0d4eb4c..493cabc7c 100644
+index 0f0d4eb4c..05e3eb8bb 100644
 --- a/packages/plugins/sdk/src/worker-rpc-host.ts
 +++ b/packages/plugins/sdk/src/worker-rpc-host.ts
-@@ -1608,6 +1608,14 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
+@@ -89,6 +89,8 @@ import type {
+   RefreshExternalObjectsParams,
+   PluginEnvironmentAcquireLeaseParams,
+   PluginEnvironmentDestroyLeaseParams,
++  PluginEnvironmentCancelRunParams,
++  PluginEnvironmentCancelRunResult,
+   PluginEnvironmentExecuteParams,
+   PluginEnvironmentRunnerIngressEndpointParams,
+   PluginEnvironmentSyncInParams,
+@@ -1608,6 +1610,14 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
        case "handleWebhook":
          return handleWebhook(params as PluginWebhookInput);
  
@@ -441,7 +521,18 @@ index 0f0d4eb4c..493cabc7c 100644
        case "handleApiRequest":
          return handleApiRequest(params as PluginApiRequestInput);
  
-@@ -1739,6 +1747,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
+@@ -1653,6 +1663,10 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
+       case "environmentRealizeWorkspace":
+         return handleEnvironmentRealizeWorkspace(params as PluginEnvironmentRealizeWorkspaceParams);
+ 
++      case "environmentCancelRun":
++        if (!plugin.definition.onEnvironmentCancelRun) throw methodNotImplemented("environmentCancelRun");
++        return plugin.definition.onEnvironmentCancelRun(params as PluginEnvironmentCancelRunParams);
++
+       case "environmentExecute":
+         return handleEnvironmentExecute(params as PluginEnvironmentExecuteParams);
+ 
+@@ -1739,6 +1753,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
      if (plugin.definition.onHealth) supportedMethods.push("health");
      if (plugin.definition.onShutdown) supportedMethods.push("shutdown");
      if (plugin.definition.onApiRequest) supportedMethods.push("handleApiRequest");
@@ -451,6 +542,14 @@ index 0f0d4eb4c..493cabc7c 100644
      if (plugin.definition.onDetectExternalObjects) supportedMethods.push("detectExternalObjects");
      if (plugin.definition.onRouteAiConnection) supportedMethods.push("routeAiConnection");
      if (plugin.definition.onResolveExternalObject) supportedMethods.push("resolveExternalObject");
+@@ -1752,6 +1769,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
+     if (plugin.definition.onEnvironmentDestroyLease) supportedMethods.push("environmentDestroyLease");
+     if (plugin.definition.onEnvironmentRealizeWorkspace) supportedMethods.push("environmentRealizeWorkspace");
+     if (plugin.definition.onEnvironmentExecute) supportedMethods.push("environmentExecute");
++    if (plugin.definition.onEnvironmentCancelRun) supportedMethods.push("environmentCancelRun");
+     if (plugin.definition.onEnvironmentRunnerIngressEndpoint) {
+       supportedMethods.push("environmentRunnerIngressEndpoint");
+     }
 diff --git a/packages/shared/src/constants.ts b/packages/shared/src/constants.ts
 index 3e83f2631..8cb5030fa 100644
 --- a/packages/shared/src/constants.ts
@@ -734,6 +833,23 @@ index 5167ae403..ae8d34d2b 100644
    it("preserves tenant env vars across managed sandbox boot reconciles", async () => {
      // The cloud contract lets tenants add env vars — and only env vars —
      // to the managed sandbox environment. The provisioner reconciles
+diff --git a/server/src/__tests__/fixtures/plugin-worker-delayed.cjs b/server/src/__tests__/fixtures/plugin-worker-delayed.cjs
+index 8aa7e4efa..9f8354361 100644
+--- a/server/src/__tests__/fixtures/plugin-worker-delayed.cjs
++++ b/server/src/__tests__/fixtures/plugin-worker-delayed.cjs
+@@ -27,6 +27,12 @@ rl.on("line", (line) => {
+   }
+ 
+   if (method === "environmentExecute") {
++    if (message.params?.errorCode) {
++      send({ jsonrpc: "2.0", id: message.id, error: {
++        code: message.params.errorCode, message: "Execution refused before launch",
++      } });
++      return;
++    }
+     const delayMs = Number(message.params?.delayMs ?? 0);
+     setTimeout(() => {
+       send({
 diff --git a/server/src/__tests__/fixtures/plugin-worker-websocket-stalled.cjs b/server/src/__tests__/fixtures/plugin-worker-websocket-stalled.cjs
 new file mode 100644
 index 000000000..c47b53d19
@@ -892,6 +1008,72 @@ index 000000000..1543c5f30
 +    await opened(connect("normal"));
 +  }, 10000);
 +});
+diff --git a/server/src/__tests__/plugin-worker-manager.test.ts b/server/src/__tests__/plugin-worker-manager.test.ts
+index 2940b0c56..4146ffc0e 100644
+--- a/server/src/__tests__/plugin-worker-manager.test.ts
++++ b/server/src/__tests__/plugin-worker-manager.test.ts
+@@ -56,6 +56,61 @@ const TEST_MANIFEST: PaperclipPluginManifestV1 = {
+   entrypoints: { worker: "dist/worker.js" },
+ };
+ 
++describe("Outpost execution response loss", () => {
++  it.each([
++    ["yelqo.outpost", "exit", PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTCOME_UNCERTAIN],
++    ["yelqo.outpost", "timeout", PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTCOME_UNCERTAIN],
++    ["test.plugin", "exit", PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE],
++    ["test.plugin", "timeout", PLUGIN_RPC_ERROR_CODES.TIMEOUT],
++  ] as const)("classifies %s execution after worker %s", async (pluginKey, failure, code) => {
++    const handle = createPluginWorkerHandle("plugin-1", {
++      entrypointPath: DELAYED_WORKER_ENTRYPOINT,
++      manifest: { ...TEST_MANIFEST, id: pluginKey },
++      config: {},
++      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
++      apiVersion: 1,
++      hostHandlers: {},
++    });
++    try {
++      await handle.start();
++      const pending = handle.call("environmentExecute", {
++        driverKey: "outpost", companyId: "company-1", environmentId: "environment-1",
++        config: {}, lease: { providerLeaseId: "lease-1" }, command: "echo", delayMs: 1000,
++      } as HostToWorkerMethods["environmentExecute"][0], failure === "timeout" ? 10 : 5000);
++      const rejected = expect(pending).rejects.toMatchObject({ code });
++      if (failure === "exit") await handle.stop();
++      await rejected;
++    } finally {
++      await handle.stop().catch(() => undefined);
++    }
++  });
++
++  it("preserves an explicit Outpost refusal before launch", async () => {
++    const handle = createPluginWorkerHandle("plugin-1", {
++      entrypointPath: DELAYED_WORKER_ENTRYPOINT,
++      manifest: { ...TEST_MANIFEST, id: "yelqo.outpost" },
++      config: {},
++      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
++      apiVersion: 1,
++      hostHandlers: {},
++    });
++    try {
++      await handle.start();
++      await expect(handle.call("environmentExecute", {
++        driverKey: "outpost", companyId: "company-1", environmentId: "environment-1",
++        config: {}, lease: { providerLeaseId: "lease-1" }, command: "echo",
++        errorCode: PLUGIN_RPC_ERROR_CODES.EXECUTION_UNAVAILABLE,
++      } as HostToWorkerMethods["environmentExecute"][0])).rejects.toMatchObject({
++        code: PLUGIN_RPC_ERROR_CODES.EXECUTION_UNAVAILABLE,
++      });
++    } finally {
++      await handle.stop().catch(() => undefined);
++    }
++    await expect(handle.call("environmentExecute", {} as HostToWorkerMethods["environmentExecute"][0]))
++      .rejects.toThrow('Cannot call "environmentExecute"');
++  });
++});
++
+ describe("resolveRpcCallTimeoutMs", () => {
+   const MAX_RPC_TIMEOUT_MS = 15 * 60 * 1_000;
+   const MAX_NODE_TIMER_TIMEOUT_MS = 2_147_483_647;
 diff --git a/server/src/adapters/process/execute.ts b/server/src/adapters/process/execute.ts
 index 0f0838157..50796515e 100644
 --- a/server/src/adapters/process/execute.ts
@@ -965,7 +1147,7 @@ index 684e7cc13..8985f9c3a 100644
    // "set-cookie" is normally a response header; keep the request-side
 diff --git a/server/src/realtime/plugin-ws.ts b/server/src/realtime/plugin-ws.ts
 new file mode 100644
-index 000000000..5d440403c
+index 000000000..da398fbfa
 --- /dev/null
 +++ b/server/src/realtime/plugin-ws.ts
 @@ -0,0 +1,132 @@
@@ -989,7 +1171,7 @@ index 000000000..5d440403c
 +  try { commit = execFileSync("git", ["rev-parse", "HEAD"], {
 +    cwd: fileURLToPath(new URL("../../../", import.meta.url)), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1000,
 +  }).trim(); } catch { /* Packaged hosts must carry the build commit stamp. */ }
-+  const host = { commit, sdk: PLUGIN_WEBSOCKET_SDK_VERSION, transport: 7 };
++  const host = { commit, sdk: PLUGIN_WEBSOCKET_SDK_VERSION, transport: 8 };
 +  let admitted = 0, opening = 0, stopping = false;
 +  const pending = new Set<import("node:stream").Duplex>();
 +  server.on("upgrade", (req, socket, head) => {
@@ -1382,17 +1564,36 @@ index dec0d847c..5653f3e4d 100644
    return accounting;
  }
 diff --git a/server/src/services/heartbeat.ts b/server/src/services/heartbeat.ts
-index 9e8617e2f..d91ead06e 100644
+index 9e8617e2f..bf3c61129 100644
 --- a/server/src/services/heartbeat.ts
 +++ b/server/src/services/heartbeat.ts
-@@ -1,4 +1,6 @@
+@@ -1,4 +1,7 @@
++import { pluginRunCancellation, pluginRunOutcomeStatus } from "./plugin-run-cancellation.js";
 +import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk/protocol";
  import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 +import { environmentOwnsWorkspace } from "./environment-config.js";
  import { prepareConnectionInstructionDelivery } from "./connection-instructions.js";
  import { resolveAssignedConnectionInstructionsForRun } from "./native-runtime/assigned-mcp-tools.js";
  import { externalObjectService } from "./external-objects.js";
-@@ -12453,7 +12455,7 @@ export function heartbeatService(
+@@ -9634,6 +9637,7 @@ export function heartbeatService(
+   const treeControlSvc = issueTreeControlService(db);
+   const executionWorkspacesSvc = executionWorkspaceService(db);
+   const environmentsSvc = environmentService(db);
++  const pluginCancellationWorkerManager = options.pluginWorkerManager;
+   const environmentRuntime =
+     options.environmentRuntime ??
+     environmentRuntimeService(db, {
+@@ -10282,7 +10286,8 @@ export function heartbeatService(
+     };
+   }) {
+     const leaseOwnerRun = await getRun(input.runId);
+-    if (leaseOwnerRun && isNativeRunnerOwnershipHeld(leaseOwnerRun)) return;
++    if (leaseOwnerRun && (isNativeRunnerOwnershipHeld(leaseOwnerRun) ||
++      (leaseOwnerRun.status === "running" && parseObject(leaseOwnerRun.resultJson?.executionCancellation).proof === "machine_pending"))) return;
+     // Recovery can finish workspace copy-back outside the executor's finally.
+     // Successful copy-back does not earn warm retention for a failed turn.
+     const status = leaseOwnerRun?.status ?? input.status;
+@@ -12453,7 +12458,7 @@ export function heartbeatService(
      agent: typeof agents.$inferSelect,
      context: Record<string, unknown>,
      previousSessionParams: Record<string, unknown> | null,
@@ -1401,7 +1602,7 @@ index 9e8617e2f..d91ead06e 100644
    ): Promise<ResolvedAnchorWorkspaceForRun> {
      const issueId =
        readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
-@@ -12512,6 +12514,15 @@ export function heartbeatService(
+@@ -12512,6 +12517,15 @@ export function heartbeatService(
        repoRef: readNonEmptyString(workspace.repoRef),
      }));
  
@@ -1417,7 +1618,7 @@ index 9e8617e2f..d91ead06e 100644
      if (projectWorkspaceRows.length > 0) {
        const preferredWorkspace = preferredProjectWorkspaceId
          ? (projectWorkspaceRows.find(
-@@ -12696,6 +12707,8 @@ export function heartbeatService(
+@@ -12696,6 +12710,8 @@ export function heartbeatService(
      opts?: {
        useProjectWorkspace?: boolean | null;
        executionEnvironmentDriver?: string | null;
@@ -1426,7 +1627,7 @@ index 9e8617e2f..d91ead06e 100644
        anchorWorkspace?: ResolvedAnchorWorkspaceForRun;
      },
    ): Promise<ResolvedWorkspaceForRun> {
-@@ -12705,7 +12718,7 @@ export function heartbeatService(
+@@ -12705,7 +12721,7 @@ export function heartbeatService(
        previousSessionParams,
        opts,
      );
@@ -1435,7 +1636,7 @@ index 9e8617e2f..d91ead06e 100644
        return {
          ...anchor,
          additionalWorkspaces: [],
-@@ -16557,6 +16570,31 @@ export function heartbeatService(
+@@ -16557,6 +16573,31 @@ export function heartbeatService(
      }).catch(() => undefined);
    }
  
@@ -1467,7 +1668,15 @@ index 9e8617e2f..d91ead06e 100644
    async function scheduleInteractionContinuationInfrastructureRetryIfEligible(
      run: typeof heartbeatRuns.$inferSelect,
      agent: typeof agents.$inferSelect,
-@@ -21549,6 +21587,7 @@ export function heartbeatService(
+@@ -19354,6 +19395,7 @@ export function heartbeatService(
+       nativeControllerProcessStartedAt,
+       nativeControllerLeaseExpiresAt,
+     } of activeRuns) {
++      if (parseObject(run.resultJson?.executionCancellation).proof === "machine_pending") continue;
+       // Authentication timeout requires an explicit ownership resolution, not
+       // repeated reattachment or a process-gone guess on subsequent sweeps.
+       if (isNativeRunnerOwnershipHeld(run)) continue;
+@@ -21549,6 +21591,7 @@ export function heartbeatService(
            : selectedEnvironmentId
              ? await environmentsSvc.getById(selectedEnvironmentId)
              : null;
@@ -1475,7 +1684,7 @@ index 9e8617e2f..d91ead06e 100644
        const nativeChatWorkspaceScope = await findNativeChatWorkspaceScope(db, {
          adapterType: agent.adapterType,
          environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
-@@ -21618,6 +21657,7 @@ export function heartbeatService(
+@@ -21618,6 +21661,7 @@ export function heartbeatService(
              selectedEnvironmentForConfig?.driver ?? null;
            const shouldSerialize =
              sharedWorkspaceConcurrency !== "allow" &&
@@ -1483,7 +1692,7 @@ index 9e8617e2f..d91ead06e 100644
              (executionForcedToKubernetes ||
                (environmentDriver !== "local" &&
                  environmentDriver !== "ssh"));
-@@ -22001,6 +22041,9 @@ export function heartbeatService(
+@@ -22001,6 +22045,9 @@ export function heartbeatService(
          const handoff = await getFreshSessionHandoff();
          if (handoff) context.paperclipFreshSessionHandoffMarkdown = handoff;
        }
@@ -1493,7 +1702,7 @@ index 9e8617e2f..d91ead06e 100644
        const {
          selectedEnvironmentDriver: lowTrustPreflightEnvironmentDriver,
          workspace: resolvedWorkspace,
-@@ -22086,6 +22129,8 @@ export function heartbeatService(
+@@ -22086,6 +22133,8 @@ export function heartbeatService(
              {
                useProjectWorkspace:
                  requestedExecutionWorkspaceMode !== "agent_default",
@@ -1502,7 +1711,7 @@ index 9e8617e2f..d91ead06e 100644
                // Thread the selected environment driver so run-workspace resolution can tell a local
                // target from a remote one, and a confined sandbox target from an unconfined remote
                // target. A remote run resolves referenced projects only for the confined sandbox
-@@ -22120,7 +22165,7 @@ export function heartbeatService(
+@@ -22120,7 +22169,7 @@ export function heartbeatService(
          repoRef: resolvedWorkspace.repoRef,
          additionalWorkspaces: resolvedWorkspace.additionalWorkspaces,
        } satisfies ExecutionWorkspaceInput;
@@ -1511,7 +1720,7 @@ index 9e8617e2f..d91ead06e 100644
          requestedExecutionWorkspaceMode,
          config: hostExecutionWorkspaceConfig,
          issue: issueRef,
-@@ -22253,7 +22298,12 @@ export function heartbeatService(
+@@ -22253,7 +22302,12 @@ export function heartbeatService(
          executionWorkspace,
          reusedExecutionWorkspace,
          policy: resolvedWorkspaceReusePolicy,
@@ -1525,7 +1734,7 @@ index 9e8617e2f..d91ead06e 100644
          {
            requestedShouldReuseExisting,
            existingExecutionWorkspaceId:
-@@ -22647,7 +22697,7 @@ export function heartbeatService(
+@@ -22647,7 +22701,7 @@ export function heartbeatService(
        }
        await bindIssueToPersistedExecutionWorkspace(persistedExecutionWorkspace);
        const projectRepositoryPaths: string[] = [];
@@ -1534,7 +1743,7 @@ index 9e8617e2f..d91ead06e 100644
          const repositoryRows = await db.select().from(projectWorkspaces).where(and(
            eq(projectWorkspaces.companyId, agent.companyId),
            eq(projectWorkspaces.projectId, executionWorkspace.projectId),
-@@ -22970,7 +23020,7 @@ export function heartbeatService(
+@@ -22970,7 +23024,7 @@ export function heartbeatService(
        } else {
          delete context.paperclipScratch;
        }
@@ -1543,7 +1752,7 @@ index 9e8617e2f..d91ead06e 100644
          target: executionTarget,
          cwd: executionWorkspace.cwd,
          env: Object.fromEntries(
-@@ -22988,7 +23038,7 @@ export function heartbeatService(
+@@ -22988,7 +23042,7 @@ export function heartbeatService(
        runtimeConfig = { ...runtimeConfig, env: gitExecutionEnv };
        for (const key of MANAGED_GITHUB_TOKEN_KEYS) secretKeys.add(key);
        context.githubAuthenticationMode = useHostGitHub ? "host" : "managed";
@@ -1552,7 +1761,7 @@ index 9e8617e2f..d91ead06e 100644
          const githubLaunchers = await prepareHeartbeatGitHubLaunchers({
            native: agent.adapterType === "paperclip_runner",
            githubConfigured: githubSelection.configured,
-@@ -23653,7 +23703,7 @@ export function heartbeatService(
+@@ -23653,7 +23707,7 @@ export function heartbeatService(
          const hasInstructionFilesystem = nativeRuntimeResolution.kind !== "native"
            ? adapter.supportsInstructionsBundle === true
            : !["claude_managed_agents_api", "aws_agentcore_harness_api"].includes(nativeRuntimeResolution.profile.backend);
@@ -1561,7 +1770,36 @@ index 9e8617e2f..d91ead06e 100644
            try {
              // Missing contract fields on a restored session mean the deployed
              // legacy format. New sessions opt into whole-directory persistence.
-@@ -26091,6 +26141,10 @@ export function heartbeatService(
+@@ -25465,9 +25519,18 @@ export function heartbeatService(
+           failedProcessRunCancellations.get(run.id);
+         await processCancellation?.settled;
+         let outcome: RunSessionOutcome;
+-        const latestRun = await getRun(run.id);
++        let latestRun = await getRun(run.id);
+         if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
+           outcome = latestRun.status;
++        } else if (parseObject(latestRun?.resultJson?.executionCancellation).proof === "machine_pending") {
++          const receipt = await pluginRunCancellation({ db, workerManager: pluginCancellationWorkerManager,
++            companyId: run.companyId, runId: run.id, queryOnly: true });
++          if (!receipt || receipt.state !== "confirmed") return;
++          outcome = pluginRunOutcomeStatus(receipt.outcome);
++          latestRun = { ...latestRun!, resultJson: { ...parseObject(latestRun?.resultJson), executionCancellation: {
++            ...parseObject(latestRun?.resultJson?.executionCancellation), state: "acknowledged",
++            acknowledgedAt: new Date().toISOString(), proof: "machine_termination", outcome: receipt.outcome,
++          } } };
+         } else if (executionControl.controller.signal.aborted) {
+           outcome = "cancelled";
+         } else if (adapterResult.nativeFinalization) {
+@@ -25634,7 +25697,7 @@ export function heartbeatService(
+           mergeRunStopMetadataForAgent(agent, outcome, {
+             resultJson: mergeAdapterRecoveryMetadata({
+               resultJson: {
+-                ...(adapterResult.nativeFinalization || outcome === "cancelled"
++                ...(adapterResult.nativeFinalization || outcome === "cancelled" || parseObject(latestRun?.resultJson?.executionCancellation).proof === "machine_termination"
+                   ? parseObject(latestRun?.resultJson)
+                   : {}),
+                 ...parseObject(adapterResult.resultJson),
+@@ -26091,6 +26154,10 @@ export function heartbeatService(
            wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
          });
        } catch (err) {
@@ -1572,7 +1810,20 @@ index 9e8617e2f..d91ead06e 100644
          if (err instanceof NativeControllerDetachedForRestartError) {
            nativeSessionResumeScheduled = true;
            return;
-@@ -26250,6 +26304,8 @@ export function heartbeatService(
+@@ -26212,6 +26279,12 @@ export function heartbeatService(
+         // A process adapter may throw while its owned Stop is joining the
+         // child. Let the cancellation write settle before attempting failure.
+         await processRunCancellationSettlements.get(run.id)?.settled;
++        const cancellationSnapshot = await getRun(run.id);
++        if (parseObject(cancellationSnapshot?.resultJson?.executionCancellation).proof === "machine_pending") {
++          // Reconciliation owns this original attempt after its RPC has gone.
++          // Neither a timeout nor a local exception proves remote termination.
++          return;
++        }
+         const message = redactCurrentUserText(
+           err instanceof Error ? err.message : "Unknown adapter failure",
+           await getCurrentUserRedactionOptions(),
+@@ -26250,6 +26323,8 @@ export function heartbeatService(
            })
            .catch(() => null);
          const failureErrorCode =
@@ -1581,7 +1832,7 @@ index 9e8617e2f..d91ead06e 100644
            workspaceValidationFailure?.code ??
            configurationIncompleteFailure?.code ??
            nonRetryablePreflightFailureCode(err) ??
-@@ -26377,7 +26433,7 @@ export function heartbeatService(
+@@ -26377,7 +26452,7 @@ export function heartbeatService(
              // exhaustion. Once its durable coordinator has classified a
              // terminal failure, generic issue recovery must not create a
              // replacement retryOfRunId chain for the same provider work.
@@ -1590,7 +1841,7 @@ index 9e8617e2f..d91ead06e 100644
            });
            await handleIssueReviewPathDisposition(livenessRun);
  
-@@ -26453,6 +26509,8 @@ export function heartbeatService(
+@@ -26453,6 +26528,8 @@ export function heartbeatService(
            eventMessage: "stale execution continuation cancelled before dispatch",
            suppressImmediateRecovery: true,
          });
@@ -1599,7 +1850,7 @@ index 9e8617e2f..d91ead06e 100644
        } else if (isWorkspaceBusyDeferral(outerErr)) {
          // Expected contention on a shared project workspace, not a
          // failure: park the run as a bounded scheduled retry and leave the
-@@ -26505,6 +26563,8 @@ export function heartbeatService(
+@@ -26505,6 +26582,8 @@ export function heartbeatService(
            nonRetryablePreflightFailureCode(outerErr);
          const workspaceGitScanFailure = isWorkspaceGitScanError(outerErr) ? outerErr : null;
          const setupFailureErrorCode =
@@ -1608,7 +1859,7 @@ index 9e8617e2f..d91ead06e 100644
            workspaceGitScanFailure?.code ??
            workspaceValidationSetupFailure?.code ??
            configurationIncompleteSetupFailure?.code ??
-@@ -26648,6 +26708,7 @@ export function heartbeatService(
+@@ -26648,6 +26727,7 @@ export function heartbeatService(
            }
            await releaseIssueExecutionAndPromote(livenessRun, {
              suppressImmediateRecovery:
@@ -1616,6 +1867,89 @@ index 9e8617e2f..d91ead06e 100644
                readNonEmptyString(
                  parseObject(livenessRun.contextSnapshot).goalControlRequestId,
                ) !== null ||
+@@ -26687,6 +26767,7 @@ export function heartbeatService(
+       await nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
+       if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
+       let latestRun = await getRun(run.id).catch(() => null);
++      const cancellationPending = latestRun?.status === "running" && parseObject(latestRun.resultJson?.executionCancellation).proof === "machine_pending";
+       try {
+         if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
+           await db
+@@ -26726,7 +26807,7 @@ export function heartbeatService(
+           latestRun &&
+           !nativeSessionResumeScheduled &&
+           !nativeWorkspaceFinalizeScheduled &&
+-          !nativeOwnershipHeld
++          !nativeOwnershipHeld && !cancellationPending
+         ) {
+           latestRun = await terminalizeRunOnLeaseRelease(latestRun).catch(
+             (terminalizeErr) => {
+@@ -26752,7 +26833,7 @@ export function heartbeatService(
+         if (
+           !nativeSessionResumeScheduled &&
+           !nativeWorkspaceFinalizeScheduled &&
+-          !nativeOwnershipHeld
++          !nativeOwnershipHeld && !cancellationPending
+         ) {
+           // Keep launchers during same-run recovery. At a terminal boundary all
+           // operations have settled; clean before the remote lease can be stopped.
+@@ -29627,6 +29708,20 @@ export function heartbeatService(
+     const errorCode = options.errorCode ?? "cancelled";
+     const cancellation = requestedRunCancellation(options.resultJson ?? {}, reason);
+ 
++    if (run.status === "running") {
++      const supported = await pluginRunCancellation({ db, workerManager: pluginCancellationWorkerManager,
++        companyId: run.companyId, runId: run.id, queryOnly: true });
++      if (supported) {
++        await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ||
++          ${JSON.stringify({ cancellation, executionCancellation: {
++            state: "requested", requestedAt: new Date().toISOString(), proof: "machine_pending",
++          } })}::jsonb`, updatedAt: new Date() }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")));
++        await pluginRunCancellation({ db, workerManager: pluginCancellationWorkerManager,
++          companyId: run.companyId, runId: run.id, queryOnly: false });
++        return getRun(run.id);
++      }
++    }
++
+     const pendingProcessCancellation = processRunCancellationSettlements.get(
+       run.id,
+     );
+@@ -30439,6 +30534,35 @@ export function heartbeatService(
+     buildRunOutputSilence,
+ 
+     tickTimers: async (now = new Date()) => {
++      const cancellations = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.status, "running"),
++        sql`${heartbeatRuns.resultJson}->'executionCancellation'->>'proof' = 'machine_pending'`));
++      for (const run of cancellations) {
++        if (activeRunExecutions.has(run.id)) continue;
++        try {
++          const receipt = await pluginRunCancellation({ db, workerManager: pluginCancellationWorkerManager,
++            companyId: run.companyId, runId: run.id, queryOnly: false });
++          if (!receipt || receipt.state !== "confirmed") continue;
++          const evidence = receipt.outcome;
++          const status = pluginRunOutcomeStatus(evidence);
++          const finishedAt = new Date();
++          const settled = await setRunStatusIfRunning(run.id, status, { finishedAt, exitCode: evidence.exitCode,
++            signal: evidence.signal, error: evidence.error ?? null, errorCode: evidence.cancelled ? "cancelled" : null,
++            resultJson: { ...parseObject(run.resultJson), executionCancellation: {
++              ...parseObject(run.resultJson?.executionCancellation), state: "acknowledged",
++              acknowledgedAt: finishedAt.toISOString(), proof: "machine_termination", outcome: evidence,
++            } },
++          });
++          if (settled.updated && settled.run) {
++            await setWakeupStatus(run.wakeupRequestId, status, { finishedAt });
++            await appendRunEvent(settled.run, { eventType: "lifecycle", stream: "system", level: "info",
++              message: "machine termination reconciled after cancellation", payload: { outcome: evidence } });
++            await releaseIssueExecutionAndPromote(settled.run, { suppressImmediateRecovery: true });
++            await finalizeAgentStatus(run.agentId, status);
++            await releaseEnvironmentLeasesForRun({ runId: run.id, companyId: run.companyId, agentId: run.agentId, status });
++            await startNextQueuedRunForAgent(run.agentId);
++          }
++        } catch (err) { logger.warn({ err, runId: run.id }, "run cancellation remains unconfirmed"); }
++      }
+       if ((await getSchedulingSuppression()).suppressed) {
+         return {
+           checked: 0,
 diff --git a/server/src/services/legacy-execution-recovery.ts b/server/src/services/legacy-execution-recovery.ts
 index 64c4c7f2d..d6ad3db51 100644
 --- a/server/src/services/legacy-execution-recovery.ts
@@ -1629,6 +1963,67 @@ index 64c4c7f2d..d6ad3db51 100644
    // Setup owns the bounded retry budget for temporary workspace scans. Its
    // exhaustion needs workspace repair, not reconciliation of provider actions
    // that the bootstrap evidence proves never started. Keep unknown outcomes held.
+diff --git a/server/src/services/plugin-run-cancellation.ts b/server/src/services/plugin-run-cancellation.ts
+new file mode 100644
+index 000000000..ad3c7a5ca
+--- /dev/null
++++ b/server/src/services/plugin-run-cancellation.ts
+@@ -0,0 +1,55 @@
++import type { Db } from "@paperclipai/db";
++import { environmentLeases, environments } from "@paperclipai/db";
++import { and, desc, eq } from "drizzle-orm";
++import type { PluginEnvironmentCancelRunResult } from "@paperclipai/plugin-sdk";
++import type { PluginWorkerManager } from "./plugin-worker-manager.js";
++import { parseEnvironmentDriverConfig } from "./environment-config.js";
++
++/** Use the original company's lease and provider snapshot, never an agent's
++ * current target. A missing worker or receipt cannot establish termination. */
++export async function pluginRunCancellation(input: {
++  db: Db; workerManager?: PluginWorkerManager;
++  companyId: string; runId: string; queryOnly: boolean;
++}): Promise<PluginEnvironmentCancelRunResult | null> {
++  const manager = input.workerManager;
++  const [row] = await input.db.select({ lease: environmentLeases, environment: environments })
++    .from(environmentLeases).innerJoin(environments, eq(environments.id, environmentLeases.environmentId))
++    .where(and(eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.heartbeatRunId, input.runId)))
++    .orderBy(desc(environmentLeases.createdAt)).limit(1);
++  if (!row || !["plugin", "sandbox"].includes(row.environment.driver)) return null;
++  const metadata = row.lease.metadata ?? {};
++  const pluginId = typeof metadata.pluginId === "string" ? metadata.pluginId : null;
++  const provider = metadata.providerMetadata as Record<string, unknown> | undefined;
++  const snapshot = metadata.cancellationConfig ?? provider?.cancellationConfig;
++  if (!pluginId || !manager?.isRunning(pluginId) || !manager.getWorker(pluginId)?.supportedMethods.includes("environmentCancelRun")) {
++    if (!snapshot) return null;
++    if (input.queryOnly) return { state: "requested" };
++    throw new Error("Cancellation worker is unavailable; termination remains unconfirmed");
++  }
++  const parsed = row.environment.driver === "plugin"
++    ? parseEnvironmentDriverConfig({ driver: "plugin", config: row.environment.config }) : null;
++  const config = snapshot
++    ?? (parsed?.driver === "plugin" ? parsed.config.driverConfig : null);
++  if (!config || typeof config !== "object") throw new Error("Original cancellation config is unavailable");
++  return manager!.call(pluginId, "environmentCancelRun", {
++    driverKey: typeof metadata.provider === "string" ? metadata.provider
++      : typeof metadata.driverKey === "string" ? metadata.driverKey : "",
++    companyId: input.companyId, environmentId: row.environment.id,
++    config: config as Record<string, unknown>,
++    runId: input.runId, queryOnly: input.queryOnly,
++  }).catch(error => {
++    // An original provider snapshot identifies cancellation support even if
++    // the worker disappears during this read. Persist operator intent first.
++    if (input.queryOnly && snapshot) return { state: "requested" as const };
++    throw error;
++  });
++}
++
++/** Natural signal termination is failure even when it has no numeric exit code. */
++export function pluginRunOutcomeStatus(outcome: Extract<PluginEnvironmentCancelRunResult, { state: "confirmed" }>["outcome"]):
++  "cancelled" | "timed_out" | "failed" | "succeeded" {
++  if (outcome.cancelled) return "cancelled";
++  if (outcome.timedOut) return "timed_out";
++  if (outcome.interrupted || outcome.error || outcome.signal || (outcome.exitCode ?? 0) !== 0) return "failed";
++  return "succeeded";
++}
 diff --git a/server/src/services/plugin-worker-manager.ts b/server/src/services/plugin-worker-manager.ts
 index af6721f3d..4a0bb8d14 100644
 --- a/server/src/services/plugin-worker-manager.ts
@@ -1820,86 +2215,3 @@ index 2cb7ac951..ffc21ff97 100644
    "native_provider_model_rejected",
    "provider_tool_definition_invalid",
    "adapter_engine_unavailable",
-diff --git a/server/src/__tests__/plugin-worker-manager.test.ts b/server/src/__tests__/plugin-worker-manager.test.ts
-index 2940b0c56..4146ffc0e 100644
---- a/server/src/__tests__/plugin-worker-manager.test.ts
-+++ b/server/src/__tests__/plugin-worker-manager.test.ts
-@@ -56,6 +56,61 @@ const TEST_MANIFEST: PaperclipPluginManifestV1 = {
-   entrypoints: { worker: "dist/worker.js" },
- };
- 
-+describe("Outpost execution response loss", () => {
-+  it.each([
-+    ["yelqo.outpost", "exit", PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTCOME_UNCERTAIN],
-+    ["yelqo.outpost", "timeout", PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTCOME_UNCERTAIN],
-+    ["test.plugin", "exit", PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE],
-+    ["test.plugin", "timeout", PLUGIN_RPC_ERROR_CODES.TIMEOUT],
-+  ] as const)("classifies %s execution after worker %s", async (pluginKey, failure, code) => {
-+    const handle = createPluginWorkerHandle("plugin-1", {
-+      entrypointPath: DELAYED_WORKER_ENTRYPOINT,
-+      manifest: { ...TEST_MANIFEST, id: pluginKey },
-+      config: {},
-+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
-+      apiVersion: 1,
-+      hostHandlers: {},
-+    });
-+    try {
-+      await handle.start();
-+      const pending = handle.call("environmentExecute", {
-+        driverKey: "outpost", companyId: "company-1", environmentId: "environment-1",
-+        config: {}, lease: { providerLeaseId: "lease-1" }, command: "echo", delayMs: 1000,
-+      } as HostToWorkerMethods["environmentExecute"][0], failure === "timeout" ? 10 : 5000);
-+      const rejected = expect(pending).rejects.toMatchObject({ code });
-+      if (failure === "exit") await handle.stop();
-+      await rejected;
-+    } finally {
-+      await handle.stop().catch(() => undefined);
-+    }
-+  });
-+
-+  it("preserves an explicit Outpost refusal before launch", async () => {
-+    const handle = createPluginWorkerHandle("plugin-1", {
-+      entrypointPath: DELAYED_WORKER_ENTRYPOINT,
-+      manifest: { ...TEST_MANIFEST, id: "yelqo.outpost" },
-+      config: {},
-+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
-+      apiVersion: 1,
-+      hostHandlers: {},
-+    });
-+    try {
-+      await handle.start();
-+      await expect(handle.call("environmentExecute", {
-+        driverKey: "outpost", companyId: "company-1", environmentId: "environment-1",
-+        config: {}, lease: { providerLeaseId: "lease-1" }, command: "echo",
-+        errorCode: PLUGIN_RPC_ERROR_CODES.EXECUTION_UNAVAILABLE,
-+      } as HostToWorkerMethods["environmentExecute"][0])).rejects.toMatchObject({
-+        code: PLUGIN_RPC_ERROR_CODES.EXECUTION_UNAVAILABLE,
-+      });
-+    } finally {
-+      await handle.stop().catch(() => undefined);
-+    }
-+    await expect(handle.call("environmentExecute", {} as HostToWorkerMethods["environmentExecute"][0]))
-+      .rejects.toThrow('Cannot call "environmentExecute"');
-+  });
-+});
-+
- describe("resolveRpcCallTimeoutMs", () => {
-   const MAX_RPC_TIMEOUT_MS = 15 * 60 * 1_000;
-   const MAX_NODE_TIMER_TIMEOUT_MS = 2_147_483_647;
-diff --git a/server/src/__tests__/fixtures/plugin-worker-delayed.cjs b/server/src/__tests__/fixtures/plugin-worker-delayed.cjs
-index 8aa7e4efa..9f8354361 100644
---- a/server/src/__tests__/fixtures/plugin-worker-delayed.cjs
-+++ b/server/src/__tests__/fixtures/plugin-worker-delayed.cjs
-@@ -27,6 +27,12 @@ rl.on("line", (line) => {
-   }
- 
-   if (method === "environmentExecute") {
-+    if (message.params?.errorCode) {
-+      send({ jsonrpc: "2.0", id: message.id, error: {
-+        code: message.params.errorCode, message: "Execution refused before launch",
-+      } });
-+      return;
-+    }
-     const delayMs = Number(message.params?.delayMs ?? 0);
-     setTimeout(() => {
-       send({

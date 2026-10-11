@@ -25,6 +25,7 @@ export default definePlugin({
   onEnvironmentAcquireLease(input) { return workflows.execution.acquire(input); },
   onEnvironmentRealizeWorkspace(input) { return workflows.execution.realize(input); },
   onEnvironmentExecute(input) { return workflows.execution.execute(input); },
+  onEnvironmentCancelRun(input) { return workflows.execution.cancelRun(input); },
   onEnvironmentReleaseLease(input) { return workflows.execution.release(input); },
   onWebSocketOpen(input) {
     return Effect.runPromise(workflows.open(input).pipe(Effect.catchAll(error => {
