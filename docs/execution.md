@@ -262,7 +262,10 @@ host restarts, or that grace expires, the heartbeat attempt can fail; recovered
 output and terminal receipts remain inspectable and never rewrite a completed
 attempt. Grace expiry after dispatch reports `EXECUTION_OUTCOME_UNCERTAIN`;
 Paperclip records `execution_outcome_uncertain` and blocks automatic recovery,
-including Pi conversation continuation. A late output-limit receipt remains
+including Pi conversation continuation. Losing an already sent Outpost execution
+RPC to plugin worker exit or host RPC timeout reports the same nonretryable
+uncertainty; an explicit refusal before launch retains its deferral behavior.
+A late output-limit receipt remains
 visible in execution history while the completed heartbeat keeps its uncertainty
 classification. Continuing requires a separate operator-authorized attempt
 after the previous operation's ownership is resolved. Daemon interruption

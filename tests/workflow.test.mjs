@@ -960,6 +960,54 @@ test('late recovered exhaustion cannot automatically continue a Pi task after gr
   } finally { transport.reconnect(); await removeExecutionAdapter('pi_local'); }
 });
 
+test('worker restart cannot automatically continue a Pi task after recovered exhaustion', {timeout:90000}, async t => {
+  await installExecutionAdapter('pi_local');
+  const transport=await bufferedOutpost(t,'worker-exhaustion',['--output-buffer-bytes','4096','--output-total-bytes','8192']);
+  const {outpost,statusPath}=transport;
+  const workspace=join(home,'workspaces','worker-exhaustion'); mkdirSync(workspace);
+  let disabled=false;
+  try {
+    const agent=await commandAgent(workspace,'echo launch >> launches; printf started; while ! test -e exhaust; do sleep .1; done; (sleep 2; echo escaped > escaped) & yes output',
+      {adapterType:'pi_local',defaultEnvironmentId:outpost.environmentId});
+    const task=await json(`/api/companies/${company.id}/issues`,{title:'Worker loss requires operator continuation',status:'in_progress',assigneeAgentId:agent.id});
+    await eventually(()=>existsSync(join(workspace,'launches')));
+    const [run]=await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`);
+    // Withhold the terminal receipt until the host has observed worker loss.
+    transport.disconnect();
+    await json('/api/plugins/yelqo.outpost/disable',{}); disabled=true;
+    writeFileSync(join(workspace,'exhaust'),'');
+    await json('/api/plugins/yelqo.outpost/enable',{}); disabled=false;
+    const outcome=await terminalRun(run);
+    assert.equal(outcome.status,'failed');
+    assert.equal(outcome.errorCode,'execution_outcome_uncertain',JSON.stringify(outcome));
+    assert.equal(outcome.resultJson.conversationContinuation,'continue_conversation_v1');
+    transport.reconnect();
+    let receipt;
+    await eventually(async ()=>{
+      const status=await json(statusPath);
+      receipt=status.executionHistory.find(record=>record.runId===run.id);
+      return status.executionReady && receipt?.status==='terminal' && status.outputRetention?.operations===0;
+    });
+    assert.equal(receipt.outcome.error,'output limit exceeded');
+    const recovered=await json(`${statusPath.replace('?','/output?')}&operationId=${encodeURIComponent(receipt.operationId)}`);
+    assert.ok(recovered.receipt.bytes>0 && recovered.receipt.bytes<4096);
+    assert.equal((await json(`/api/heartbeat-runs/${run.id}`)).errorCode,'execution_outcome_uncertain');
+    // Observe two real scheduler sweeps after terminal recovery clears ownership.
+    await delay(21000);
+    const runs=await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`);
+    assert.equal(runs.length,1,'worker loss and late exhaustion must not create automatic replacement attempts');
+    const observed=await json(`/api/issues/${task.id}`);
+    assert.equal(observed.status,'blocked');
+    assert.equal(observed.scheduledRetry,null);
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'launch\n');
+    assert.equal(existsSync(join(workspace,'escaped')),false);
+  } finally {
+    transport.reconnect();
+    if(disabled) await json('/api/plugins/yelqo.outpost/enable',{});
+    await removeExecutionAdapter('pi_local');
+  }
+});
+
 test('execution refuses to launch when durable intent cannot be written',async () => {
   const daemon=await startExecutionDaemon();
   const workspace=join(home,'workspaces','intent-failure');

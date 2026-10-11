@@ -49,7 +49,9 @@ func TestOutputSurvivesUnavailableDelivery(t *testing.T) {
 func TestOutputLimitWithWithheldAcknowledgements(t *testing.T) {
 	f := newExecutionFixture(t, 4096, 8192)
 	op := f.operation("limited-run", "limited-operation", "agent_execution")
-	op.Args = []string{"-c", "cd \"$1\"; echo launch >> launches; head -c 65536 /dev/zero; echo forbidden > forbidden", "output", f.workspace}
+	// An immediate shell builtin can race the asynchronous namespace kill after
+	// the output pipe closes. A delayed effect proves that execution is stopped.
+	op.Args = []string{"-c", "cd \"$1\"; echo launch >> launches; head -c 65536 /dev/zero; sleep 1; echo forbidden > forbidden", "output", f.workspace}
 	f.supervisor.handle(context.Background(), op, func(any) error { return errors.New("acknowledgement withheld") })
 	if _, err := os.Stat(filepath.Join(f.workspace, "forbidden")); !os.IsNotExist(err) {
 		t.Fatalf("exhausted process continued: %v", err)
