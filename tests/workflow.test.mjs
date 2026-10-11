@@ -126,7 +126,14 @@ test('the Go daemon connects outbound and the operator observes its authenticate
     return status.connected === true && output.includes('connected');
   });
   assert.ok(output.includes('connected'));
-  daemon.kill('SIGTERM');
+  try {
+    assert.throws(() => cli(['check','--private-dir',privateDir]),error => {
+      assert.match(error.stderr.toString(),/already connected.*HTTP 409.*stop.*daemon.*check/);
+      assert.doesNotMatch(error.stderr.toString(),/access credentials|registration|revocation|configure/);
+      return true;
+    });
+    assert.equal((await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).connected,true);
+  } finally { daemon.kill('SIGTERM'); }
   await eventually(async () => !(await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).connected);
 });
 
@@ -193,6 +200,7 @@ test('actual Pi reads its assigned task through the callback bridge and retains 
     let input=''; for await(const chunk of req) input+=chunk;
     const body=JSON.parse(input);
     assert.equal(req.headers.authorization,'Bearer machine-provider-key');
+    for (const secret of Object.values(proxySecrets)) assert.ok(!JSON.stringify(body).includes(secret),'Access credential reached Pi through runtime or callback input');
     const steps=[
       ['paperclip_coordination',{operation:'task'}],
       ['paperclip_coordination',{operation:'progress',comment:'Pi completed the local fixture check.'}],
@@ -232,11 +240,13 @@ test('actual Pi reads its assigned task through the callback bridge and retains 
   const history=execFileSync('git',['-C',workspace,'rev-parse','HEAD'],{encoding:'utf8'});
   // Configure writable runtime state locally through the registration CLI.
   const piPrivate=join(home,'pi-private');
-  const piRegistration=JSON.parse(cli(['register','--instance',origin,'--company',company.id,'--name','Pi worker',
-    '--private-dir',piPrivate,'--workspace-root',join(home,'workspaces'),'--scratch-root',join(home,'scratch')],
+  cli(['configure','--instance',origin,'--private-dir',piPrivate,
+    '--workspace-root',join(home,'workspaces'),'--scratch-root',join(home,'scratch')],{headers:proxySecrets});
+  const piRegistration=JSON.parse(cli(['register','--company',company.id,'--name','Pi worker','--private-dir',piPrivate],
     {operatorAuthorization:`Bearer ${boardToken}`,runtimeRoots:[state,sessions,agentDir],runtimeEnv:['OPENAI_API_KEY']}));
   await json(`/api/agents/${agent.id}`,{defaultEnvironmentId:piRegistration.environmentId},undefined,'PATCH');
   const daemon=spawn(join(root,'bin/outpost'),['daemon','--private-dir',piPrivate],{env:{...process.env,PATH:node22.slice(0,-5)+':/usr/bin:/bin',
+    CF_ACCESS_CLIENT_ID:proxySecrets['CF-Access-Client-Id'],CF_ACCESS_CLIENT_SECRET:proxySecrets['CF-Access-Client-Secret'],
     OPENAI_API_KEY:'machine-provider-key',PI_CODING_AGENT_DIR:agentDir,PI_APPROVAL_POLICY:policyPath,PI_APPROVAL_STATE:state,PI_APPROVAL_PAPERCLIP:workerPath},stdio:['ignore','pipe','pipe']});
   processes.push(daemon);
   await eventually(async()=>(await json(`/api/plugins/yelqo.outpost/api/outposts/${piRegistration.outpostId}?companyId=${company.id}`)).connected);
@@ -252,6 +262,10 @@ test('actual Pi reads its assigned task through the callback bridge and retains 
       assert.match(log.content,/\/tmp\/pi-home/);
       assert.ok(!log.content.includes('server-key-must-not-replace-machine-auth'));
       assert.ok(!log.content.includes('machine-provider-key'));
+      for (const secret of Object.values(proxySecrets)) {
+        assert.ok(!log.content.includes(secret),'Access credential present in agent run log');
+        assert.ok(!logs.includes(secret),'Access credential present in host log');
+      }
       const comments=await json(`/api/issues/${task.id}/comments`);
       assert.equal(comments.length,attempt+1);
       assert.equal(readFileSync(join(workspace,'pi-effect.txt'),'utf8'),'machine-owned Pi effect\n');
