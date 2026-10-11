@@ -218,6 +218,19 @@ func session(ctx context.Context, c Connection, output io.Writer, daemon bool, s
 			return errDisconnected
 		}
 	}
+	go func() {
+		for {
+			if err := s.deliverOutputs(send); err != nil {
+				endSession()
+				return
+			}
+			select {
+			case <-sessionCtx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	}()
 	for {
 		reports, reportErr := s.recoveryReports(false)
 		if reportErr != nil {
@@ -228,7 +241,7 @@ func session(ctx context.Context, c Connection, output io.Writer, daemon bool, s
 				return errDisconnected
 			}
 		}
-		if err = write(map[string]string{"type": "heartbeat"}); err != nil {
+		if err = write(map[string]any{"type": "heartbeat", "outputRetention": s.outputs.retention()}); err != nil {
 			return errDisconnected
 		}
 		var reply incoming
@@ -241,6 +254,8 @@ func session(ctx context.Context, c Connection, output io.Writer, daemon bool, s
 			return errDisconnected
 		case <-ctx.Done():
 			return nil
+		case <-sessionCtx.Done():
+			return errDisconnected
 		case <-time.After(10 * time.Second):
 			return errDisconnected
 		}

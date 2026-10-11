@@ -17,6 +17,7 @@ export type OutpostError = InvalidCredentials | RevokedOutpost | IncompatibleVer
 
 type Outpost = { id:string; companyId:string; name:string; credentialHash:string; revoked:boolean };
 type Session = { outpostId:string; companyId:string; scope:Scope.CloseableScope; authenticated?:boolean; reconciled?:boolean;
+  outputRetention?:unknown;
   expected?:ExecutionRecord[]; inventory?:Map<string,string>; recovery?:Array<{operationId:string;record?:ExecutionRecord}>; recoveryIndex?:number };
 const uuid = (value:unknown):value is string => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 const digest = (value:string) => createHash("sha256").update(value).digest();
@@ -56,10 +57,18 @@ export function createOutpostWorkflows(ctx:PluginContext) {
     const record = yield* read(input.companyId,input.params.outpostId ?? "");
     if (!record) return yield* Effect.fail(new OutpostNotFound());
     if (input.routeKey === "revoke") return yield* revoke(record);
+    if(input.routeKey === "output") {
+      const operationId=input.query.operationId;
+      const afterSequence=Number(input.query.afterSequence ?? 0);
+      if(typeof operationId!=="string" || !operationId || !Number.isSafeInteger(afterSequence) || afterSequence<0) return {status:400,body:{error:"operationId and a nonnegative afterSequence are required"}};
+      const output=yield* persistence(()=>execution.output.read(record.companyId,record.id,operationId,afterSequence));
+      return {headers:{"Cache-Control":"no-store"},body:output};
+    }
     const connected = [...sessions.values()].some(session => session.authenticated && session.companyId === record.companyId && session.outpostId === record.id);
     const executionReady = [...sessions.values()].some(session => session.authenticated && session.reconciled && session.companyId === record.companyId && session.outpostId === record.id);
     const executionHistory=yield* persistence(()=>execution.history.all(record.companyId,record.id));
-    return {headers:{"Cache-Control":"no-store"},body:{outpostId:record.id,name:record.name,companyId:record.companyId,revoked:record.revoked,connected,executionReady,executionHistory}};
+    const outputRetention=[...sessions.values()].find(session=>session.companyId===record.companyId && session.outpostId===record.id)?.outputRetention;
+    return {headers:{"Cache-Control":"no-store"},body:{outpostId:record.id,name:record.name,companyId:record.companyId,revoked:record.revoked,connected,executionReady,executionHistory,outputRetention}};
   });
   const authenticate = (input:PluginWebSocketOpen) => Effect.gen(function* () {
     const id = input.query.outpostId;
@@ -145,7 +154,12 @@ export function createOutpostWorkflows(ctx:PluginContext) {
       session.reconciled=true;
       return {messages:[JSON.stringify({type:"recovery_ready"})]};
     }
-    if (data?.type === "heartbeat" && Object.keys(data).length === 1) {
+    if (data?.type === "heartbeat" && Object.keys(data).every(key=>key==="type" || key==="outputRetention")) {
+      const retention=data.outputRetention;
+      if(retention!==undefined) {
+        if(!retention || typeof retention!=="object" || !["bytes","operations","perOperationBytes","totalBytes","maxOperations"].every(key=>Number.isSafeInteger(retention[key]) && retention[key]>=0)) return yield* Effect.fail(new InvalidCredentials());
+        session.outputRetention=retention;
+      }
       const operations=session.reconciled ? yield* persistence(()=>execution.drain(session.companyId,session.outpostId)) : [];
       return {messages:[JSON.stringify({type:"pong",operations})]};
     }
@@ -159,7 +173,7 @@ export function createOutpostWorkflows(ctx:PluginContext) {
       } else if(data.type==="result" && data.error && data.beforeLaunch===true && data.operationId) {
         yield* persistence(()=>execution.history.refuse(session.companyId,session.outpostId,data.operationId,data.runId));
       }
-      yield* Effect.try({try:() => execution.message(session.companyId,session.outpostId,data),catch:() => new InvalidCredentials()});
+      yield* persistence(()=>execution.message(session.companyId,session.outpostId,data));
       return {messages:[JSON.stringify({type:"ack",deliveryId:data.deliveryId})]};
     }
     return yield* Effect.fail(new InvalidCredentials());

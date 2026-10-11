@@ -7,7 +7,8 @@ function fixture() {
   const scope={companyId:'company',config:{companyId:'company',outpostId:'outpost'},adapterType:'pi_local'};
   let online=true;
   const states=new Map();
-  const execution=createExecutionWorkflows({execution:{log(){}},state:{
+  const logs=[];
+  const execution=createExecutionWorkflows({execution:{log(stream,chunk){logs.push([stream,chunk]);}},state:{
     async get(input){return structuredClone(states.get(input.stateKey) ?? null);},
     async set(input,value){states.set(input.stateKey,structuredClone(value));},
   }},()=>online);
@@ -26,7 +27,7 @@ function fixture() {
     ...scope,lease,runId,operationId,purpose,cwd:'/workspace',command:'/bin/sh',timeoutMs:5000,
   });
   const release=lease => execution.release({...scope,providerLeaseId:lease.providerLeaseId});
-  return {execution,admit,execute,release,drain,reply,offline:()=>{online=false;}};
+  return {execution,logs,admit,execute,release,drain,reply,offline:()=>{online=false;},reconnect:()=>{online=true;}};
 }
 
 test('the first control stays retryable when the outpost goes offline after admission',async () => {
@@ -76,7 +77,7 @@ test('a refused control cannot schedule a replacement while a prior control is u
   const f=fixture();
   const lease=await f.admit('A');
   const control=f.execute(lease,'A','control');
-  const rejected=assert.rejects(control,/durable outcome is uncertain/);
+  const rejected=assert.rejects(control,{code:PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTCOME_UNCERTAIN,message:'durable outcome is uncertain'});
   f.reply(await f.drain(),{exitCode:0,timedOut:false,ownershipUncertain:true,error:'durable outcome is uncertain'});
   await rejected;
   f.offline();
@@ -84,19 +85,22 @@ test('a refused control cannot schedule a replacement while a prior control is u
   await f.release(lease);
 });
 
-test('a lost control reply preserves ownership after lease release',async () => {
+test('a lost control reply preserves ownership after lease release',async t => {
+  t.mock.timers.enable({apis:['setTimeout']});
   const f=fixture();
   const lease=await f.admit('A');
   const control=f.execute(lease,'A','control');
-  const rejected=assert.rejects(control,/outcome is uncertain/);
+  const rejected=assert.rejects(control,{code:PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTCOME_UNCERTAIN,message:'Outpost operation outcome is uncertain'});
   await f.drain();
   f.execution.close('company','outpost');
+  t.mock.timers.tick(15001);
   await rejected;
   await f.release(lease);
   await assert.rejects(f.admit('B'),/busy|uncertain/);
 });
 
-test('agent completion cannot release an outstanding control',async () => {
+test('agent completion cannot release an outstanding control',async t => {
+  t.mock.timers.enable({apis:['setTimeout']});
   const f=fixture();
   const lease=await f.admit('A');
   const agent=f.execute(lease,'A','agent','agent_execution');
@@ -107,6 +111,7 @@ test('agent completion cannot release an outstanding control',async () => {
   f.reply(agentRequest,{exitCode:0,timedOut:false});
   await agent;
   f.execution.close('company','outpost');
+  t.mock.timers.tick(15001);
   await rejected;
   await f.release(lease);
   await assert.rejects(f.admit('B'),/busy|uncertain/);
@@ -166,4 +171,63 @@ test('lease release waits for every control to settle and then frees the workspa
   f.reply(secondRequest,{exitCode:0,timedOut:false});
   await second;
   await f.admit('C');
+});
+
+test('a dispatched operation survives reconnection and a lost output acknowledgement',async () => {
+  const f=fixture();
+  const lease=await f.admit('A');
+  const running=f.execute(lease,'A','agent','agent_execution');
+  const request=await f.drain();
+  const output={type:'output',requestId:request.requestId,runId:'A',operationId:'agent',sequence:1,stream:'stdout',data:Buffer.from('structured-output\n').toString('base64')};
+  await f.execution.message('company','outpost',output);
+  f.execution.close('company','outpost');
+  await f.execution.message('company','outpost',output);
+  f.reply(request,{exitCode:0,timedOut:false});
+  const result=await running;
+  assert.equal(result.stdout,'structured-output\n');
+  assert.deepEqual(f.logs,[['stdout','structured-output\n']]);
+});
+
+test('a recovered spool-reservation failure remains nonretryable',async () => {
+  const f=fixture();
+  const lease=await f.admit('A');
+  const running=f.execute(lease,'A','agent','agent_execution');
+  const rejected=assert.rejects(running,{code:PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTPUT_LIMIT,message:'output limit exceeded'});
+  const request=await f.drain();
+  f.execution.close('company','outpost');
+  const record={runId:'A',operationId:'agent',purpose:'agent_execution',workspace:'1:2',deadline:request.deadline,
+    status:'terminal',outcome:{exitCode:null,timedOut:false,error:'output limit exceeded'}};
+  await f.execution.history.report('company','outpost',record);
+  await f.execution.reconcile('company','outpost',record);
+  await f.reply(request,record.outcome);
+  await rejected;
+  await f.release(lease);
+  assert.deepEqual(f.logs,[]);
+  assert.equal((await f.execution.history.all('company','outpost'))[0].outcome.error,'output limit exceeded');
+});
+
+test('exhaustion recovered after the grace period cannot make the original failure retryable',async t => {
+  t.mock.timers.enable({apis:['setTimeout']});
+  const f=fixture();
+  const lease=await f.admit('A');
+  const running=f.execute(lease,'A','agent','agent_execution');
+  const rejected=assert.rejects(running,{code:PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTCOME_UNCERTAIN,message:'Outpost operation outcome is uncertain'});
+  const request=await f.drain();
+  f.offline();
+  f.execution.close('company','outpost');
+  t.mock.timers.tick(15001);
+  await rejected;
+  await f.release(lease);
+  f.reconnect();
+  await assert.rejects(f.admit('B'),/busy|uncertain/);
+  const record={runId:'A',operationId:'agent',purpose:'agent_execution',workspace:'1:2',deadline:request.deadline,
+    status:'terminal',outcome:{exitCode:null,timedOut:false,error:'output limit exceeded'}};
+  await f.execution.history.report('company','outpost',record);
+  await f.execution.reconcile('company','outpost',record);
+  await f.reply(request,record.outcome);
+  assert.equal((await f.execution.history.all('company','outpost'))[0].outcome.error,'output limit exceeded');
+  assert.deepEqual(f.logs,[]);
+  // The recovered terminal result frees the directory for an explicit new run.
+  // It must never change the original failure into a retryable adapter failure.
+  await f.admit('operator-continuation');
 });

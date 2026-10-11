@@ -27,7 +27,7 @@ func closeTestSupervisor(s *supervisor) {
 	s.lock.Close()
 }
 
-func newExecutionFixture(t *testing.T) executionFixture {
+func newExecutionFixture(t *testing.T, outputLimits ...int64) executionFixture {
 	t.Helper()
 	root := t.TempDir()
 	for _, name := range []string{"private", "workspace", "scratch", "bin"} {
@@ -43,6 +43,9 @@ func newExecutionFixture(t *testing.T) executionFixture {
 	}
 	t.Setenv("PATH", filepath.Join(root, "bin")+":"+os.Getenv("PATH"))
 	c := Connection{WorkspaceRoot: filepath.Join(root, "workspace"), ScratchRoot: filepath.Join(root, "scratch")}
+	if len(outputLimits) == 2 {
+		c.OutputBufferBytes, c.OutputTotalBytes = outputLimits[0], outputLimits[1]
+	}
 	s, err := newSupervisor(filepath.Join(root, "private"), c)
 	if err != nil {
 		t.Fatal(err)

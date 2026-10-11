@@ -3,7 +3,6 @@ package outpost
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -74,6 +73,8 @@ type executionRecord struct {
 	Refused        bool            `json:"refused,omitempty"`
 	Status         string          `json:"status"`
 	Outcome        *processOutcome `json:"outcome,omitempty"`
+	// Local delivery metadata is excluded from the shared recovery fingerprint.
+	PendingResultRequestID string `json:"pendingResultRequestId,omitempty"`
 }
 
 type workspaceOwnership struct {
@@ -98,6 +99,7 @@ type supervisor struct {
 	bootID         string
 	reports        map[string]executionRecord
 	fault          func(string)
+	outputs        *outputStore
 }
 
 func newSupervisor(dir string, c Connection) (*supervisor, error) {
@@ -129,6 +131,10 @@ func newSupervisor(dir string, c Connection) (*supervisor, error) {
 		return nil, errors.New("cannot establish machine boot identity")
 	}
 	s.bootID = strings.TrimSpace(string(boot))
+	s.outputs, err = openOutputStore(filepath.Join(dir, "output"), c.OutputBufferBytes, c.OutputTotalBytes)
+	if err != nil {
+		return nil, err
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -443,6 +449,29 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 		return
 	}
 	checkpoint("after-intent")
+	if err := s.outputs.create(op, checkpoint); err != nil {
+		message := "output retention failed; execution refused"
+		if errors.Is(err, errOutputLimit) {
+			message = "output limit exceeded"
+		}
+		record.Outcome = &processOutcome{Error: message}
+		record.Status = "terminal"
+		record.PendingResultRequestID = op.RequestID
+		if s.persist(record, false) == nil {
+			s.records[op.OperationID] = record
+			s.releaseOperation(record)
+		} else {
+			record.Outcome.Error = "execution refused but its durable outcome is uncertain"
+			record.Outcome.OwnershipUncertain = true
+		}
+		s.mu.Unlock()
+		if record.Outcome.OwnershipUncertain {
+			reply(*record.Outcome, nil)
+			return
+		}
+		_ = s.deliverOutputs(send)
+		return
+	}
 	if op.Purpose == "agent_execution" {
 		s.activeAgents++
 	} else {
@@ -484,6 +513,7 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 	var outputMu sync.Mutex
 	outputBytes := 0
 	limited := false
+	outputFailed := false
 	writer := func(stream string) io.Writer {
 		return outputWriter(func(data []byte) (int, error) {
 			outputMu.Lock()
@@ -494,15 +524,11 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 				return 0, errors.New("output limit exceeded")
 			}
 			outputBytes += len(data)
-			for offset := 0; offset < len(data); offset += 2048 {
-				end := offset + 2048
-				if end > len(data) {
-					end = len(data)
-				}
-				if err := send(map[string]any{"type": "output", "requestId": op.RequestID, "runId": op.RunID, "operationId": op.OperationID, "stream": stream, "data": base64.StdEncoding.EncodeToString(data[offset:end])}); err != nil {
-					cancel()
-					return 0, err
-				}
+			if err := s.outputs.append(op.OperationID, stream, data); err != nil {
+				limited = limited || errors.Is(err, errOutputLimit)
+				outputFailed = outputFailed || !errors.Is(err, errOutputLimit)
+				cancel()
+				return 0, err
 			}
 			return len(data), nil
 		})
@@ -554,6 +580,8 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 	}
 	if limited {
 		outcome.Error = "output limit exceeded"
+	} else if outputFailed {
+		outcome.Error = "output retention failed"
 	}
 	s.mu.Lock()
 	record.Outcome = &outcome
@@ -572,7 +600,11 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 	}
 	s.mu.Unlock()
 	checkpoint("after-terminal")
-	reply(outcome, nil)
+	if outcome.OwnershipUncertain {
+		reply(outcome, nil)
+		return
+	}
+	_ = s.deliverOutputs(send)
 }
 
 type outputWriter func([]byte) (int, error)

@@ -1,8 +1,8 @@
 // Installed through Paperclip's public adapter API. This adapter exercises the
 // execution-driver contract; assertions remain at public runs, logs and files.
-export function createServerAdapter() {
+export function createServerAdapter(adapterType='process') {
   return {
-    type:'process',runtimeToolDelivery:'environment',models:[],
+    type:adapterType,runtimeToolDelivery:'environment',models:[],
     async execute({runId,config,executionTarget,onLog}) {
       const runner=executionTarget?.runner;
       if(!runner) throw new Error('A real environment execution driver is required');
@@ -11,7 +11,7 @@ export function createServerAdapter() {
       });
       if(config.scenario==='control-ownership') {
         const result=await execute(`${runId}:control`,'control',
-          'echo control-started > control; while ! test -e finish-control; do sleep .1; done; echo control-finished > finished-control',60000);
+          'echo control-started > control; printf before-restart; while ! test -e finish-control; do sleep .1; done; printf after-restart; echo control-finished > finished-control',60000);
         return {...result,resultJson:{controlSucceeded:true}};
       }
       if(config.scenario==='ownership') {

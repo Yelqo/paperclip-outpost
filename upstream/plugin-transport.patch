@@ -342,7 +342,7 @@ index 947a67cbb..45d259622 100644
    /**
     * Called when Paperclip scans issue/comment/document content and asks this
 diff --git a/packages/plugins/sdk/src/index.ts b/packages/plugins/sdk/src/index.ts
-index 57f862811..43af82d46 100644
+index 57f862811..61db6b04b 100644
 --- a/packages/plugins/sdk/src/index.ts
 +++ b/packages/plugins/sdk/src/index.ts
 @@ -49,6 +49,9 @@
@@ -350,13 +350,13 @@ index 57f862811..43af82d46 100644
  // ---------------------------------------------------------------------------
  
 +export type { PluginWebSocketOpen, PluginWebSocketEvent, PluginWebSocketReply, PluginWebSocketAdmission } from "./define-plugin.js";
-+export const PLUGIN_WEBSOCKET_SDK_VERSION = "1.0.0+outpost.5";
++export const PLUGIN_WEBSOCKET_SDK_VERSION = "1.0.0+outpost.7";
 +
  export { definePlugin } from "./define-plugin.js";
  export { createTestHarness, createEnvironmentTestHarness, createFakeEnvironmentDriver, filterEnvironmentEvents, assertEnvironmentEventOrder, assertLeaseLifecycle, assertWorkspaceRealizationLifecycle, assertExecutionLifecycle, assertEnvironmentError } from "./testing.js";
  export { createPluginBundlerPresets } from "./bundlers.js";
 diff --git a/packages/plugins/sdk/src/protocol.ts b/packages/plugins/sdk/src/protocol.ts
-index 9c08a45c4..13a34434f 100644
+index 9c08a45c4..0dc8b9bb4 100644
 --- a/packages/plugins/sdk/src/protocol.ts
 +++ b/packages/plugins/sdk/src/protocol.ts
 @@ -1,3 +1,4 @@
@@ -364,16 +364,20 @@ index 9c08a45c4..13a34434f 100644
  import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paperclipai/shared";
  /**
   * JSON-RPC 2.0 message types and protocol helpers for the host ↔ worker IPC
-@@ -266,6 +267,8 @@ export const PLUGIN_RPC_ERROR_CODES = {
+@@ -266,6 +267,12 @@ export const PLUGIN_RPC_ERROR_CODES = {
     * `multiCompanyConfig: true` on its definition.
     */
    CROSS_TENANT_CONFIG: -32006,
 +  /** Environment refused the request before launch; safe to defer in the host scheduler. */
 +  EXECUTION_UNAVAILABLE: -32007,
++  /** Output exhaustion is terminal and requires explicit operator continuation. */
++  EXECUTION_OUTPUT_LIMIT: -32008,
++  /** A dispatched operation has no verified outcome; automatic continuation is unsafe. */
++  EXECUTION_OUTCOME_UNCERTAIN: -32009,
    /** A catch-all for errors that do not fit other categories. */
    UNKNOWN: -32099,
  } as const;
-@@ -704,6 +707,12 @@ export interface PluginEnvironmentRealizeWorkspaceResult {
+@@ -704,6 +711,12 @@ export interface PluginEnvironmentRealizeWorkspaceResult {
  }
  
  export interface PluginEnvironmentExecuteParams extends PluginEnvironmentDriverBaseParams {
@@ -386,7 +390,7 @@ index 9c08a45c4..13a34434f 100644
    lease: PluginEnvironmentLease;
    command: string;
    args?: string[];
-@@ -1212,6 +1221,11 @@ export function decodeChannelBytes(value: unknown): Uint8Array | null {
+@@ -1212,6 +1225,11 @@ export function decodeChannelBytes(value: unknown): Uint8Array | null {
  
  /** The open request for one persistent duplex channel. The worker registers the channel by `hostRouteId`. */
  export interface PluginDuplexChannelOpenParams {
@@ -398,7 +402,7 @@ index 9c08a45c4..13a34434f 100644
    /** The host-owned opaque route identifier. The worker registers the channel by it. */
    hostRouteId: string;
    /** The environment driver key, for the worker sandbox scope. */
-@@ -1323,6 +1337,9 @@ export const DUPLEX_CHANNEL_EXIT_NOTIFICATION = "duplexChannel.exit";
+@@ -1323,6 +1341,9 @@ export const DUPLEX_CHANNEL_EXIT_NOTIFICATION = "duplexChannel.exit";
   * ensure type safety across the IPC boundary.
   */
  export interface HostToWorkerMethods {
@@ -408,7 +412,7 @@ index 9c08a45c4..13a34434f 100644
    /** @see PLUGIN_SPEC.md §13.1 */
    initialize: [params: InitializeParams, result: InitializeResult];
    /** @see PLUGIN_SPEC.md §13.2 */
-@@ -1476,6 +1493,9 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[]
+@@ -1476,6 +1497,9 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[]
    "runJob",
    "handleWebhook",
    "handleApiRequest",
@@ -961,7 +965,7 @@ index 684e7cc13..8985f9c3a 100644
    // "set-cookie" is normally a response header; keep the request-side
 diff --git a/server/src/realtime/plugin-ws.ts b/server/src/realtime/plugin-ws.ts
 new file mode 100644
-index 000000000..0a8e46535
+index 000000000..5d440403c
 --- /dev/null
 +++ b/server/src/realtime/plugin-ws.ts
 @@ -0,0 +1,132 @@
@@ -985,7 +989,7 @@ index 000000000..0a8e46535
 +  try { commit = execFileSync("git", ["rev-parse", "HEAD"], {
 +    cwd: fileURLToPath(new URL("../../../", import.meta.url)), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1000,
 +  }).trim(); } catch { /* Packaged hosts must carry the build commit stamp. */ }
-+  const host = { commit, sdk: PLUGIN_WEBSOCKET_SDK_VERSION, transport: 5 };
++  const host = { commit, sdk: PLUGIN_WEBSOCKET_SDK_VERSION, transport: 7 };
 +  let admitted = 0, opening = 0, stopping = false;
 +  const pending = new Set<import("node:stream").Duplex>();
 +  server.on("upgrade", (req, socket, head) => {
@@ -1378,7 +1382,7 @@ index dec0d847c..5653f3e4d 100644
    return accounting;
  }
 diff --git a/server/src/services/heartbeat.ts b/server/src/services/heartbeat.ts
-index 9e8617e2f..b4f559bac 100644
+index 9e8617e2f..d91ead06e 100644
 --- a/server/src/services/heartbeat.ts
 +++ b/server/src/services/heartbeat.ts
 @@ -1,4 +1,6 @@
@@ -1568,7 +1572,25 @@ index 9e8617e2f..b4f559bac 100644
          if (err instanceof NativeControllerDetachedForRestartError) {
            nativeSessionResumeScheduled = true;
            return;
-@@ -26453,6 +26507,8 @@ export function heartbeatService(
+@@ -26250,6 +26304,8 @@ export function heartbeatService(
+           })
+           .catch(() => null);
+         const failureErrorCode =
++          (err instanceof JsonRpcCallError && err.code === PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTPUT_LIMIT ? "output_limit" : null) ??
++          (err instanceof JsonRpcCallError && err.code === PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTCOME_UNCERTAIN ? "execution_outcome_uncertain" : null) ??
+           workspaceValidationFailure?.code ??
+           configurationIncompleteFailure?.code ??
+           nonRetryablePreflightFailureCode(err) ??
+@@ -26377,7 +26433,7 @@ export function heartbeatService(
+             // exhaustion. Once its durable coordinator has classified a
+             // terminal failure, generic issue recovery must not create a
+             // replacement retryOfRunId chain for the same provider work.
+-            suppressImmediateRecovery: nativeTerminalFailureCode !== null,
++            suppressImmediateRecovery: nativeTerminalFailureCode !== null || failureErrorCode === "output_limit" || failureErrorCode === "execution_outcome_uncertain",
+           });
+           await handleIssueReviewPathDisposition(livenessRun);
+ 
+@@ -26453,6 +26509,8 @@ export function heartbeatService(
            eventMessage: "stale execution continuation cancelled before dispatch",
            suppressImmediateRecovery: true,
          });
@@ -1577,6 +1599,23 @@ index 9e8617e2f..b4f559bac 100644
        } else if (isWorkspaceBusyDeferral(outerErr)) {
          // Expected contention on a shared project workspace, not a
          // failure: park the run as a bounded scheduled retry and leave the
+@@ -26505,6 +26563,8 @@ export function heartbeatService(
+           nonRetryablePreflightFailureCode(outerErr);
+         const workspaceGitScanFailure = isWorkspaceGitScanError(outerErr) ? outerErr : null;
+         const setupFailureErrorCode =
++          (outerErr instanceof JsonRpcCallError && outerErr.code === PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTPUT_LIMIT ? "output_limit" : null) ??
++          (outerErr instanceof JsonRpcCallError && outerErr.code === PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTCOME_UNCERTAIN ? "execution_outcome_uncertain" : null) ??
+           workspaceGitScanFailure?.code ??
+           workspaceValidationSetupFailure?.code ??
+           configurationIncompleteSetupFailure?.code ??
+@@ -26648,6 +26708,7 @@ export function heartbeatService(
+           }
+           await releaseIssueExecutionAndPromote(livenessRun, {
+             suppressImmediateRecovery:
++              setupFailureErrorCode === "output_limit" || setupFailureErrorCode === "execution_outcome_uncertain" ||
+               readNonEmptyString(
+                 parseObject(livenessRun.contextSnapshot).goalControlRequestId,
+               ) !== null ||
 diff --git a/server/src/services/legacy-execution-recovery.ts b/server/src/services/legacy-execution-recovery.ts
 index 64c4c7f2d..d6ad3db51 100644
 --- a/server/src/services/legacy-execution-recovery.ts
@@ -1591,10 +1630,19 @@ index 64c4c7f2d..d6ad3db51 100644
    // exhaustion needs workspace repair, not reconciliation of provider actions
    // that the bootstrap evidence proves never started. Keep unknown outcomes held.
 diff --git a/server/src/services/plugin-worker-manager.ts b/server/src/services/plugin-worker-manager.ts
-index af6721f3d..c477ceae5 100644
+index af6721f3d..9f7ba9c0c 100644
 --- a/server/src/services/plugin-worker-manager.ts
 +++ b/server/src/services/plugin-worker-manager.ts
-@@ -604,6 +604,10 @@ export interface LoginPtyHostSession {
+@@ -527,6 +527,8 @@ interface PendingRequest {
+   id: JsonRpcId;
+   /** Method name (for logging). */
+   method: string;
++  /** A sent Outpost execution may outlive its plugin worker or RPC deadline. */
++  outpostExecution?: boolean;
+   /** Resolve the promise with the response. */
+   resolve: (response: JsonRpcResponse) => void;
+   /** Timeout timer handle. */
+@@ -604,6 +606,10 @@ export interface LoginPtyHostSession {
   * allowlist, so the caller owns the command.
   */
  export interface DuplexChannelOpenInput {
@@ -1605,7 +1653,7 @@ index af6721f3d..c477ceae5 100644
    driverKey: string;
    companyId: string;
    environmentId: string;
-@@ -715,6 +719,17 @@ export interface PluginWorkerHandle {
+@@ -715,6 +721,17 @@ export interface PluginWorkerHandle {
      executeLogSink?: ExecuteLogSink,
    ): Promise<HostToWorkerMethods[M][1]>;
  
@@ -1623,7 +1671,7 @@ index af6721f3d..c477ceae5 100644
    /**
     * Send a fire-and-forget notification to the worker (no response expected).
     */
-@@ -888,6 +903,8 @@ export function createPluginWorkerHandle(
+@@ -888,6 +905,8 @@ export function createPluginWorkerHandle(
  
    // Pending RPC requests awaiting a response
    const pendingRequests = new Map<string | number, PendingRequest>();
@@ -1632,7 +1680,7 @@ index af6721f3d..c477ceae5 100644
    let nextRequestId = 1;
    const activeInvocations = new Map<string, ActiveInvocation>();
    // Host-owned execute routes, keyed by the host-issued invocation id. Only an
-@@ -1093,9 +1110,12 @@ export function createPluginWorkerHandle(
+@@ -1093,9 +1112,12 @@ export function createPluginWorkerHandle(
        return;
      }
  
@@ -1646,7 +1694,7 @@ index af6721f3d..c477ceae5 100644
        return;
      }
  
-@@ -2472,6 +2492,9 @@ export function createPluginWorkerHandle(
+@@ -2472,6 +2494,9 @@ export function createPluginWorkerHandle(
          "duplexChannelOpen",
          {
            hostRouteId,
@@ -1656,7 +1704,15 @@ index af6721f3d..c477ceae5 100644
            driverKey: input.driverKey,
            companyId: input.companyId,
            environmentId: input.environmentId,
-@@ -3039,6 +3062,8 @@ export function createPluginWorkerHandle(
+@@ -3033,12 +3058,14 @@ export function createPluginWorkerHandle(
+       pending.resolve(
+         createErrorResponse(
+           pending.id,
+-          PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE,
+-          error.message,
++          pending.outpostExecution ? PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTCOME_UNCERTAIN : PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE,
++          pending.outpostExecution ? `Outpost operation outcome is uncertain: ${error.message}` : error.message,
+         ) as JsonRpcResponse,
        );
      }
      pendingRequests.clear();
@@ -1665,7 +1721,7 @@ index af6721f3d..c477ceae5 100644
      for (const invocation of activeInvocations.values()) {
        if (invocation.timer) clearTimeout(invocation.timer);
      }
-@@ -3291,9 +3316,11 @@ export function createPluginWorkerHandle(
+@@ -3291,9 +3318,11 @@ export function createPluginWorkerHandle(
      params: HostToWorkerMethods[M][0],
      timeoutMs?: number,
      executeLogSink?: ExecuteLogSink,
@@ -1677,15 +1733,37 @@ index af6721f3d..c477ceae5 100644
          reject(
            new Error(
              `Cannot call "${method}" — worker for "${pluginId}" is not running`,
-@@ -3303,6 +3330,7 @@ export function createPluginWorkerHandle(
+@@ -3303,6 +3332,10 @@ export function createPluginWorkerHandle(
        }
  
        const id = nextRequestId++;
++      // Only a worker response can prove whether this execution was refused or
++      // completed. Losing the response cannot authorize an automatic new run.
++      const outpostExecution = options.manifest.id === "yelqo.outpost" && method === "environmentExecute";
 +      if (onWorkerCompleted) workerCompletions.set(id, onWorkerCompleted);
        const timeout = resolveRpcCallTimeoutMs(timeoutMs, rpcTimeoutMs);
        const invocationScope = deriveInvocationScope(method, params);
        const invocation = invocationScope ? registerInvocation(invocationScope) : null;
-@@ -3366,6 +3394,8 @@ export function createPluginWorkerHandle(
+@@ -3334,8 +3367,8 @@ export function createPluginWorkerHandle(
+         settle(
+           reject,
+           new JsonRpcCallError({
+-            code: PLUGIN_RPC_ERROR_CODES.TIMEOUT,
+-            message: `RPC call "${method}" timed out after ${timeout}ms`,
++            code: outpostExecution ? PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTCOME_UNCERTAIN : PLUGIN_RPC_ERROR_CODES.TIMEOUT,
++            message: `${outpostExecution ? "Outpost operation outcome is uncertain: " : ""}RPC call "${method}" timed out after ${timeout}ms`,
+           }),
+         );
+       }, timeout);
+@@ -3343,6 +3376,7 @@ export function createPluginWorkerHandle(
+       const pending: PendingRequest = {
+         id,
+         method,
++        outpostExecution,
+         resolve: (response: JsonRpcResponse) => {
+           if (isJsonRpcSuccessResponse(response)) {
+             settle(resolve, response.result as HostToWorkerMethods[M][1]);
+@@ -3366,6 +3400,8 @@ export function createPluginWorkerHandle(
          };
          sendMessage(request);
        } catch (err) {
@@ -1694,7 +1772,7 @@ index af6721f3d..c477ceae5 100644
          clearTimeout(timer);
          pendingRequests.delete(id);
          clearInvocation(invocation);
-@@ -3435,6 +3465,22 @@ export function createPluginWorkerHandle(
+@@ -3435,6 +3471,22 @@ export function createPluginWorkerHandle(
        return callInternal(method, params, timeoutMs, executeLogSink);
      },
  
@@ -1717,3 +1795,99 @@ index af6721f3d..c477ceae5 100644
      openLoginPtySession(input: LoginPtyOpenInput) {
        if (status !== "running" && status !== "starting") {
          return Promise.reject(
+diff --git a/server/src/services/recovery/service.ts b/server/src/services/recovery/service.ts
+index 2cb7ac951..ffc21ff97 100644
+--- a/server/src/services/recovery/service.ts
++++ b/server/src/services/recovery/service.ts
+@@ -491,6 +491,8 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
+ ]);
+ 
+ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
++  "output_limit",
++  "execution_outcome_uncertain",
+   "native_provider_model_rejected",
+   "provider_tool_definition_invalid",
+   "adapter_engine_unavailable",
+diff --git a/server/src/__tests__/plugin-worker-manager.test.ts b/server/src/__tests__/plugin-worker-manager.test.ts
+index 2940b0c56..4146ffc0e 100644
+--- a/server/src/__tests__/plugin-worker-manager.test.ts
++++ b/server/src/__tests__/plugin-worker-manager.test.ts
+@@ -56,6 +56,61 @@ const TEST_MANIFEST: PaperclipPluginManifestV1 = {
+   entrypoints: { worker: "dist/worker.js" },
+ };
+ 
++describe("Outpost execution response loss", () => {
++  it.each([
++    ["yelqo.outpost", "exit", PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTCOME_UNCERTAIN],
++    ["yelqo.outpost", "timeout", PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTCOME_UNCERTAIN],
++    ["test.plugin", "exit", PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE],
++    ["test.plugin", "timeout", PLUGIN_RPC_ERROR_CODES.TIMEOUT],
++  ] as const)("classifies %s execution after worker %s", async (pluginKey, failure, code) => {
++    const handle = createPluginWorkerHandle("plugin-1", {
++      entrypointPath: DELAYED_WORKER_ENTRYPOINT,
++      manifest: { ...TEST_MANIFEST, id: pluginKey },
++      config: {},
++      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
++      apiVersion: 1,
++      hostHandlers: {},
++    });
++    try {
++      await handle.start();
++      const pending = handle.call("environmentExecute", {
++        driverKey: "outpost", companyId: "company-1", environmentId: "environment-1",
++        config: {}, lease: { providerLeaseId: "lease-1" }, command: "echo", delayMs: 1000,
++      } as HostToWorkerMethods["environmentExecute"][0], failure === "timeout" ? 10 : 5000);
++      const rejected = expect(pending).rejects.toMatchObject({ code });
++      if (failure === "exit") await handle.stop();
++      await rejected;
++    } finally {
++      await handle.stop().catch(() => undefined);
++    }
++  });
++
++  it("preserves an explicit Outpost refusal before launch", async () => {
++    const handle = createPluginWorkerHandle("plugin-1", {
++      entrypointPath: DELAYED_WORKER_ENTRYPOINT,
++      manifest: { ...TEST_MANIFEST, id: "yelqo.outpost" },
++      config: {},
++      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
++      apiVersion: 1,
++      hostHandlers: {},
++    });
++    try {
++      await handle.start();
++      await expect(handle.call("environmentExecute", {
++        driverKey: "outpost", companyId: "company-1", environmentId: "environment-1",
++        config: {}, lease: { providerLeaseId: "lease-1" }, command: "echo",
++        errorCode: PLUGIN_RPC_ERROR_CODES.EXECUTION_UNAVAILABLE,
++      } as HostToWorkerMethods["environmentExecute"][0])).rejects.toMatchObject({
++        code: PLUGIN_RPC_ERROR_CODES.EXECUTION_UNAVAILABLE,
++      });
++    } finally {
++      await handle.stop().catch(() => undefined);
++    }
++    await expect(handle.call("environmentExecute", {} as HostToWorkerMethods["environmentExecute"][0]))
++      .rejects.toThrow('Cannot call "environmentExecute"');
++  });
++});
++
+ describe("resolveRpcCallTimeoutMs", () => {
+   const MAX_RPC_TIMEOUT_MS = 15 * 60 * 1_000;
+   const MAX_NODE_TIMER_TIMEOUT_MS = 2_147_483_647;
+diff --git a/server/src/__tests__/fixtures/plugin-worker-delayed.cjs b/server/src/__tests__/fixtures/plugin-worker-delayed.cjs
+index 8aa7e4efa..9f8354361 100644
+--- a/server/src/__tests__/fixtures/plugin-worker-delayed.cjs
++++ b/server/src/__tests__/fixtures/plugin-worker-delayed.cjs
+@@ -27,6 +27,12 @@ rl.on("line", (line) => {
+   }
+ 
+   if (method === "environmentExecute") {
++    if (message.params?.errorCode) {
++      send({ jsonrpc: "2.0", id: message.id, error: {
++        code: message.params.errorCode, message: "Execution refused before launch",
++      } });
++      return;
++    }
+     const delayMs = Number(message.params?.delayMs ?? 0);
+     setTimeout(() => {
+       send({

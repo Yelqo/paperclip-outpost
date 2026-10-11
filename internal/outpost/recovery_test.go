@@ -11,7 +11,7 @@ import (
 )
 
 func TestCrashBoundariesNeverRepeatLaunch(t *testing.T) {
-	for _, stage := range []string{"before-intent", "after-intent", "after-launch", "before-terminal", "after-terminal", "after-ack"} {
+	for _, stage := range []string{"before-intent", "after-intent", "before-output-header", "after-output-header", "after-launch", "before-terminal", "after-terminal", "after-ack"} {
 		t.Run(stage, func(t *testing.T) {
 			f := newExecutionFixture(t)
 			closeTestSupervisor(f.supervisor)
@@ -48,7 +48,7 @@ func TestCrashBoundariesNeverRepeatLaunch(t *testing.T) {
 			if string(launches) != "" && string(launches) != "effect\n" {
 				t.Fatalf("delivered operation launched twice: %q", launches)
 			}
-			if stage == "after-intent" && len(launches) != 0 {
+			if (stage == "after-intent" || stage == "before-output-header" || stage == "after-output-header") && len(launches) != 0 {
 				t.Fatalf("intent-only crash launched on restart: %q", launches)
 			}
 			if stage == "after-terminal" || stage == "after-ack" {
