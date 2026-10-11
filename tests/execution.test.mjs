@@ -3,14 +3,14 @@ import assert from 'node:assert/strict';
 import { PLUGIN_RPC_ERROR_CODES } from '@paperclipai/plugin-sdk/protocol';
 import { createExecutionWorkflows } from '../plugin/execution.ts';
 
-function fixture() {
+function fixture({beforeStateSet}={}) {
   const scope={companyId:'company',config:{companyId:'company',outpostId:'outpost'},adapterType:'pi_local'};
   let online=true;
   const states=new Map();
   const logs=[];
   const execution=createExecutionWorkflows({execution:{log(stream,chunk){logs.push([stream,chunk]);}},state:{
     async get(input){return structuredClone(states.get(input.stateKey) ?? null);},
-    async set(input,value){states.set(input.stateKey,structuredClone(value));},
+    async set(input,value){await beforeStateSet?.(input,value); states.set(input.stateKey,structuredClone(value));},
   }},()=>online);
   const drain=async () => (await execution.drain('company','outpost'))[0];
   const reply=(request,result,extra={}) => execution.message('company','outpost',{
@@ -186,6 +186,39 @@ test('a dispatched operation survives reconnection and a lost output acknowledge
   const result=await running;
   assert.equal(result.stdout,'structured-output\n');
   assert.deepEqual(f.logs,[['stdout','structured-output\n']]);
+});
+
+test('overlapping output redelivery after reconnect preserves the durable cursor and emits each chunk once',async t => {
+  let resume,entered,paused=false;
+  const gate=new Promise(resolve=>{resume=resolve;});
+  const writing=new Promise(resolve=>{entered=resolve;});
+  const f=fixture({async beforeStateSet(input,value) {
+    if(input.stateKey.endsWith(':cursor') && value.sequence===1 && !paused) {
+      paused=true; entered(); await gate;
+    }
+  }});
+  const lease=await f.admit('A');
+  const running=f.execute(lease,'A','agent','agent_execution');
+  const request=await f.drain();
+  t.after(async ()=>{resume(); await f.reply(request,{exitCode:0,timedOut:false});});
+  const frame=(sequence,data)=>({type:'output',requestId:request.requestId,runId:'A',operationId:'agent',sequence,stream:'stdout',data:Buffer.from(data).toString('base64')});
+  const original=f.execution.message('company','outpost',frame(1,'first'));
+  await writing;
+  f.execution.close('company','outpost');
+  const replay=f.execution.message('company','outpost',frame(1,'first'));
+  // The old connection's delayed storage write overlaps the new connection.
+  // Release it after any unblocked replay and subsequent write have run.
+  setImmediate(resume);
+  await replay;
+  await f.execution.message('company','outpost',frame(2,'second'));
+  await original;
+  await f.execution.message('company','outpost',frame(3,'third'));
+  await f.reply(request,{exitCode:0,timedOut:false});
+  assert.equal((await running).stdout,'firstsecondthird');
+  assert.deepEqual(f.logs,[['stdout','first'],['stdout','second'],['stdout','third']]);
+  const retained=await f.execution.output.read('company','outpost','agent',0);
+  assert.equal(retained.receipt.sequence,3);
+  assert.equal(retained.receipt.bytes,16);
 });
 
 test('a recovered spool-reservation failure remains nonretryable',async () => {
