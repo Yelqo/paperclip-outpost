@@ -53,6 +53,8 @@ requires absolute paths, resolves aliases, rejects overlapping private and
 writable roots, and creates mode 0700 private state with a mode 0600 connection
 file. Registration refuses an existing registered identity; configuration
 updates replace the private file atomically.
+Only one `configure` or `register` command can use a private directory at a time.
+An overlapping command fails locally; retry after the active command finishes.
 
 ### Optional access layer
 

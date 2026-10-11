@@ -14,6 +14,7 @@ const headers = {'CF-Access-Client-Id':'existing-service-id', 'CF-Access-Client-
 let server, sockets, origin;
 let requireAccess = true;
 let redirectTo;
+let registrationHandler;
 const requests = [];
 
 function cli(args, input, stopWhenConnected = false) {
@@ -29,7 +30,7 @@ function cli(args, input, stopWhenConnected = false) {
     });
     child.stderr.on('data', data => {stderr += data;});
     child.on('error', reject);
-    child.on('exit', code => {clearTimeout(timer); resolve({code, stdout, stderr});});
+    child.on('close', code => {clearTimeout(timer); resolve({code, stdout, stderr});});
     child.stdin.end(input === undefined ? '' : JSON.stringify(input));
   });
 }
@@ -51,7 +52,10 @@ before(async () => {
     res.setHeader('Content-Type','application/json');
     if (req.url === '/api/health') return res.end('{"status":"ok"}');
     if (req.headers.authorization !== 'Bearer operator-secret') {res.writeHead(401); return res.end('denied');}
-    if (req.url.endsWith('/api/outposts')) return res.end(JSON.stringify({outpostId:'fixture-outpost',credential:'outpost-machine-secret',versions}));
+    if (req.url.endsWith('/api/outposts')) {
+      if (registrationHandler) return registrationHandler(req,res);
+      return res.end(JSON.stringify({outpostId:'fixture-outpost',credential:'outpost-machine-secret',versions}));
+    }
     if (req.url.endsWith('/environments')) return res.end('{"id":"fixture-environment"}');
     res.writeHead(404); res.end('{}');
   });
@@ -194,5 +198,48 @@ test('invalid connection credentials are rejected privately without replacing wo
     assert.ok(!invalid.stderr.includes('management-secret'));
     assert.ok(!invalid.stderr.includes('invalid-secret'));
     assert.equal((await cli(['check','--private-dir',dir])).code,0);
+  }
+});
+
+test('overlapping registration and configuration cannot overwrite an identity or its settings', async () => {
+  for (const preconfigured of [true,false]) {
+    const dir = join(home,preconfigured ? 'configured-overlap' : 'direct-overlap');
+    if (preconfigured) assert.equal((await configure(dir)).code,0);
+    const started = Promise.withResolvers(), release = Promise.withResolvers();
+    let registrations = 0;
+    registrationHandler = async (_req,res) => {
+      const id = ++registrations;
+      if (id === 1) {started.resolve(); await release.promise;}
+      res.end(JSON.stringify({outpostId:`overlap-${id}`,credential:`overlap-credential-${id}`,versions}));
+    };
+    const args = ['register','--private-dir',dir,'--company','fixture-company','--name','Overlap worker'];
+    if (!preconfigured) args.push('--instance',origin,'--workspace-root',workspace,'--scratch-root',scratch);
+    const input = {operatorAuthorization:'Bearer operator-secret',...(preconfigured ? {} : {headers})};
+    const first = cli(args,input);
+    try {
+      await Promise.race([started.promise,first.then(() => assert.fail('registration exited before reaching the fixture'))]);
+      const requestsBefore = requests.length;
+      for (const result of [await cli(args,input),await configure(dir,{})]) {
+        assert.equal(result.code,1,'overlapping management command must fail');
+        assert.match(result.stderr,/connection management already in progress.*retry/);
+      }
+      assert.equal(requests.length,requestsBefore,'rejected commands must not create remote identities');
+      assert.equal(registrations,1);
+    } finally {
+      release.resolve();
+      await first;
+      registrationHandler = undefined;
+    }
+    const registered = await first;
+    assert.equal(registered.code,0,registered.stderr);
+    const saved = JSON.parse(readFileSync(join(dir,'connection.json'),'utf8'));
+    assert.equal(saved.outpostId,JSON.parse(registered.stdout).outpostId);
+    assert.deepEqual(saved.headers,headers);
+    assert.equal((await cli(args,input)).code,1,'registered identity must refuse re-registration');
+    assert.equal((await configure(dir,{})).code,0,'management lock must release after registration');
+    const updated = JSON.parse(readFileSync(join(dir,'connection.json'),'utf8'));
+    assert.equal(updated.credential,saved.credential);
+    assert.equal(updated.outpostId,saved.outpostId);
+    assert.equal(updated.headers,undefined);
   }
 });

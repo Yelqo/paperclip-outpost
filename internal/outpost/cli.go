@@ -60,6 +60,13 @@ func Run(args []string, input io.Reader, output io.Writer) error {
 	if f.Parse(args[1:]) != nil || (f.NArg() != 0 && args[0] != "protect") {
 		return errors.New("invalid command arguments")
 	}
+	if args[0] == "configure" || args[0] == "register" {
+		lock, err := lockConnection(*privateDir)
+		if err != nil {
+			return err
+		}
+		defer lock.Close()
+	}
 	if args[0] == "configure" {
 		var settings struct {
 			Headers map[string]string `json:"headers"`
@@ -234,6 +241,32 @@ func revoke(origin, company, id string, auth enrollment) {
 	_ = request(origin, "/api/plugins/yelqo.outpost/api/outposts/"+url.PathEscape(id)+"/revoke", map[string]string{"companyId": company}, auth, nil)
 }
 
+// Lock the directory, whose inode survives atomic connection-file replacement.
+// Hold it before loading settings through registration, persistence and rollback.
+func lockConnection(dir string) (*os.File, error) {
+	if !filepath.IsAbs(dir) {
+		return nil, errors.New("private connection directory must be absolute")
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, errors.New("cannot create private connection directory")
+	}
+	if err := validatePrivateDirectory(dir); err != nil {
+		return nil, err
+	}
+	lock, err := os.Open(dir)
+	if err != nil {
+		return nil, errors.New("cannot open connection management lock")
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lock.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, errors.New("connection management already in progress; retry after configure or register finishes")
+		}
+		return nil, errors.New("cannot acquire connection management lock")
+	}
+	return lock, nil
+}
+
 func prepareConnection(dir string, requested Connection) (Connection, bool, error) {
 	_, statErr := os.Lstat(filepath.Join(dir, "connection.json"))
 	if !os.IsNotExist(statErr) {
@@ -266,7 +299,7 @@ func preparePrivate(dir, workspace, scratch string) error {
 	}
 	return validatePrivate(dir, workspace, scratch)
 }
-func validatePrivate(dir, workspace, scratch string) error {
+func validatePrivateDirectory(dir string) error {
 	canonical, err := filepath.EvalSymlinks(dir)
 	if err != nil || canonical != filepath.Clean(dir) {
 		return errors.New("private directory must exist without symlink aliases")
@@ -275,6 +308,13 @@ func validatePrivate(dir, workspace, scratch string) error {
 	if err != nil || !info.IsDir() || info.Mode().Perm() != 0700 || !owned(info) {
 		return errors.New("private connection directory requires mode 0700")
 	}
+	return nil
+}
+func validatePrivate(dir, workspace, scratch string) error {
+	if err := validatePrivateDirectory(dir); err != nil {
+		return err
+	}
+	canonical := filepath.Clean(dir)
 	for _, root := range []string{workspace, scratch} {
 		r, err := filepath.EvalSymlinks(root)
 		if err != nil || !filepath.IsAbs(root) {
