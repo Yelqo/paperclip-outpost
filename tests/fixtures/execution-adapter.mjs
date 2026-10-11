@@ -11,7 +11,7 @@ export function createServerAdapter() {
       });
       if(config.scenario==='control-ownership') {
         const result=await execute(`${runId}:control`,'control',
-          'echo control-started > control; while ! test -e finish-control; do sleep .1; done; echo control-finished > finished-control',60000);
+          'echo control-started > control; printf before-restart; while ! test -e finish-control; do sleep .1; done; printf after-restart; echo control-finished > finished-control',60000);
         return {...result,resultJson:{controlSucceeded:true}};
       }
       if(config.scenario==='ownership') {

@@ -7,6 +7,7 @@ import { resolve, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import WebSocket from 'ws';
 import { createServer } from 'node:http';
+import { createServer as createTCPServer, connect as connectTCP } from 'node:net';
 import { versions as supportedVersions } from '../plugin/versions.ts';
 
 const root = resolve('.');
@@ -172,8 +173,8 @@ test('execution runs a bounded command through the selected outpost and preserve
   }
 });
 
-async function startExecutionDaemon(env={}) {
-  const daemon=spawn(join(root,'bin/outpost'),['daemon','--private-dir',privateDir],{env:{...process.env,...env},stdio:['ignore','pipe','pipe']});
+async function startExecutionDaemon(env={},args=[]) {
+  const daemon=spawn(join(root,'bin/outpost'),['daemon','--private-dir',privateDir,...args],{env:{...process.env,...env},stdio:['ignore','pipe','pipe']});
   processes.push(daemon);
   let output=''; daemon.stdout.on('data',data => {output+=data;}); daemon.stderr.on('data',data => {output+=data;});
   await eventually(async () => {
@@ -557,9 +558,10 @@ process.exit(child.status ?? 1);
 });
 
 async function commandAgent(cwd,args,extra={}) {
+  const {defaultEnvironmentId=registered.environmentId,...adapterConfig}=extra;
   return json(`/api/companies/${company.id}/agents`,{
-    name:'Execution fixture',role:'engineer',adapterType:'process',defaultEnvironmentId:registered.environmentId,
-    adapterConfig:{command:'/bin/sh',args:['-c',args],cwd,timeoutSec:5,...extra},
+    name:'Execution fixture',role:'engineer',adapterType:'process',defaultEnvironmentId,
+    adapterConfig:{command:'/bin/sh',args:['-c',args],cwd,timeoutSec:5,...adapterConfig},
   });
 }
 async function terminalRun(run) {
@@ -776,6 +778,15 @@ test('a control before agent launch excludes conflicting work after plugin resta
     assert.equal(readFileSync(join(independent,'effect'),'utf8'),'independent\n');
     writeFileSync(join(workspace,'finish-control'),'');
     await eventually(() => existsSync(join(workspace,'finished-control')));
+    let recovered;
+    await eventually(async () => {
+      const status=await json(statusPath);
+      recovered=status.executionHistory.find(record=>record.runId===run.id && record.purpose==='control');
+      return recovered?.status==='terminal' && status.outputRetention?.operations===0;
+    });
+    const output=await json(`${statusPath.replace('?','/output?')}&operationId=${encodeURIComponent(recovered.operationId)}`);
+    assert.equal(output.chunks.map(chunk=>Buffer.from(chunk.data,'base64').toString()).join(''),'before-restartafter-restart');
+    assert.equal((await json(`/api/heartbeat-runs/${run.id}`)).status,'failed','recovered output must not rewrite a completed heartbeat');
     const after=await json(`/api/agents/${competing.id}/heartbeat/invoke`,{});
     assert.equal((await terminalRun(after)).status,'succeeded');
     assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'conflicting\n');
@@ -788,16 +799,103 @@ test('a control before agent launch excludes conflicting work after plugin resta
 });
 
 test('execution stops at its output limit and retains the workspace',async () => {
-  const daemon=await startExecutionDaemon();
+  await installExecutionAdapter();
+  const daemon=await startExecutionDaemon({},['--output-buffer-bytes','4096','--output-total-bytes','8192']);
   const workspace=join(home,'workspaces','output-limit');
   mkdirSync(workspace);
   try {
-    const agent=await commandAgent(workspace,'echo launch > launches; yes output');
-    const outcome=await terminalRun(await json(`/api/agents/${agent.id}/heartbeat/invoke`,{}));
+    const agent=await commandAgent(workspace,'echo launch > launches; while ! test -e exhaust; do sleep .1; done; (sleep 2; echo escaped > escaped) & printf \'{"status":"success"}\\n\'; yes output');
+    const task=await json(`/api/companies/${company.id}/issues`,{title:'Exhaustion requires operator continuation',status:'in_progress',assigneeAgentId:agent.id});
+    await eventually(()=>existsSync(join(workspace,'launches')));
+    assert.equal((await json(`/api/issues/${task.id}`)).status,'in_progress','failure must exercise recovery of an active task');
+    const [run]=await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`);
+    writeFileSync(join(workspace,'exhaust'),'');
+    const outcome=await terminalRun(run);
     assert.equal(outcome.status,'failed',JSON.stringify(outcome));
     assert.match(outcome.error,/output limit/);
+    assert.equal(outcome.errorCode,'output_limit');
+    assert.equal(outcome.resultJson.stopReason,'adapter_failed','partial structured output must never become an adapter success');
+    assert.equal(outcome.resultJson.stdout,undefined);
     assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'launch\n');
-  } finally { await stopExecutionDaemon(daemon); }
+    const statusPath=`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`;
+    let receipt;
+    await eventually(async () => {
+      const status=await json(statusPath);
+      receipt=status.executionHistory.find(record=>record.runId===outcome.id);
+      return receipt?.status==='terminal' && status.outputRetention?.operations===0;
+    });
+    assert.match(receipt.outcome.error,/output limit/);
+    const recovered=await json(`${statusPath.replace('?','/output?')}&operationId=${encodeURIComponent(receipt.operationId)}`);
+    assert.ok(recovered.receipt.bytes>0 && recovered.receipt.bytes<4096);
+    await delay(2100);
+    assert.equal(existsSync(join(workspace,'escaped')),false,'exhaustion must stop descendants');
+    assert.equal((await json(`/api/issues/${task.id}`)).scheduledRetry,null,'exhaustion cannot schedule a replacement');
+    await stopExecutionDaemon(daemon);
+    const restarted=await startExecutionDaemon();
+    try {
+      const status=await json(statusPath);
+      assert.match(status.executionHistory.find(record=>record.operationId===receipt.operationId).outcome.error,/output limit/);
+      assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'launch\n');
+      const runs=await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`);
+      assert.equal(runs.length,1,'exhaustion cannot trigger automatic relaunch');
+    } finally { await stopExecutionDaemon(restarted); }
+  } finally { await stopExecutionDaemon(daemon); await removeExecutionAdapter(); }
+});
+
+test('a disconnected execution recovers ordered output and succeeds without another launch', {timeout:60000}, async t => {
+  await installExecutionAdapter();
+  let blocked=false;
+  const sockets=new Set();
+  const proxy=createTCPServer(client => {
+    if(blocked) { client.destroy(); return; }
+    const upstream=connectTCP({host:'127.0.0.1',port});
+    for(const socket of [client,upstream]) {
+      sockets.add(socket);
+      socket.on('error',()=>{client.destroy(); upstream.destroy();});
+      socket.on('close',()=>sockets.delete(socket));
+    }
+    client.pipe(upstream); upstream.pipe(client);
+  });
+  await new Promise(resolve=>proxy.listen(0,'127.0.0.1',resolve));
+  t.after(()=>{for(const socket of sockets) socket.destroy(); proxy.close();});
+  const privatePath=join(home,'buffered-private');
+  const enrollment=spawn(join(root,'bin/outpost'),['register','--instance',`http://127.0.0.1:${proxy.address().port}`,'--company',company.id,
+    '--name','Buffered worker','--private-dir',privatePath,'--workspace-root',join(home,'workspaces'),'--scratch-root',join(home,'scratch')]);
+  let enrolled='',enrollmentError='';
+  enrollment.stdout.on('data',data=>{enrolled+=data;});
+  enrollment.stderr.on('data',data=>{enrollmentError+=data;});
+  enrollment.stdin.end(JSON.stringify({operatorAuthorization:`Bearer ${boardToken}`}));
+  assert.equal(await new Promise(resolve=>enrollment.once('close',resolve)),0,enrollmentError);
+  const outpost=JSON.parse(enrolled);
+  const daemon=spawn(join(root,'bin/outpost'),['daemon','--private-dir',privatePath],{stdio:['ignore','pipe','pipe']});
+  processes.push(daemon);
+  const workspace=join(home,'workspaces','buffered-output'); mkdirSync(workspace);
+  const statusPath=`/api/plugins/yelqo.outpost/api/outposts/${outpost.outpostId}?companyId=${company.id}`;
+  try {
+    await eventually(async ()=>(await json(statusPath)).executionReady);
+    const agent=await commandAgent(workspace,'echo launch >> launches; printf start; while ! test -e release; do sleep .1; done; printf \'{"ok":true}\\n\'; printf recovered-error >&2; echo completed > completed',{defaultEnvironmentId:outpost.environmentId,timeoutSec:30});
+    const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{});
+    await eventually(async ()=>{
+      const response=await api(`/api/heartbeat-runs/${run.id}/log`);
+      return response.ok && (await response.json()).content.includes('start');
+    });
+    blocked=true; for(const socket of sockets) socket.destroy();
+    await eventually(async ()=>!(await json(statusPath)).connected);
+    writeFileSync(join(workspace,'release'),'');
+    await eventually(()=>existsSync(join(workspace,'completed')));
+    assert.equal((await json(`/api/heartbeat-runs/${run.id}`)).status,'running');
+    blocked=false;
+    const outcome=await terminalRun(run);
+    assert.equal(outcome.status,'succeeded',JSON.stringify(outcome));
+    assert.equal(outcome.resultJson.stdout,'start{"ok":true}\n');
+    assert.equal(outcome.resultJson.stderr,'recovered-error');
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'launch\n');
+    let status;
+    await eventually(async ()=>{status=await json(statusPath); return status.outputRetention?.operations===0;});
+    const record=status.executionHistory.find(record=>record.runId===run.id);
+    const retained=await json(`${statusPath.replace('?','/output?')}&operationId=${encodeURIComponent(record.operationId)}`);
+    assert.equal(retained.chunks.filter(chunk=>chunk.stream==='stdout').map(chunk=>Buffer.from(chunk.data,'base64').toString()).join(''),'start{"ok":true}\n');
+  } finally { blocked=false; daemon.kill('SIGTERM'); await removeExecutionAdapter(); }
 });
 
 test('execution refuses to launch when durable intent cannot be written',async () => {

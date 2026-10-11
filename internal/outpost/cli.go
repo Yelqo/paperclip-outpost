@@ -26,17 +26,19 @@ type Versions struct {
 }
 
 type Connection struct {
-	Instance      string            `json:"instance"`
-	CompanyID     string            `json:"companyId"`
-	OutpostID     string            `json:"outpostId"`
-	EnvironmentID string            `json:"environmentId"`
-	Name          string            `json:"name"`
-	Credential    string            `json:"credential"`
-	WorkspaceRoot string            `json:"workspaceRoot"`
-	ScratchRoot   string            `json:"scratchRoot"`
-	Headers       map[string]string `json:"headers,omitempty"`
-	RuntimeRoots  []string          `json:"runtimeRoots,omitempty"`
-	RuntimeEnv    []string          `json:"runtimeEnv,omitempty"`
+	Instance          string            `json:"instance"`
+	CompanyID         string            `json:"companyId"`
+	OutpostID         string            `json:"outpostId"`
+	EnvironmentID     string            `json:"environmentId"`
+	Name              string            `json:"name"`
+	Credential        string            `json:"credential"`
+	WorkspaceRoot     string            `json:"workspaceRoot"`
+	ScratchRoot       string            `json:"scratchRoot"`
+	Headers           map[string]string `json:"headers,omitempty"`
+	RuntimeRoots      []string          `json:"runtimeRoots,omitempty"`
+	RuntimeEnv        []string          `json:"runtimeEnv,omitempty"`
+	OutputBufferBytes int64             `json:"-"`
+	OutputTotalBytes  int64             `json:"-"`
 }
 type enrollment struct {
 	OperatorAuthorization string            `json:"operatorAuthorization"`
@@ -57,6 +59,8 @@ func Run(args []string, input io.Reader, output io.Writer) error {
 	name := f.String("name", "", "outpost name")
 	workspace := f.String("workspace-root", "", "agent-writable workspace root")
 	scratch := f.String("scratch-root", "", "agent-writable scratch root")
+	outputBuffer := f.Int64("output-buffer-bytes", defaultOutputBufferBytes, "retained output bytes per operation")
+	outputTotal := f.Int64("output-total-bytes", defaultOutputTotalBytes, "retained output bytes across operations")
 	if f.Parse(args[1:]) != nil || (f.NArg() != 0 && args[0] != "protect") {
 		return errors.New("invalid command arguments")
 	}
@@ -155,6 +159,7 @@ func Run(args []string, input io.Reader, output io.Writer) error {
 	if err != nil {
 		return err
 	}
+	c.OutputBufferBytes, c.OutputTotalBytes = *outputBuffer, *outputTotal
 	switch args[0] {
 	case "protect":
 		return protect(*privateDir, c, f.Args(), output)

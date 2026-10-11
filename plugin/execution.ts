@@ -2,6 +2,7 @@ import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk/protocol";
 import { randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { StringDecoder } from "node:string_decoder";
+import { createOutputHistory, type OutputFrame } from "./output.ts";
 import { createRecoveryHistory, readOutcome, type Outcome, type ExecutionRecord } from "./recovery.ts";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import type { PluginEnvironmentAcquireLeaseParams, PluginEnvironmentExecuteParams, PluginEnvironmentRealizeWorkspaceParams, PluginEnvironmentReleaseLeaseParams } from "@paperclipai/plugin-sdk/protocol";
@@ -12,12 +13,12 @@ type OperationRequest =
   | {type:"inspect";cwd:string;deadline:string}
   | Identity & {type:"execute";workspaceId:string;command:string;args?:string[];cwd:string;env?:Record<string,string>;callbackTransport?:CallbackTransport;stdin?:string;deadline:string};
 type Inspection = {cwd:string;workspaceId:string;ownerRunId:string};
-type OutputFrame = {type:"output";requestId:string;runId:string;operationId:string;stream:"stdout"|"stderr";data:string};
 type ResultFrame = {type:"result";requestId:string;runId:string;operationId:string;result:unknown;error?:string;errorCode?:"execution_unavailable";beforeLaunch?:boolean};
 type Frame = OutputFrame | ResultFrame;
 type Pending = {
   outpostId:string; companyId:string; identity?:Identity;
   sent:boolean;
+  outputSequence:number;
   onSent?:() => void;
   deliver:(frame:Frame) => void;
   reject:(error:Error) => void;
@@ -35,7 +36,7 @@ function readFrame(value:unknown):Frame {
   const frame=object(value);
   if(typeof frame.requestId!=="string" || typeof frame.runId!=="string" || typeof frame.operationId!=="string") throw new Error("Invalid response identity");
   const identity={requestId:frame.requestId,runId:frame.runId,operationId:frame.operationId};
-  if(frame.type==="output" && (frame.stream==="stdout" || frame.stream==="stderr") && typeof frame.data==="string") return {...identity,type:"output",stream:frame.stream,data:frame.data};
+  if(frame.type==="output" && (frame.stream==="stdout" || frame.stream==="stderr") && typeof frame.data==="string" && Number.isSafeInteger(frame.sequence) && (frame.sequence as number)>0) return {...identity,type:"output",stream:frame.stream,data:frame.data,sequence:frame.sequence as number};
   if(frame.type==="result" && (frame.error===undefined || typeof frame.error==="string") && (frame.errorCode===undefined || frame.errorCode==="execution_unavailable") && (frame.beforeLaunch===undefined || typeof frame.beforeLaunch==="boolean")) return {...identity,type:"result",result:frame.result,error:frame.error,errorCode:frame.errorCode,beforeLaunch:frame.beforeLaunch};
   throw new Error("Invalid Outpost response frame");
 }
@@ -49,6 +50,7 @@ function readInspection(value:unknown):Inspection {
  * No transport redelivery or lease reuse creates a new execution identity. */
 export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:string,outpostId:string) => boolean) {
   const history=createRecoveryHistory(ctx);
+  const output=createOutputHistory(ctx);
   const pending = new Map<string,Pending>();
   const queues = new Map<string,Array<OperationRequest & {requestId:string}>>();
   type Lease = {runId:string;outpostKey:string;workspaceId?:string;workspaceKey?:string;operations:Map<string,Identity["purpose"]>;released:boolean;executedAgent:boolean};
@@ -73,7 +75,7 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
         dispose(); reject(sent ? new Error("Outpost operation outcome is uncertain") : unavailable("Outpost unavailable before dispatch"));
       },Math.max(10000,Date.parse(request.deadline)-Date.now()+10000));
       pending.set(requestId,{
-        outpostId,companyId,sent:false,onSent,identity:request.type==="execute" ? request : undefined,
+        outpostId,companyId,sent:false,outputSequence:0,onSent,identity:request.type==="execute" ? request : undefined,
         deliver(frame) {
           if (frame.type === "output") { onOutput?.(frame); return; }
           dispose();
@@ -106,15 +108,22 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
     if(request) { request.sent=true; request.onSent?.(); }
     return message ? [message] : [];
   };
-  const message = (companyId:string,outpostId:string,value:unknown) => {
+  const message = async (companyId:string,outpostId:string,value:unknown) => {
     const frame=readFrame(value);
     const request=pending.get(frame.requestId);
-    if (!request || request.companyId !== companyId || request.outpostId !== outpostId) return;
-    if (request.identity && (frame.runId !== request.identity.runId || frame.operationId !== request.identity.operationId)) throw new Error("Mismatched execution identity");
-    request.deliver(frame);
+    if(request && (request.companyId !== companyId || request.outpostId !== outpostId || (request.identity && (frame.runId !== request.identity.runId || frame.operationId !== request.identity.operationId)))) throw new Error("Mismatched execution identity");
+    if(frame.type==="output") {
+      const record=(await history.all(companyId,outpostId)).find(record=>record.operationId===frame.operationId);
+      if(!record || record.runId!==frame.runId) throw new Error("Unknown output operation");
+      await output.accept(companyId,outpostId,frame);
+      if(request && frame.sequence>request.outputSequence) {
+        request.deliver(frame);
+        request.outputSequence=frame.sequence;
+      }
+    } else request?.deliver(frame);
   };
-  const close = (companyId:string,outpostId:string) => {
-    for (const request of [...pending.values()]) if (request.companyId===companyId && request.outpostId===outpostId) request.reject(request.sent && request.identity ? new Error("Outpost disconnected; operation outcome is uncertain") : unavailable("Outpost disconnected before launch"));
+  const close = (companyId:string,outpostId:string,permanent=false) => {
+    for (const request of [...pending.values()]) if (request.companyId===companyId && request.outpostId===outpostId && (permanent || !request.sent || !request.identity)) request.reject(request.sent && request.identity ? new Error("Outpost disconnected; operation outcome is uncertain") : unavailable("Outpost disconnected before launch"));
     queues.delete(key(companyId,outpostId));
   };
   const reconcile = (companyId:string,outpostId:string,record:ExecutionRecord) => {
@@ -188,7 +197,7 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
     if(lease.runId!==input.runId || !lease.workspaceId || !lease.workspaceKey) throw new Error("Execution requires the run's admitted workspace");
     if(owners.get(lease.workspaceKey)!==input.runId) throw new Error("Execution workspace ownership changed");
     const timeout=Math.min(input.timeoutMs && input.timeoutMs>0 ? input.timeoutMs : 60000,3600000);
-    let stdout="",stderr="";
+    let stdout="",stderr="",outputBytes=0;
     const decoders={stdout:new StringDecoder("utf8"),stderr:new StringDecoder("utf8")};
     const log=AsyncLocalStorage.bind((stream:"stdout"|"stderr",chunk:string) => ctx.execution.log(stream,chunk));
     const agentExecution=input.purpose==="agent_execution";
@@ -205,9 +214,11 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
       command:input.command,args:input.args,cwd:input.cwd,env:input.env,callbackTransport:input.callbackTransport,stdin:input.stdin,
       deadline:new Date(Date.now()+timeout).toISOString(),
     },readOutcome,frame => {
-      const chunk=decoders[frame.stream].write(Buffer.from(frame.data,"base64"));
+      const bytes=Buffer.from(frame.data,"base64");
+      outputBytes+=bytes.length;
+      if(outputBytes>1048576) throw new Error("Outpost output limit exceeded");
+      const chunk=decoders[frame.stream].write(bytes);
       if(frame.stream==="stdout") stdout+=chunk; else stderr+=chunk;
-      if(Buffer.byteLength(stdout)+Buffer.byteLength(stderr)>1048576) throw new Error("Outpost output limit exceeded");
       log(frame.stream,chunk);
     },() => { sent=true; }); } catch(error) {
       if(!sent || (error instanceof Error && "beforeLaunch" in error && error.beforeLaunch===true)) settle();
@@ -226,8 +237,8 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
       if(stream==="stdout") stdout+=chunk; else stderr+=chunk;
       if(chunk) log(stream,chunk);
     }
-    if (result.error) throw new Error(result.error);
+    if (result.error) throw Object.assign(new Error(result.error),result.error==="output limit exceeded" ? {code:PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTPUT_LIMIT} : {});
     return {...result,stdout,stderr};
   };
-  return {acquire,realize,execute,release,drain,message,close,history,reconcile,restore};
+  return {acquire,realize,execute,release,drain,message,close,history,output,reconcile,restore};
 }

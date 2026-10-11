@@ -342,7 +342,7 @@ index 947a67cbb..45d259622 100644
    /**
     * Called when Paperclip scans issue/comment/document content and asks this
 diff --git a/packages/plugins/sdk/src/index.ts b/packages/plugins/sdk/src/index.ts
-index 57f862811..43af82d46 100644
+index 57f862811..9346e3cd8 100644
 --- a/packages/plugins/sdk/src/index.ts
 +++ b/packages/plugins/sdk/src/index.ts
 @@ -49,6 +49,9 @@
@@ -350,13 +350,13 @@ index 57f862811..43af82d46 100644
  // ---------------------------------------------------------------------------
  
 +export type { PluginWebSocketOpen, PluginWebSocketEvent, PluginWebSocketReply, PluginWebSocketAdmission } from "./define-plugin.js";
-+export const PLUGIN_WEBSOCKET_SDK_VERSION = "1.0.0+outpost.5";
++export const PLUGIN_WEBSOCKET_SDK_VERSION = "1.0.0+outpost.6";
 +
  export { definePlugin } from "./define-plugin.js";
  export { createTestHarness, createEnvironmentTestHarness, createFakeEnvironmentDriver, filterEnvironmentEvents, assertEnvironmentEventOrder, assertLeaseLifecycle, assertWorkspaceRealizationLifecycle, assertExecutionLifecycle, assertEnvironmentError } from "./testing.js";
  export { createPluginBundlerPresets } from "./bundlers.js";
 diff --git a/packages/plugins/sdk/src/protocol.ts b/packages/plugins/sdk/src/protocol.ts
-index 9c08a45c4..13a34434f 100644
+index 9c08a45c4..50b52a0f4 100644
 --- a/packages/plugins/sdk/src/protocol.ts
 +++ b/packages/plugins/sdk/src/protocol.ts
 @@ -1,3 +1,4 @@
@@ -364,16 +364,18 @@ index 9c08a45c4..13a34434f 100644
  import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paperclipai/shared";
  /**
   * JSON-RPC 2.0 message types and protocol helpers for the host ↔ worker IPC
-@@ -266,6 +267,8 @@ export const PLUGIN_RPC_ERROR_CODES = {
+@@ -266,6 +267,10 @@ export const PLUGIN_RPC_ERROR_CODES = {
     * `multiCompanyConfig: true` on its definition.
     */
    CROSS_TENANT_CONFIG: -32006,
 +  /** Environment refused the request before launch; safe to defer in the host scheduler. */
 +  EXECUTION_UNAVAILABLE: -32007,
++  /** Output exhaustion is terminal and requires explicit operator continuation. */
++  EXECUTION_OUTPUT_LIMIT: -32008,
    /** A catch-all for errors that do not fit other categories. */
    UNKNOWN: -32099,
  } as const;
-@@ -704,6 +707,12 @@ export interface PluginEnvironmentRealizeWorkspaceResult {
+@@ -704,6 +709,12 @@ export interface PluginEnvironmentRealizeWorkspaceResult {
  }
  
  export interface PluginEnvironmentExecuteParams extends PluginEnvironmentDriverBaseParams {
@@ -386,7 +388,7 @@ index 9c08a45c4..13a34434f 100644
    lease: PluginEnvironmentLease;
    command: string;
    args?: string[];
-@@ -1212,6 +1221,11 @@ export function decodeChannelBytes(value: unknown): Uint8Array | null {
+@@ -1212,6 +1223,11 @@ export function decodeChannelBytes(value: unknown): Uint8Array | null {
  
  /** The open request for one persistent duplex channel. The worker registers the channel by `hostRouteId`. */
  export interface PluginDuplexChannelOpenParams {
@@ -398,7 +400,7 @@ index 9c08a45c4..13a34434f 100644
    /** The host-owned opaque route identifier. The worker registers the channel by it. */
    hostRouteId: string;
    /** The environment driver key, for the worker sandbox scope. */
-@@ -1323,6 +1337,9 @@ export const DUPLEX_CHANNEL_EXIT_NOTIFICATION = "duplexChannel.exit";
+@@ -1323,6 +1339,9 @@ export const DUPLEX_CHANNEL_EXIT_NOTIFICATION = "duplexChannel.exit";
   * ensure type safety across the IPC boundary.
   */
  export interface HostToWorkerMethods {
@@ -408,7 +410,7 @@ index 9c08a45c4..13a34434f 100644
    /** @see PLUGIN_SPEC.md §13.1 */
    initialize: [params: InitializeParams, result: InitializeResult];
    /** @see PLUGIN_SPEC.md §13.2 */
-@@ -1476,6 +1493,9 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[]
+@@ -1476,6 +1495,9 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[]
    "runJob",
    "handleWebhook",
    "handleApiRequest",
@@ -961,7 +963,7 @@ index 684e7cc13..8985f9c3a 100644
    // "set-cookie" is normally a response header; keep the request-side
 diff --git a/server/src/realtime/plugin-ws.ts b/server/src/realtime/plugin-ws.ts
 new file mode 100644
-index 000000000..0a8e46535
+index 000000000..b745b6dd6
 --- /dev/null
 +++ b/server/src/realtime/plugin-ws.ts
 @@ -0,0 +1,132 @@
@@ -985,7 +987,7 @@ index 000000000..0a8e46535
 +  try { commit = execFileSync("git", ["rev-parse", "HEAD"], {
 +    cwd: fileURLToPath(new URL("../../../", import.meta.url)), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1000,
 +  }).trim(); } catch { /* Packaged hosts must carry the build commit stamp. */ }
-+  const host = { commit, sdk: PLUGIN_WEBSOCKET_SDK_VERSION, transport: 5 };
++  const host = { commit, sdk: PLUGIN_WEBSOCKET_SDK_VERSION, transport: 6 };
 +  let admitted = 0, opening = 0, stopping = false;
 +  const pending = new Set<import("node:stream").Duplex>();
 +  server.on("upgrade", (req, socket, head) => {
@@ -1378,7 +1380,7 @@ index dec0d847c..5653f3e4d 100644
    return accounting;
  }
 diff --git a/server/src/services/heartbeat.ts b/server/src/services/heartbeat.ts
-index 9e8617e2f..b4f559bac 100644
+index 9e8617e2f..f385d34f1 100644
 --- a/server/src/services/heartbeat.ts
 +++ b/server/src/services/heartbeat.ts
 @@ -1,4 +1,6 @@
@@ -1568,7 +1570,24 @@ index 9e8617e2f..b4f559bac 100644
          if (err instanceof NativeControllerDetachedForRestartError) {
            nativeSessionResumeScheduled = true;
            return;
-@@ -26453,6 +26507,8 @@ export function heartbeatService(
+@@ -26250,6 +26304,7 @@ export function heartbeatService(
+           })
+           .catch(() => null);
+         const failureErrorCode =
++          (err instanceof JsonRpcCallError && err.code === PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTPUT_LIMIT ? "output_limit" : null) ??
+           workspaceValidationFailure?.code ??
+           configurationIncompleteFailure?.code ??
+           nonRetryablePreflightFailureCode(err) ??
+@@ -26377,7 +26432,7 @@ export function heartbeatService(
+             // exhaustion. Once its durable coordinator has classified a
+             // terminal failure, generic issue recovery must not create a
+             // replacement retryOfRunId chain for the same provider work.
+-            suppressImmediateRecovery: nativeTerminalFailureCode !== null,
++            suppressImmediateRecovery: nativeTerminalFailureCode !== null || failureErrorCode === "output_limit",
+           });
+           await handleIssueReviewPathDisposition(livenessRun);
+ 
+@@ -26453,6 +26508,8 @@ export function heartbeatService(
            eventMessage: "stale execution continuation cancelled before dispatch",
            suppressImmediateRecovery: true,
          });
@@ -1577,6 +1596,14 @@ index 9e8617e2f..b4f559bac 100644
        } else if (isWorkspaceBusyDeferral(outerErr)) {
          // Expected contention on a shared project workspace, not a
          // failure: park the run as a bounded scheduled retry and leave the
+@@ -26505,6 +26562,7 @@ export function heartbeatService(
+           nonRetryablePreflightFailureCode(outerErr);
+         const workspaceGitScanFailure = isWorkspaceGitScanError(outerErr) ? outerErr : null;
+         const setupFailureErrorCode =
++          (outerErr instanceof JsonRpcCallError && outerErr.code === PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTPUT_LIMIT ? "output_limit" : null) ??
+           workspaceGitScanFailure?.code ??
+           workspaceValidationSetupFailure?.code ??
+           configurationIncompleteSetupFailure?.code ??
 diff --git a/server/src/services/legacy-execution-recovery.ts b/server/src/services/legacy-execution-recovery.ts
 index 64c4c7f2d..d6ad3db51 100644
 --- a/server/src/services/legacy-execution-recovery.ts
@@ -1717,3 +1744,15 @@ index af6721f3d..c477ceae5 100644
      openLoginPtySession(input: LoginPtyOpenInput) {
        if (status !== "running" && status !== "starting") {
          return Promise.reject(
+diff --git a/server/src/services/recovery/service.ts b/server/src/services/recovery/service.ts
+index 2cb7ac951..00e65013a 100644
+--- a/server/src/services/recovery/service.ts
++++ b/server/src/services/recovery/service.ts
+@@ -491,6 +491,7 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
+ ]);
+ 
+ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
++  "output_limit",
+   "native_provider_model_rejected",
+   "provider_tool_definition_invalid",
+   "adapter_engine_unavailable",

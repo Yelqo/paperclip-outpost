@@ -70,16 +70,16 @@ so agents cannot occupy all control capacity.
 Each operation receives an absolute deadline at dispatch, retains it throughout
 execution, and cannot gain a new deadline by replay. A positive adapter timeout
 is honored up to one hour; an omitted or unbounded timeout becomes 60 seconds.
-Combined stdout/stderr is limited to 1 MiB per operation. Output delivery uses
-acknowledgements to apply backpressure within the host's bounded transport.
-Exceeding the output limit terminates the process and reports failure.
+Combined stdout/stderr is limited to 1 MiB per operation over its entire lifetime.
+The independently bounded durable output buffer is described below. Exceeding
+either limit terminates the protected process tree and reports failure.
 
 The daemon records the terminal process outcome durably before releasing its
 workspace ownership. A killed process namespace also terminates descendants.
 If an operation's outcome is uncertain after a crash or a failed terminal write,
 conflicting dispatch remains blocked until recovery establishes termination.
-Preserve the private history. Buffered output recovery, cancellation receipts
-and operator resolution of missing history remain subsequent milestones.
+Preserve the private history. Cancellation receipts and operator resolution of
+missing history remain subsequent milestones.
 
 On startup, the daemon locates uncertain workspace identities under its worker
 root and reacquires their directory locks before opening its transport. This
@@ -188,6 +188,92 @@ workspace, scratch and runtime roots. Mode `0700`/`0600` is supplemented by the
 actual launcher's read-only root, private-directory mask, separate mount/PID
 namespaces and dropped capabilities. Same-UID agent processes cannot read or
 modify consumption records or access the supervisor through `/proc`.
+
+## Ordered output, acknowledgement and retention
+
+These bounds are implementation decisions for Outpost 0.7.0. The daemon
+defaults to a **2 MiB output spool per operation**, **64 MiB across retained
+operations**, and **1024 retained operations**. Operator flags on `daemon`
+configure the first two bounds:
+
+```sh
+outpost daemon --private-dir /home/worker/.outpost \
+  --output-buffer-bytes 2097152 --output-total-bytes 67108864
+```
+
+The per-operation bound accepts 4096 bytes through 64 MiB. The total bound must
+be at least the per-operation bound and at most 1 GiB. They measure actual
+spool file lengths, including identity headers and five framing bytes per
+chunk. Output chunks hold at most 2048 bytes. The separate 1 MiB combined raw
+stdout/stderr lifetime limit also bounds Paperclip's adapter accumulation,
+regardless of acknowledgement speed or larger spool settings. A small buffer
+therefore permits less raw output than its byte setting. Terminal receipts,
+which deliberately remain forever to prevent replay, are outside the output
+quota. Cursor files add at most 32 bytes per retained operation (committed plus
+temporary cursor); filesystem allocation overhead depends on the filesystem.
+
+Output spools live under `output/` in the same protected private directory as
+execution history. Identity headers are written to a temporary file, fsynced,
+atomically renamed and followed by directory fsync before launch. Startup
+removes unpublished headers left by a crash. The daemon serializes stdout/stderr chunks into a single
+operation order, fsyncs them before delivery, and sends one acknowledged frame
+at a time. This order is the supervisor's pipe-read order; it does not promise
+to reconstruct the child's cross-pipe write timing. Memory holds bounded
+chunk buffers and at most 1024 spool identities/cursors, without an output
+backlog in memory. Process admission remains separately limited to 16 agent
+and 16 control operations.
+
+Paperclip acknowledges an output chunk only after durably saving its bytes
+and sequence cursor in company-scoped plugin state. A repeated sequence must
+match its saved bytes and stream; it does not append duplicate adapter output.
+The daemon fsyncs its local acknowledgement cursor before advancing. A lost
+acknowledgement, connection or daemon restart can replay the same chunk safely.
+Successful terminal results are delivered only after all preceding output is
+acknowledged. Paperclip saves the terminal receipt before acknowledging that
+result. Only then does the daemon delete the operation's output spool and
+cursor and fsync the directory. Individual chunk acknowledgements do not
+compact a live spool; reclamation occurs after the terminal acknowledgement.
+
+Unacknowledged output has **no time-based expiry**. A prolonged outage consumes
+the finite byte/operation quotas rather than evicting output. No output write
+waits for a network acknowledgement. Failure to append within either byte
+bound cancels the protected process, durably records `output limit exceeded`,
+and preserves all already retained output, the terminal receipt and workspace.
+Failure to reserve a spool records the same terminal failure before starting
+a child. Storage errors report `output retention failed`. Remaining terminal
+records provide a delivery lane independent of full output storage. Exhaustion
+cannot become adapter success or authorize relaunch. Lowering limits on restart
+preserves existing spools; new appends fail until terminal acknowledgements
+reclaim enough capacity.
+
+The SDK carries exhaustion as `EXECUTION_OUTPUT_LIMIT`; Paperclip stores
+`errorCode: "output_limit"` and treats it as nonretryable. Task-owned runs do
+not enter immediate or periodic generic execution recovery after exhaustion.
+Continuation requires a separate operator-authorized attempt.
+
+A transient transport outage keeps the original pending adapter execution
+alive until its original deadline plus the existing 10-second reconciliation
+grace. Reconnection resumes delivery, never dispatch. If the plugin worker or
+host restarts, or that grace expires, the heartbeat attempt can fail; recovered
+output and terminal receipts remain inspectable and never rewrite a completed
+attempt. Daemon interruption reports verified process loss as before.
+
+The operator's outpost status API exposes `outputRetention` (retained bytes,
+operation count and configured bounds) while connected. Saved output is
+available through the board-authenticated endpoint below, scoped to the
+outpost's company and operation:
+
+```text
+GET /api/plugins/yelqo.outpost/api/outposts/OUTPOST_ID/output
+    ?companyId=COMPANY_ID&operationId=OPERATION_ID&afterSequence=0
+```
+
+Each page contains a `receipt` with original run/operation identities, last
+sequence and raw byte count, plus up to 32 ordered `chunks` with sequence,
+stream and base64 data. Continue with the last returned sequence. Saved output
+and terminal receipts have no automatic deletion in this release; Paperclip's
+own run log retention is independent. Local output reclamation does not delete
+workspaces, terminal consumption records or Paperclip's saved output.
 
 ## Acceptance
 

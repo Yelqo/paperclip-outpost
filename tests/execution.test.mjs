@@ -7,7 +7,8 @@ function fixture() {
   const scope={companyId:'company',config:{companyId:'company',outpostId:'outpost'},adapterType:'pi_local'};
   let online=true;
   const states=new Map();
-  const execution=createExecutionWorkflows({execution:{log(){}},state:{
+  const logs=[];
+  const execution=createExecutionWorkflows({execution:{log(stream,chunk){logs.push([stream,chunk]);}},state:{
     async get(input){return structuredClone(states.get(input.stateKey) ?? null);},
     async set(input,value){states.set(input.stateKey,structuredClone(value));},
   }},()=>online);
@@ -26,7 +27,7 @@ function fixture() {
     ...scope,lease,runId,operationId,purpose,cwd:'/workspace',command:'/bin/sh',timeoutMs:5000,
   });
   const release=lease => execution.release({...scope,providerLeaseId:lease.providerLeaseId});
-  return {execution,admit,execute,release,drain,reply,offline:()=>{online=false;}};
+  return {execution,logs,admit,execute,release,drain,reply,offline:()=>{online=false;}};
 }
 
 test('the first control stays retryable when the outpost goes offline after admission',async () => {
@@ -90,7 +91,7 @@ test('a lost control reply preserves ownership after lease release',async () => 
   const control=f.execute(lease,'A','control');
   const rejected=assert.rejects(control,/outcome is uncertain/);
   await f.drain();
-  f.execution.close('company','outpost');
+  f.execution.close('company','outpost',true);
   await rejected;
   await f.release(lease);
   await assert.rejects(f.admit('B'),/busy|uncertain/);
@@ -106,7 +107,7 @@ test('agent completion cannot release an outstanding control',async () => {
   await f.drain();
   f.reply(agentRequest,{exitCode:0,timedOut:false});
   await agent;
-  f.execution.close('company','outpost');
+  f.execution.close('company','outpost',true);
   await rejected;
   await f.release(lease);
   await assert.rejects(f.admit('B'),/busy|uncertain/);
@@ -166,4 +167,19 @@ test('lease release waits for every control to settle and then frees the workspa
   f.reply(secondRequest,{exitCode:0,timedOut:false});
   await second;
   await f.admit('C');
+});
+
+test('a dispatched operation survives reconnection and a lost output acknowledgement',async () => {
+  const f=fixture();
+  const lease=await f.admit('A');
+  const running=f.execute(lease,'A','agent','agent_execution');
+  const request=await f.drain();
+  const output={type:'output',requestId:request.requestId,runId:'A',operationId:'agent',sequence:1,stream:'stdout',data:Buffer.from('structured-output\n').toString('base64')};
+  await f.execution.message('company','outpost',output);
+  f.execution.close('company','outpost');
+  await f.execution.message('company','outpost',output);
+  f.reply(request,{exitCode:0,timedOut:false});
+  const result=await running;
+  assert.equal(result.stdout,'structured-output\n');
+  assert.deepEqual(f.logs,[['stdout','structured-output\n']]);
 });
