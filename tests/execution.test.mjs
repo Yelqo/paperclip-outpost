@@ -183,3 +183,21 @@ test('a dispatched operation survives reconnection and a lost output acknowledge
   assert.equal(result.stdout,'structured-output\n');
   assert.deepEqual(f.logs,[['stdout','structured-output\n']]);
 });
+
+test('a recovered spool-reservation failure remains nonretryable',async () => {
+  const f=fixture();
+  const lease=await f.admit('A');
+  const running=f.execute(lease,'A','agent','agent_execution');
+  const rejected=assert.rejects(running,{code:PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTPUT_LIMIT,message:'output limit exceeded'});
+  const request=await f.drain();
+  f.execution.close('company','outpost');
+  const record={runId:'A',operationId:'agent',purpose:'agent_execution',workspace:'1:2',deadline:request.deadline,
+    status:'terminal',outcome:{exitCode:null,timedOut:false,error:'output limit exceeded'}};
+  await f.execution.history.report('company','outpost',record);
+  await f.execution.reconcile('company','outpost',record);
+  await f.reply(request,record.outcome);
+  await rejected;
+  await f.release(lease);
+  assert.deepEqual(f.logs,[]);
+  assert.equal((await f.execution.history.all('company','outpost'))[0].outcome.error,'output limit exceeded');
+});

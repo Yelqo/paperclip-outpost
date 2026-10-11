@@ -370,6 +370,11 @@ func (store *outputStore) remove(id string) error {
 func (s *supervisor) deliverOutputs(send func(any) error) error {
 	s.outputs.deliveryMu.Lock()
 	defer s.outputs.deliveryMu.Unlock()
+	// Reservation failures have no spool. Deliver their durable terminal
+	// receipts first so full or unacknowledged output cannot block them.
+	if err := s.deliverPendingResults(send); err != nil {
+		return err
+	}
 	s.outputs.mu.Lock()
 	ids := make([]string, 0, len(s.outputs.spools))
 	for id := range s.outputs.spools {
@@ -413,6 +418,43 @@ func (s *supervisor) deliverOutputs(send func(any) error) error {
 			s.fault("after-ack")
 		}
 		if err := s.outputs.remove(id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *supervisor) deliverPendingResults(send func(any) error) error {
+	s.mu.Lock()
+	var pending []executionRecord
+	for _, record := range s.records {
+		if record.PendingResultRequestID != "" && record.Outcome != nil && !record.Outcome.OwnershipUncertain {
+			pending = append(pending, record)
+		}
+	}
+	s.mu.Unlock()
+	for _, record := range pending {
+		frame := map[string]any{"type": "result", "requestId": record.PendingResultRequestID, "runId": record.RunID,
+			"operationId": record.OperationID, "result": *record.Outcome, "record": record}
+		if err := send(frame); err != nil {
+			return err
+		}
+		if s.fault != nil {
+			s.fault("after-ack")
+		}
+		s.mu.Lock()
+		current := s.records[record.OperationID]
+		if current.PendingResultRequestID != record.PendingResultRequestID {
+			s.mu.Unlock()
+			continue
+		}
+		current.PendingResultRequestID = ""
+		err := s.persist(current, false)
+		if err == nil {
+			s.records[record.OperationID] = current
+		}
+		s.mu.Unlock()
+		if err != nil {
 			return err
 		}
 	}

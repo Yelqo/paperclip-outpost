@@ -73,6 +73,8 @@ type executionRecord struct {
 	Refused        bool            `json:"refused,omitempty"`
 	Status         string          `json:"status"`
 	Outcome        *processOutcome `json:"outcome,omitempty"`
+	// Local delivery metadata is excluded from the shared recovery fingerprint.
+	PendingResultRequestID string `json:"pendingResultRequestId,omitempty"`
 }
 
 type workspaceOwnership struct {
@@ -454,6 +456,7 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 		}
 		record.Outcome = &processOutcome{Error: message}
 		record.Status = "terminal"
+		record.PendingResultRequestID = op.RequestID
 		if s.persist(record, false) == nil {
 			s.records[op.OperationID] = record
 			s.releaseOperation(record)
@@ -462,7 +465,11 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 			record.Outcome.OwnershipUncertain = true
 		}
 		s.mu.Unlock()
-		reply(*record.Outcome, nil)
+		if record.Outcome.OwnershipUncertain {
+			reply(*record.Outcome, nil)
+			return
+		}
+		_ = s.deliverOutputs(send)
 		return
 	}
 	if op.Purpose == "agent_execution" {

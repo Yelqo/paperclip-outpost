@@ -191,3 +191,95 @@ func TestAcknowledgedOutputIsNotReplayedAfterRestart(t *testing.T) {
 		t.Fatalf("restart ignored durable acknowledgement cursor: %q", output.String())
 	}
 }
+
+func TestSpoolReservationFailureSurvivesLostDelivery(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		name := "reconnect"
+		if restart {
+			name = "daemon-restart"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newExecutionFixture(t, 4096, 4096)
+			retained := f.operation("retained-run", "retained-output", "control")
+			store := f.supervisor.outputs
+			if err := store.create(retained, func(string) {}); err != nil {
+				t.Fatal(err)
+			}
+			// Two frames fill the actual byte quota, leaving no room for another
+			// identity header. Keep their acknowledgements withheld throughout.
+			remaining := 4096 - store.retention()["bytes"].(int64)
+			if err := store.append(retained.OperationID, "stdout", make([]byte, remaining-10)); err != nil {
+				t.Fatal(err)
+			}
+			if store.retention()["bytes"] != int64(4096) {
+				t.Fatal("fixture did not fill output capacity")
+			}
+			op := f.operation("refused-run", "refused-operation", "agent_execution")
+			op.RequestID = "original-request"
+			op.Args = []string{"-c", "touch \"$1\"", "output", filepath.Join(f.workspace, "forbidden")}
+			lost := errors.New("acknowledgement withheld")
+			f.supervisor.handle(context.Background(), op, func(any) error { return lost })
+			if _, err := os.Stat(filepath.Join(f.workspace, "forbidden")); !os.IsNotExist(err) {
+				t.Fatalf("reservation failure launched the process: %v", err)
+			}
+			s := f.supervisor
+			t.Cleanup(func() { closeTestSupervisor(s) })
+			restartSupervisor := func() {
+				closeTestSupervisor(s)
+				restarted, err := newSupervisor(filepath.Join(f.root, "private"), f.supervisor.connection)
+				if err != nil {
+					t.Fatal(err)
+				}
+				s = restarted
+			}
+			if restart {
+				restartSupervisor()
+			}
+			var results int
+			send := func(value any) error {
+				frame := value.(map[string]any)
+				if frame["operationId"] == op.OperationID {
+					outcome, ok := frame["result"].(processOutcome)
+					if frame["type"] != "result" || frame["requestId"] != op.RequestID || frame["runId"] != op.RunID || !ok || outcome.Error != "output limit exceeded" || outcome.OwnershipUncertain {
+						t.Fatalf("lost terminal identity or failure: %v", frame)
+					}
+					results++
+				}
+				return lost
+			}
+			if err := s.deliverOutputs(send); !errors.Is(err, lost) {
+				t.Fatalf("unexpected delivery error: %v", err)
+			}
+			if results != 1 {
+				t.Fatalf("reservation failure was not redelivered while output remained full: %d results", results)
+			}
+			// Losing that acknowledgement must also survive another restart.
+			restartSupervisor()
+			if err := s.deliverOutputs(func(value any) error {
+				frame := value.(map[string]any)
+				if frame["operationId"] == op.OperationID {
+					_ = send(value)
+					return nil
+				}
+				return lost
+			}); !errors.Is(err, lost) {
+				t.Fatalf("unexpected delivery error: %v", err)
+			}
+			if results != 2 {
+				t.Fatalf("lost acknowledgement discarded the terminal result: %d results", results)
+			}
+			restartSupervisor()
+			_ = s.deliverOutputs(send)
+			if results != 2 {
+				t.Fatal("acknowledged terminal result was replayed after restart")
+			}
+			if s.records[op.OperationID].Outcome.Error != "output limit exceeded" {
+				t.Fatal("acknowledgement removed terminal history")
+			}
+			result := handleResult(t, s, op)
+			if !strings.Contains(result["error"].(string), "already admitted") {
+				t.Fatalf("reservation failure allowed replay: %v", result)
+			}
+		})
+	}
+}

@@ -240,9 +240,13 @@ waits for a network acknowledgement. Failure to append within either byte
 bound cancels the protected process, durably records `output limit exceeded`,
 and preserves all already retained output, the terminal receipt and workspace.
 Failure to reserve a spool records the same terminal failure before starting
-a child. Storage errors report `output retention failed`. Remaining terminal
-records provide a delivery lane independent of full output storage. Exhaustion
-cannot become adapter success or authorize relaunch. Lowering limits on restart
+a child. Its terminal record retains the original request identity independently
+of output capacity; delivery retries after a lost result or acknowledgement,
+including daemon restarts, and clears that pending identity durably only after
+Paperclip acknowledges the result. Storage errors report
+`output retention failed`. Remaining terminal records provide a delivery lane
+independent of full output storage. Exhaustion cannot become adapter success or
+authorize relaunch. Lowering limits on restart
 preserves existing spools; new appends fail until terminal acknowledgements
 reclaim enough capacity.
 
