@@ -1,7 +1,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, mkdirSync, writeFileSync, existsSync, chmodSync, symlinkSync, copyFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, mkdirSync, writeFileSync, existsSync, chmodSync, symlinkSync, copyFileSync, cpSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -145,7 +145,7 @@ test('execution runs a bounded command through the selected outpost and preserve
   const history = execFileSync('git',['-C',workspace,'rev-parse','HEAD'],{encoding:'utf8'});
   const daemon = spawn(join(root,'bin/outpost'),['daemon','--private-dir',privateDir],{stdio:['ignore','pipe','pipe']});
   processes.push(daemon);
-  await eventually(async () => (await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).connected);
+  await eventually(async () => (await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).executionReady);
   try {
     const agent = await json(`/api/companies/${company.id}/agents`, {
       name:'Bounded execution', role:'engineer', adapterType:'process', defaultEnvironmentId:registered.environmentId,
@@ -178,7 +178,7 @@ async function startExecutionDaemon(env={}) {
   let output=''; daemon.stdout.on('data',data => {output+=data;}); daemon.stderr.on('data',data => {output+=data;});
   await eventually(async () => {
     assert.equal(daemon.exitCode,null,output);
-    return (await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).connected;
+    return (await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).executionReady;
   });
   return daemon;
 }
@@ -249,7 +249,7 @@ test('actual Pi reads its assigned task through the callback bridge and retains 
     CF_ACCESS_CLIENT_ID:proxySecrets['CF-Access-Client-Id'],CF_ACCESS_CLIENT_SECRET:proxySecrets['CF-Access-Client-Secret'],
     OPENAI_API_KEY:'machine-provider-key',PI_CODING_AGENT_DIR:agentDir,PI_APPROVAL_POLICY:policyPath,PI_APPROVAL_STATE:state,PI_APPROVAL_PAPERCLIP:workerPath},stdio:['ignore','pipe','pipe']});
   processes.push(daemon);
-  await eventually(async()=>(await json(`/api/plugins/yelqo.outpost/api/outposts/${piRegistration.outpostId}?companyId=${company.id}`)).connected);
+  await eventually(async()=>(await json(`/api/plugins/yelqo.outpost/api/outposts/${piRegistration.outpostId}?companyId=${company.id}`)).executionReady);
   try {
     for(let attempt=0;attempt<2;attempt++) {
       const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{payload:{issueId:task.id}});
@@ -336,7 +336,7 @@ test('actual Pi human approvals preserve continuation, scope and one-time author
     PI_CODING_AGENT_DIR:agentDir,PI_APPROVAL_POLICY:policyPath,PI_APPROVAL_STATE:state,PI_APPROVAL_PAPERCLIP:workerPath},stdio:['ignore','pipe','pipe']});
   processes.push(daemon);
   const statusPath=`/api/plugins/yelqo.outpost/api/outposts/${registration.outpostId}?companyId=${company.id}`;
-  await eventually(async()=>(await json(statusPath)).connected);
+  await eventually(async()=>(await json(statusPath)).executionReady);
   const interactions=()=>json(`/api/issues/${task.id}/interactions`);
   const approvalRun=async(run)=>{
     for(let retry=0;retry<3;retry++) {
@@ -530,7 +530,7 @@ process.exit(child.status ?? 1);
         await delay(15000);
         await json('/api/plugins/yelqo.outpost/enable',{});
         disabled=false;
-        await eventually(async()=>(await json(statusPath)).connected,20000);
+        await eventually(async()=>(await json(statusPath)).executionReady,20000);
         assert.equal((await interactions()).find(card=>card.id===pending.id).status,'pending');
         assert.equal(commits(),2,'Reconnection cannot approve the operation');
         const wake=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{reason:'manual_approval_check',payload:{issueId:task.id}});
@@ -634,6 +634,34 @@ async function removeExecutionAdapter() {
   assert.ok(response.ok,await response.text());
 }
 
+test('restoring a machine snapshot reports missing history and never authorizes another launch', {timeout:60000}, async () => {
+  const snapshot=join(home,'history-snapshot');
+  cpSync(privateDir,snapshot,{recursive:true});
+  let daemon=await startExecutionDaemon();
+  const workspace=join(home,'workspaces','history-rollback'); mkdirSync(workspace);
+  try {
+    const agent=await commandAgent(workspace,'echo effect >> launches');
+    const runs=[];
+    for(let attempt=0;attempt<2;attempt++) {
+      const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{});
+      assert.equal((await terminalRun(run)).status,'succeeded');
+      runs.push(run);
+    }
+    await stopExecutionDaemon(daemon);
+    rmSync(privateDir,{recursive:true});
+    cpSync(snapshot,privateDir,{recursive:true});
+    chmodSync(privateDir,0o700);
+    daemon=await startExecutionDaemon();
+    const status=await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`);
+    for(const run of runs) assert.ok(status.executionHistory.some(record => record.runId===run.id && record.historyMissing && record.status==='uncertain'),JSON.stringify(status));
+    const competing=await commandAgent(workspace,'echo duplicate >> launches');
+    const conflict=await json(`/api/agents/${competing.id}/heartbeat/invoke`,{});
+    assert.equal((await terminalRun(conflict)).status,'cancelled');
+    await json(`/api/heartbeat-runs/${(await scheduledRetry(conflict)).id}/cancel`,{});
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'effect\neffect\n');
+  } finally { await stopExecutionDaemon(daemon); }
+});
+
 test('execution rejects a consumed operation after daemon restart without repeating its effect',async () => {
   await installExecutionAdapter();
   let daemon=await startExecutionDaemon();
@@ -732,7 +760,7 @@ test('a control before agent launch excludes conflicting work after plugin resta
     disabled=true;
     await json('/api/plugins/yelqo.outpost/enable',{});
     disabled=false;
-    await eventually(async () => (await json(statusPath)).connected,20000);
+    await eventually(async () => (await json(statusPath)).executionReady,20000);
     assert.equal((await terminalRun(run)).status,'failed');
     assert.equal(existsSync(join(workspace,'finished-control')),false,'control must still be executing after transport loss');
     const competing=await commandAgent(workspace,'echo conflicting >> launches');
@@ -786,7 +814,7 @@ test('execution refuses to launch when durable intent cannot be written',async (
   } finally { chmodSync(privateDir,0o700); await stopExecutionDaemon(daemon); }
 });
 
-test('execution keeps a crashed operation consumed and scheduler retries cannot free its uncertain workspace', {timeout:90000}, async () => {
+test('daemon interruption reports verified process loss and frees the workspace without replay', {timeout:60000}, async () => {
   let daemon=await startExecutionDaemon();
   const workspace=join(home,'workspaces','uncertain');
   mkdirSync(workspace);
@@ -801,21 +829,17 @@ test('execution keeps a crashed operation consumed and scheduler retries cannot 
     await eventually(async () => !(await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).connected);
     await terminalRun(run);
     daemon=await startExecutionDaemon();
-    const second=await commandAgent(workspace,'echo duplicate >> launches');
-    const conflict=await json(`/api/agents/${second.id}/heartbeat/invoke`,{});
-    const outcome=await terminalRun(conflict);
-    assert.equal(outcome.status,'cancelled',JSON.stringify(outcome));
-    assert.match(outcome.error,/uncertain/);
-    const retry=await scheduledRetry(conflict);
-    let retried;
+    let recovered;
     await eventually(async () => {
-      retried=await json(`/api/heartbeat-runs/${retry.id}`);
-      return retried.status==='cancelled';
-    },45000);
-    assert.match(retried.error,/uncertain/);
-    const pending=await scheduledRetry(retried);
-    await json(`/api/heartbeat-runs/${pending.id}/cancel`,{});
-    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'effect\n');
+      const status=await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`);
+      recovered=status.executionHistory.find(record=>record.runId===run.id);
+      return recovered?.status==='interrupted';
+    });
+    assert.equal(recovered.outcome.interrupted,true);
+    assert.equal(recovered.outcome.ownershipUncertain,undefined);
+    const second=await commandAgent(workspace,'echo next >> launches');
+    assert.equal((await terminalRun(await json(`/api/agents/${second.id}/heartbeat/invoke`,{}))).status,'succeeded');
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'effect\nnext\n');
   } finally { await stopExecutionDaemon(daemon); }
 });
 
@@ -912,13 +936,16 @@ test('revocation rejects subsequent connections from the actual Go daemon', asyn
   assert.equal(await rejected(transport()),403);
 });
 
-test('same-UID runtime isolation hides connection files and the daemon process namespace', () => {
+test('same-UID runtime isolation hides execution history, connection files and the daemon process namespace', () => {
   const privateFile = join(privateDir,'connection.json');
   // Ordinary same-UID permissions do allow a read: the launcher must add isolation.
   assert.ok(readFileSync(privateFile,'utf8').includes(connection().credential));
+  const historyFile=join(privateDir,readdirSync(privateDir).find(name=>/^operation-.*\.json$/.test(name)));
+  const history=readFileSync(historyFile,'utf8');
   const output = cli(['protect','--private-dir',privateDir,'--','/bin/sh','-c',
-    `test ! -e '${privateFile}' && test ! -e /proc/${process.pid}/environ && echo isolated`]);
+    `test ! -e '${privateFile}' && test ! -e '${historyFile}' && printf tampered > '${historyFile}' && test ! -e /proc/${process.pid}/environ && echo isolated`]);
   assert.match(output,/isolated/);
+  assert.equal(readFileSync(historyFile,'utf8'),history,'protected execution must not modify private consumption history');
 });
 
 test('an agent from another company cannot select the outpost environment', async () => {
@@ -975,7 +1002,7 @@ test('the actual Go daemon retries a transient persistence failure instead of ex
   processes.push(daemon);
   let output = ''; daemon.stdout.on('data',data => {output += data;}); daemon.stderr.on('data',data => {output += data;});
   const statusPath = `/api/plugins/yelqo.outpost/api/outposts/${secondRegistered.outpostId}?companyId=${company.id}`;
-  await eventually(async () => (await json(statusPath)).connected);
+  await eventually(async () => (await json(statusPath)).executionReady);
   // Inject a real persistence outage in the disposable DB. All observations
   // remain at the public daemon/API seam, rather than reading stored records.
   const dbPort = readFileSync(join(home,'instances/acceptance/db/postmaster.pid'),'utf8').split('\n')[3];
@@ -985,7 +1012,7 @@ test('the actual Go daemon retries a transient persistence failure instead of ex
     try {
       await eventually(async () => {assert.equal(daemon.exitCode,null,output); return output.includes('disconnected');});
     } finally { await sql`ALTER TABLE unavailable_plugin_state RENAME TO plugin_state`; }
-    await eventually(async () => (await json(statusPath)).connected);
+    await eventually(async () => (await json(statusPath)).executionReady);
   } finally { await sql.end(); daemon.kill('SIGTERM'); }
   await eventually(async () => !(await json(statusPath)).connected);
 });
@@ -1020,12 +1047,12 @@ test('the actual Go daemon reconnects after plugin restart while revocation rema
   processes.push(daemon);
   let output = ''; daemon.stdout.on('data',data => {output += data;}); daemon.stderr.on('data',data => {output += data;});
   const statusPath = `/api/plugins/yelqo.outpost/api/outposts/${secondRegistered.outpostId}?companyId=${company.id}`;
-  await eventually(async () => (await json(statusPath)).connected);
+  await eventually(async () => (await json(statusPath)).executionReady);
   await json('/api/plugins/yelqo.outpost/disable',{});
   await eventually(async () => output.includes('disconnected'),20000);
   assert.equal(daemon.exitCode,null,output);
   await json('/api/plugins/yelqo.outpost/enable',{});
-  await eventually(async () => (await json(statusPath)).connected,20000);
+  await eventually(async () => (await json(statusPath)).executionReady,20000);
   assert.equal(await rejected(transport()),403);
   daemon.kill('SIGTERM');
   await eventually(async () => !(await json(statusPath)).connected);

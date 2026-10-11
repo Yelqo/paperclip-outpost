@@ -58,15 +58,22 @@ type processOutcome struct {
 	TimedOut           bool   `json:"timedOut"`
 	Error              string `json:"error,omitempty"`
 	OwnershipUncertain bool   `json:"ownershipUncertain,omitempty"`
+	Interrupted        bool   `json:"interrupted,omitempty"`
 }
 
 type executionRecord struct {
-	RunID       string          `json:"runId"`
-	OperationID string          `json:"operationId"`
-	Purpose     string          `json:"purpose"`
-	Workspace   string          `json:"workspace"`
-	Deadline    string          `json:"deadline"`
-	Outcome     *processOutcome `json:"outcome,omitempty"`
+	RunID          string          `json:"runId"`
+	OperationID    string          `json:"operationId"`
+	Purpose        string          `json:"purpose"`
+	Workspace      string          `json:"workspace"`
+	Deadline       string          `json:"deadline"`
+	BootID         string          `json:"bootId,omitempty"`
+	ProcessID      int             `json:"processId,omitempty"`
+	ProcessStart   string          `json:"processStart,omitempty"`
+	HistoryMissing bool            `json:"historyMissing,omitempty"`
+	Refused        bool            `json:"refused,omitempty"`
+	Status         string          `json:"status"`
+	Outcome        *processOutcome `json:"outcome,omitempty"`
 }
 
 type workspaceOwnership struct {
@@ -74,6 +81,7 @@ type workspaceOwnership struct {
 	operations     map[string]struct{}
 	agentOperation string
 	lock           *os.File
+	historyMissing bool
 }
 
 // The supervisor survives transport sessions. A durable intent is a consumed
@@ -87,6 +95,9 @@ type supervisor struct {
 	activeAgents   int
 	activeControls int
 	lock           *os.File
+	bootID         string
+	reports        map[string]executionRecord
+	fault          func(string)
 }
 
 func newSupervisor(dir string, c Connection) (*supervisor, error) {
@@ -101,7 +112,7 @@ func newSupervisor(dir string, c Connection) (*supervisor, error) {
 		lock.Close()
 		return nil, errors.New("daemon already running")
 	}
-	s := &supervisor{dir: dir, connection: c, records: map[string]executionRecord{}, owners: map[string]*workspaceOwnership{}, lock: lock}
+	s := &supervisor{dir: dir, connection: c, records: map[string]executionRecord{}, owners: map[string]*workspaceOwnership{}, reports: map[string]executionRecord{}, lock: lock}
 	ready := false
 	defer func() {
 		if !ready {
@@ -113,6 +124,11 @@ func newSupervisor(dir string, c Connection) (*supervisor, error) {
 			}
 		}
 	}()
+	boot, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil || strings.TrimSpace(string(boot)) == "" {
+		return nil, errors.New("cannot establish machine boot identity")
+	}
+	s.bootID = strings.TrimSpace(string(boot))
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -121,11 +137,22 @@ func newSupervisor(dir string, c Connection) (*supervisor, error) {
 		if !strings.HasPrefix(entry.Name(), "operation-") {
 			continue
 		}
+		if strings.HasSuffix(entry.Name(), ".tmp") {
+			continue
+		}
 		data, readErr := os.ReadFile(filepath.Join(dir, entry.Name()))
 		var record executionRecord
 		if readErr != nil || json.Unmarshal(data, &record) != nil || record.OperationID == "" || record.RunID == "" || record.Workspace == "" {
 			return nil, errors.New("cannot reconcile execution history")
 		}
+		if record.Outcome == nil && s.terminated(record) {
+			record.Outcome = interruptedOutcome()
+			record.Status = "interrupted"
+			if err := s.persist(record, false); err != nil {
+				return nil, errors.New("cannot persist interruption")
+			}
+		}
+		record.Status = recordStatus(record)
 		s.records[record.OperationID] = record
 		if record.Outcome == nil {
 			owner := s.owners[record.Workspace]
@@ -133,9 +160,10 @@ func newSupervisor(dir string, c Connection) (*supervisor, error) {
 				owner = &workspaceOwnership{runID: record.RunID, operations: map[string]struct{}{}}
 				s.owners[record.Workspace] = owner
 			}
-			if owner.runID != record.RunID {
+			if owner.runID != record.RunID && !owner.historyMissing && !record.HistoryMissing {
 				return nil, errors.New("cannot reconcile conflicting workspace ownership")
 			}
+			owner.historyMissing = owner.historyMissing || record.HistoryMissing
 			owner.operations[record.OperationID] = struct{}{}
 			if record.Purpose == "agent_execution" {
 				owner.agentOperation = record.OperationID
@@ -153,7 +181,12 @@ func newSupervisor(dir string, c Connection) (*supervisor, error) {
 // actual device/inode, so locating it under the worker root also handles renamed
 // directories without changing the durable record format.
 func (s *supervisor) restoreWorkspaceLocks() error {
-	remaining := len(s.owners)
+	remaining := 0
+	for _, owner := range s.owners {
+		if owner.lock == nil {
+			remaining++
+		}
+	}
 	if remaining == 0 {
 		return nil
 	}
@@ -236,7 +269,11 @@ func (s *supervisor) persist(record executionRecord, exclusive bool) error {
 		return err
 	}
 	defer dir.Close()
-	return dir.Sync()
+	if err := dir.Sync(); err != nil {
+		return err
+	}
+	s.reports[record.OperationID] = record
+	return nil
 }
 
 func (s *supervisor) workspace(path string) (*os.File, string, error) {
@@ -267,8 +304,18 @@ func (s *supervisor) workspace(path string) (*os.File, string, error) {
 
 func (s *supervisor) handle(ctx context.Context, op operation, send func(any) error) {
 	admitted := false
+	checkpoint := func(stage string) {
+		if s.fault != nil {
+			s.fault(stage)
+		}
+	}
 	reply := func(value any, err error) {
 		message := map[string]any{"type": "result", "requestId": op.RequestID, "runId": op.RunID, "operationId": op.OperationID, "result": value}
+		if admitted {
+			s.mu.Lock()
+			message["record"] = s.records[op.OperationID]
+			s.mu.Unlock()
+		}
 		if err != nil {
 			message["error"] = err.Error()
 			message["beforeLaunch"] = !admitted
@@ -277,7 +324,9 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 				message["errorCode"] = "execution_unavailable"
 			}
 		}
-		_ = send(message)
+		if send(message) == nil && admitted {
+			checkpoint("after-ack")
+		}
 	}
 	file, workspace, err := s.workspace(op.Cwd)
 	if err != nil {
@@ -357,7 +406,7 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 		return
 	}
 	owner := s.owners[workspace]
-	if (owner != nil && owner.runID != op.RunID) ||
+	if (owner != nil && (owner.runID != op.RunID || owner.historyMissing)) ||
 		(op.Purpose == "agent_execution" && ((owner != nil && owner.agentOperation != "") || s.activeAgents >= 16)) ||
 		(op.Purpose == "control" && s.activeControls >= 16) {
 		s.mu.Unlock()
@@ -379,7 +428,7 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 		owner.lock = file
 		retained = true
 	}
-	record := executionRecord{RunID: op.RunID, OperationID: op.OperationID, Purpose: op.Purpose, Workspace: workspace, Deadline: op.Deadline}
+	record := executionRecord{RunID: op.RunID, OperationID: op.OperationID, Purpose: op.Purpose, Workspace: workspace, Deadline: op.Deadline, BootID: s.bootID, Status: "uncertain"}
 
 	admitted = true
 	s.records[op.OperationID] = record
@@ -387,11 +436,13 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 	if op.Purpose == "agent_execution" {
 		owner.agentOperation = op.OperationID
 	}
+	checkpoint("before-intent")
 	if err := s.persist(record, true); err != nil {
 		s.mu.Unlock()
 		reply(nil, errors.New("cannot persist launch intent; execution refused"))
 		return
 	}
+	checkpoint("after-intent")
 	if op.Purpose == "agent_execution" {
 		s.activeAgents++
 	} else {
@@ -458,7 +509,37 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 	}
 	cmd.Stdout = writer("stdout")
 	cmd.Stderr = writer("stderr")
-	err = cmd.Run()
+	// Bubblewrap reports the host PID of namespace PID 1. Its disappearance,
+	// unlike a shell or outer launcher PID, establishes loss of all descendants.
+	infoRead, infoWrite, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		reply(nil, errors.New("cannot establish protected process evidence"))
+		return
+	}
+	defer infoRead.Close()
+	cmd.ExtraFiles = append(cmd.ExtraFiles, infoWrite)
+	cmd.Args = append(cmd.Args[:1], append([]string{"--info-fd", "4"}, cmd.Args[1:]...)...)
+	err = cmd.Start()
+	infoWrite.Close()
+	if err == nil {
+		checkpoint("after-launch")
+		var info struct {
+			ProcessID int `json:"child-pid"`
+		}
+		if json.NewDecoder(io.LimitReader(infoRead, 4096)).Decode(&info) == nil && info.ProcessID > 0 {
+			start, _, evidenceErr := processIdentity(info.ProcessID)
+			if evidenceErr == nil {
+				s.mu.Lock()
+				record.ProcessID, record.ProcessStart, record.Status = info.ProcessID, start, "running"
+				if s.persist(record, false) != nil {
+					cancel()
+				}
+				s.records[op.OperationID] = record
+				s.mu.Unlock()
+			}
+		}
+		err = cmd.Wait()
+	}
 	outcome := processOutcome{TimedOut: processCtx.Err() == context.DeadlineExceeded}
 	if cmd.ProcessState != nil {
 		status := cmd.ProcessState.Sys().(syscall.WaitStatus)
@@ -476,21 +557,21 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 	}
 	s.mu.Lock()
 	record.Outcome = &outcome
+	record.Status = recordStatus(record)
+	checkpoint("before-terminal")
 	if s.persist(record, false) == nil {
 		s.records[op.OperationID] = record
-		delete(owner.operations, op.OperationID)
-		if op.Purpose == "agent_execution" {
-			owner.agentOperation = ""
-		}
-		if len(owner.operations) == 0 {
-			delete(s.owners, workspace)
-			owner.lock.Close()
-		}
+		s.releaseOperation(record)
 	} else {
 		outcome.Error = "process ended but its durable outcome is uncertain"
 		outcome.OwnershipUncertain = true
+		uncertain := s.records[op.OperationID]
+		uncertain.Status = "uncertain"
+		s.records[op.OperationID] = uncertain
+		s.reports[op.OperationID] = uncertain
 	}
 	s.mu.Unlock()
+	checkpoint("after-terminal")
 	reply(outcome, nil)
 }
 

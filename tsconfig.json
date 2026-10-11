@@ -1,7 +1,7 @@
 {
   "compilerOptions": {
     "target": "ES2023", "module": "NodeNext", "moduleResolution": "NodeNext",
-    "strict": true, "skipLibCheck": true, "rootDir": "plugin", "outDir": "dist",
+    "strict": true, "skipLibCheck": true, "rootDir": "plugin", "outDir": "dist", "allowImportingTsExtensions": true,
     "types": ["node"], "noUncheckedIndexedAccess": true,
     "baseUrl": ".", "paths": {"@paperclipai/shared": [".cache/paperclip/packages/shared/dist/index.d.ts"]}
   },
