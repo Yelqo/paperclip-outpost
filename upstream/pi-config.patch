@@ -84,10 +84,14 @@ index 587a000..8a3c231 100644
    }
    return {
 diff --git a/src/paperclip.ts b/src/paperclip.ts
-index b7f71ea..7c3fa9b 100644
+index b7f71ea..dc3ad50 100644
 --- a/src/paperclip.ts
 +++ b/src/paperclip.ts
-@@ -4,14 +4,14 @@ import { Effect, Schema } from "effect";
+@@ -1,17 +1,17 @@
+ import { lstat, readFile, realpath } from "node:fs/promises";
+-import { isAbsolute } from "node:path";
++import { dirname, isAbsolute } from "node:path";
+ import { Effect, Schema } from "effect";
  import { canonical, digest, within } from "./identity.ts";
  import type { Policy } from "./types.ts";
  
@@ -104,7 +108,7 @@ index b7f71ea..7c3fa9b 100644
  export interface ProposalCard { key: string; details: string }
  export interface Interaction {
    id: string; companyId: string; issueId: string; kind: string; idempotencyKey: string;
-@@ -29,14 +29,31 @@ export interface ApprovalChannel {
+@@ -29,14 +29,35 @@ export interface ApprovalChannel {
    withdraw(card: ProposalCard, signal: AbortSignal): Promise<void>;
  }
  
@@ -123,25 +127,29 @@ index b7f71ea..7c3fa9b 100644
 -  if (!stat.isFile() || stat.uid !== process.getuid?.() || stat.mode & 0o077 || stat.size > 16384) throw new Error("Worker config must be an owned private file (0600)");
 -  const config = Schema.decodeUnknownSync(Schema.fromJsonString(ConfigSchema))(await readFile(path, "utf8"));
 +  if (!stat.isFile() || stat.uid !== process.getuid?.() || stat.mode & 0o077 || stat.size > 16384) throw new Error("Worker configuration/transport must be an owned private file (0600)");
-+  policy.protectedRoots.push(path);
 +  return readFile(path, "utf8");
 +}
 +export async function loadRunTransport(path: string, policy: Policy): Promise<RunTransport> {
 +  const value: RunTransport = JSON.parse(await readPrivateWorkerFile(path, policy));
 +  if (!value || typeof value.instance !== "string" || ![value.companyId, value.agentId, value.taskId, value.runId].every(x => typeof x === "string" && id.test(x)) ||
-+      typeof value.token !== "string" || value.token.length < 32 || !isAbsolute(value.queueDir) || !within(value.queueDir, policy.projectRoot) ||
++      typeof value.token !== "string" || value.token.length < 32 || typeof value.queueDir !== "string" || !isAbsolute(value.queueDir) ||
++      await realpath(value.queueDir) !== value.queueDir || [policy.projectRoot, ...policy.scratchRoots].some(root => within(value.queueDir, root)) ||
 +      !Number.isFinite(Date.parse(value.expiresAt)) || Date.parse(value.expiresAt) <= Date.now()) throw new Error("Invalid or expired run transport");
++  // Protect a stable directory, rather than making each wake's private filename
++  // part of the operation policy identity. Transport never grants tool access.
++  if (!policy.protectedRoots.some(root => within(path, root))) policy.protectedRoots.push(dirname(path));
 +  return value;
 +}
 +
 +const id = /^[a-f0-9-]{36}$/i;
 +export async function loadWorkerConfig(path: string, policy: Policy, env = process.env): Promise<{ config: WorkerConfig; run: RunIdentity }> {
 +  const config = Schema.decodeUnknownSync(Schema.fromJsonString(ConfigSchema))(await readPrivateWorkerFile(path, policy));
++  if (!policy.protectedRoots.includes(path)) policy.protectedRoots.push(path);
 +  const transport = env.PI_APPROVAL_TRANSPORT ? await loadRunTransport(env.PI_APPROVAL_TRANSPORT, policy) : undefined;
    const url = new URL(config.apiUrl);
    if (url.username || url.password || url.search || url.hash || url.pathname !== "/" ||
        !(url.protocol === "https:" || url.protocol === "http:" && ["127.0.0.1", "[::1]", "localhost"].includes(url.hostname))) {
-@@ -49,8 +66,16 @@ export async function loadWorkerConfig(path: string, policy: Policy, env = proce
+@@ -49,8 +70,16 @@ export async function loadWorkerConfig(path: string, policy: Policy, env = proce
        env.PAPERCLIP_COMPANY_ID !== config.companyId || env.PAPERCLIP_AGENT_ID !== config.agentId || !env.PAPERCLIP_API_KEY) {
      throw new Error("Invalid or mismatched Paperclip worker/run identity");
    }
@@ -160,7 +168,7 @@ index b7f71ea..7c3fa9b 100644
  }
  
  // Only this operator-configured client holds the token. No arbitrary HTTP
-@@ -60,7 +85,7 @@ export class PaperclipChannel implements ApprovalChannel {
+@@ -60,7 +89,7 @@ export class PaperclipChannel implements ApprovalChannel {
  
    private request(path: string, method: "GET" | "POST" | "PATCH", body: unknown, signal: AbortSignal): Promise<any> {
      const request = Effect.tryPromise({ try: async requestSignal => {

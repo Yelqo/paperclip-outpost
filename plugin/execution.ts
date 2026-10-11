@@ -68,7 +68,9 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
     const requestId = randomUUID();
     const queued={...request,requestId};
     const serialized = JSON.stringify(queued);
-    if (Buffer.byteLength(serialized)>12000) return Promise.reject(new Error("Outpost command exceeds the transport limit"));
+    // Paperclip's approval continuation includes task and interaction context.
+    // Leave room for the host envelope within its existing 64 KiB send budget.
+    if (Buffer.byteLength(serialized)>60000) return Promise.reject(new Error("Outpost command exceeds the transport limit"));
     return new Promise((resolve,reject) => {
       const dispose = () => { clearTimeout(timer); pending.delete(requestId); const queue=queues.get(key(companyId,outpostId)); if(queue) queues.set(key(companyId,outpostId),queue.filter(value => value.requestId !== requestId)); };
       const timer = setTimeout(() => {

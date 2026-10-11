@@ -327,7 +327,11 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 	if op.CallbackTransport != nil {
 		transport := op.CallbackTransport
 		expires, expiryErr := time.Parse(time.RFC3339Nano, transport.ExpiresAt)
-		if op.Purpose != "agent_execution" || transport.Instance != s.connection.Instance || transport.CompanyID != s.connection.CompanyID || transport.RunID != op.RunID || transport.AgentID == "" || transport.TaskID == "" || transport.Token == "" || expiryErr != nil || !expires.After(time.Now()) || expires.After(deadline.Add(time.Second)) || !containsPath(op.Cwd, transport.QueueDir) {
+		queueAllowed := false
+		for _, root := range s.connection.RuntimeRoots {
+			queueAllowed = queueAllowed || containsPath(root, transport.QueueDir)
+		}
+		if op.Purpose != "agent_execution" || transport.Instance != s.connection.Instance || transport.CompanyID != s.connection.CompanyID || transport.RunID != op.RunID || transport.AgentID == "" || transport.TaskID == "" || transport.Token == "" || expiryErr != nil || !expires.After(time.Now()) || expires.After(deadline.Add(time.Second)) || !queueAllowed {
 			reply(nil, errors.New("callback transport scope does not match the registered instance and run"))
 			return
 		}

@@ -1,7 +1,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, mkdirSync, writeFileSync, existsSync, chmodSync, symlinkSync, copyFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, mkdirSync, writeFileSync, existsSync, chmodSync, symlinkSync, copyFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -42,6 +42,13 @@ function cli(args, input) {
     input: input === undefined ? undefined : JSON.stringify(input), encoding: 'utf8', timeout: 15000,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
+}
+function providerResponse(res, delta, finishReason) {
+  res.writeHead(200,{'content-type':'text/event-stream'});
+  const event=(delta,finish_reason)=>({id:'fixture',object:'chat.completion.chunk',created:1,model:'fixture',choices:[{index:0,delta,finish_reason}]});
+  res.write(`data: ${JSON.stringify(event(delta,null))}\n\n`);
+  res.write(`data: ${JSON.stringify(event({},finishReason))}\n\n`);
+  res.end('data: [DONE]\n\n');
 }
 
 before(async () => {
@@ -85,6 +92,9 @@ after(async () => {
   for (const child of processes) child.kill('SIGTERM');
   if (server) { server.kill('SIGTERM'); await Promise.race([new Promise(r => server.once('exit', r)), delay(10000)]); }
   writeFileSync(join(home, 'host.log'), logs);
+  // Keep logs and workspace evidence, but release the disposable database
+  // once its owning host has exited so repeated workflow runs fit in /tmp.
+  if(server && server.exitCode!==null) rmSync(join(home,'instances/acceptance/db'),{recursive:true,force:true});
 });
 
 test('operator registers a distinct outpost and selects its named environment', async () => {
@@ -198,11 +208,7 @@ test('actual Pi reads its assigned task through the callback bridge and retains 
     if(calls === 1 || calls === 9) assert.ok(JSON.stringify(body.messages.at(-1)).includes('Read the assigned task and report progress'), 'Task callback must return the assigned issue');
     calls++;
     const delta=step ? {role:'assistant',tool_calls:[{index:0,id:`fixture-${calls}`,type:'function',function:{name:step[0],arguments:JSON.stringify(step[1])}}]} : {role:'assistant',content:'Assigned task completed.'};
-    res.writeHead(200,{'content-type':'text/event-stream'});
-    const event=(delta,finish_reason)=>({id:'fixture',object:'chat.completion.chunk',created:1,model:'fixture',choices:[{index:0,delta,finish_reason}]});
-    res.write(`data: ${JSON.stringify(event(delta,null))}\n\n`);
-    res.write(`data: ${JSON.stringify(event({},step?'tool_calls':'stop'))}\n\n`);
-    res.end('data: [DONE]\n\n');
+    providerResponse(res,delta,step?'tool_calls':'stop');
   });
   await new Promise(r=>provider.listen(0,'127.0.0.1',r));
   t.after(async()=>{provider.closeAllConnections(); await new Promise(r=>provider.close(r));});
@@ -269,6 +275,273 @@ test('actual Pi reads its assigned task through the callback bridge and retains 
     await eventually(async()=>!(await json(`/api/plugins/yelqo.outpost/api/outposts/${piRegistration.outpostId}?companyId=${company.id}`)).connected);
   }
 });
+test('actual Pi human approvals preserve continuation, scope and one-time authority', {timeout:600000}, async t => {
+  const workspace=join(home,'workspaces','pi-approval'); mkdirSync(workspace);
+  const runtime=join(home,'pi-approval-runtime'); mkdirSync(runtime);
+  const agentDir=join(runtime,'agent'),state=join(runtime,'state'),sessions=join(runtime,'sessions');
+  for(const directory of [agentDir,state,sessions]) mkdirSync(directory,{mode:0o700});
+  const policyPath=join(runtime,'policy.json'),workerPath=join(runtime,'worker.json');
+  const node22=process.env.OUTPOST_TEST_NODE22 ?? execFileSync('mise',['where','node@22.22.1'],{encoding:'utf8'}).trim()+'/bin/node';
+  let calls=0,providerPause,providerReached;
+  let command='git commit --allow-empty -m "Human approved effect"';
+  const provider=createServer(async (req,res) => {
+    let input=''; for await(const chunk of req) input+=chunk;
+    const body=JSON.parse(input);
+    providerReached?.();
+    await providerPause;
+    const complete=body.messages.at(-1).role==='tool';
+    calls++;
+    const delta=complete ? {role:'assistant',content:'Protected operation completed.'} : {role:'assistant',tool_calls:[{index:0,id:`approval-${calls}`,type:'function',function:{name:'bash',arguments:JSON.stringify({command})}}]};
+    providerResponse(res,delta,complete?'stop':'tool_calls');
+  });
+  await new Promise(r=>provider.listen(0,'127.0.0.1',r));
+  t.after(async()=>{provider.closeAllConnections(); await new Promise(r=>provider.close(r));});
+  writeFileSync(join(agentDir,'models.json'),JSON.stringify({providers:{fixture:{baseUrl:`http://127.0.0.1:${provider.address().port}/v1`,api:'openai-completions',apiKey:'fixture-key',models:[{id:'fixture',reasoning:false,input:['text'],cost:{input:0,output:0,cacheRead:0,cacheWrite:0},contextWindow:128000,maxTokens:4096}]}}}));
+  execFileSync('git',['init',workspace],{stdio:'ignore'});
+  execFileSync('git',['-C',workspace,'config','user.name','Fixture']);
+  execFileSync('git',['-C',workspace,'config','user.email','fixture@outpost.test']);
+  execFileSync('git',['-C',workspace,'commit','--allow-empty','-m','Initial history'],{stdio:'ignore'});
+  const commits=()=>Number(execFileSync('git',['-C',workspace,'rev-list','--count','HEAD'],{encoding:'utf8'}).trim());
+  const agent=await json(`/api/companies/${company.id}/agents`,{
+    name:'Human approval Pi',role:'engineer',adapterType:'pi_local',defaultEnvironmentId:registered.environmentId,
+    runtimeConfig:{heartbeat:{enabled:false,maxConcurrentRuns:1}},
+    adapterConfig:{command:join(root,'.cache/pi-config/scripts/paperclip-pi'),cwd:workspace,model:'fixture/fixture',timeoutSec:60,machineSessionDir:sessions},
+  });
+  const newTask=title=>json(`/api/companies/${company.id}/issues`,{title,status:'backlog',assigneeAgentId:agent.id});
+  let task=await newTask('Commit the approved local effect once');
+  const policy=JSON.parse(readFileSync(join(root,'.cache/pi-config/policies/personal.example.json'),'utf8'));
+  Object.assign(policy,{projectRoot:workspace,scratchRoots:[],scripts:[]});
+  writeFileSync(policyPath,JSON.stringify(policy),{mode:0o600});
+  writeFileSync(workerPath,JSON.stringify({version:1,apiUrl:origin,companyId:company.id,agentId:agent.id,workerId:'approval-fixture',generation:'one',expirySeconds:3600,hostInputs:[]}),{mode:0o600});
+  const piPrivate=join(runtime,'connection');
+  const registration=JSON.parse(cli(['register','--instance',origin,'--company',company.id,'--name','Human approval worker',
+    '--private-dir',piPrivate,'--workspace-root',join(home,'workspaces'),'--scratch-root',join(home,'scratch')],
+    {operatorAuthorization:`Bearer ${boardToken}`,runtimeRoots:[state,sessions,agentDir]}));
+  await json(`/api/agents/${agent.id}`,{defaultEnvironmentId:registration.environmentId},undefined,'PATCH');
+  const daemon=spawn(join(root,'bin/outpost'),['daemon','--private-dir',piPrivate],{env:{...process.env,PATH:node22.slice(0,-5)+':/usr/bin:/bin',
+    PI_CODING_AGENT_DIR:agentDir,PI_APPROVAL_POLICY:policyPath,PI_APPROVAL_STATE:state,PI_APPROVAL_PAPERCLIP:workerPath},stdio:['ignore','pipe','pipe']});
+  processes.push(daemon);
+  const statusPath=`/api/plugins/yelqo.outpost/api/outposts/${registration.outpostId}?companyId=${company.id}`;
+  await eventually(async()=>(await json(statusPath)).connected);
+  const interactions=()=>json(`/api/issues/${task.id}/interactions`);
+  const approvalRun=async(run)=>{
+    for(let retry=0;retry<3;retry++) {
+      let outcome;
+      await eventually(async()=>{
+        outcome=await json(`/api/heartbeat-runs/${run.id}`);
+        return !['queued','running','scheduled_retry'].includes(outcome.status);
+      },60000);
+      if(outcome.errorCode!=='execution_unavailable') return outcome;
+      run=await scheduledRetry(outcome);
+    }
+    assert.fail('Approval continuation remained unavailable after scheduler retries');
+  };
+  const invoke=async()=>{
+    const before=new Set((await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`)).map(run=>run.id));
+    // Manual retries explicitly leave the task's human-review posture. This
+    // changes scheduling, while the durable approval still decides authority.
+    if(['in_review','done'].includes((await json(`/api/issues/${task.id}`)).status)) {
+      await json(`/api/issues/${task.id}`,{status:'in_progress'},undefined,'PATCH');
+    }
+    let run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{reason:'manual_approval_check',payload:{issueId:task.id}});
+    if(!run.id) {
+      const observed=await json(`/api/issues/${task.id}`);
+      const pendingRun=observed.scheduledRetry?.runId ?? observed.executionRunId;
+      assert.ok(pendingRun,JSON.stringify({run,taskStatus:observed.status,blocker:observed.executionBlocker}));
+      run=await json(`/api/heartbeat-runs/${pendingRun}`);
+      assert.ok(!before.has(run.id) || ['queued','running','scheduled_retry'].includes(run.status),JSON.stringify(run));
+    }
+    return approvalRun(run);
+  };
+  const decisionRun=async(card,decision)=>{
+    const before=new Set((await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`)).map(run=>run.id));
+    await json(`/api/issues/${task.id}/interactions/${card.id}/${decision}`,{});
+    let continuation;
+    await eventually(async()=>{
+      continuation=(await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`)).find(run=>!before.has(run.id));
+      if(!continuation) {
+        const observed=await json(`/api/issues/${task.id}`);
+        const pendingRun=observed.scheduledRetry?.runId ?? observed.executionRunId;
+        if(pendingRun) {
+          const candidate=await json(`/api/heartbeat-runs/${pendingRun}`);
+          if(candidate.contextSnapshot?.interactionId===card.id) continuation=candidate;
+        }
+      }
+      return continuation;
+    });
+    continuation=await approvalRun(continuation);
+    assert.equal(continuation.contextSnapshot.interactionId,card.id);
+    return continuation;
+  };
+  try {
+    const first=await invoke();
+    const cards=await interactions();
+    assert.equal(cards.length,1,JSON.stringify({first,cards}));
+    const card=cards[0];
+    assert.equal(card.status,'pending');
+    assert.equal(card.effectiveResolverPolicy,'human_only');
+    assert.equal(card.continuationPolicy,'wake_assignee');
+    assert.equal((await json(`/api/issues/${task.id}`)).status,'in_review');
+    assert.equal(commits(),1,'Pending approval cannot execute');
+    const agentKey=await json(`/api/agents/${agent.id}/keys`,{name:'Cannot decide human approval'});
+    const agentDecision=await fetch(`${origin}/api/issues/${task.id}/interactions/${card.id}/accept`,{
+      method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${agentKey.token}`,'X-Paperclip-Run-Id':first.id},body:'{}',
+    });
+    assert.ok([403,422].includes(agentDecision.status));
+    assert.match(await agentDecision.text(),/human/i);
+    const continuation=await decisionRun(card,'accept');
+    assert.equal(continuation.sessionIdBefore,first.sessionIdAfter,'Human wake must reuse the Pi session');
+    assert.equal(continuation.sessionIdAfter,first.sessionIdAfter);
+    assert.equal(commits(),2,JSON.stringify(continuation));
+    await json(`/api/issues/${task.id}`,{status:'done'},undefined,'PATCH');
+
+    // A consumed approval cannot execute on a duplicate wake or decision.
+    {
+      task=await newTask('Consume an unchanged operation once');
+      command='git --version';
+      await invoke();
+      const pending=(await interactions()).find(card=>card.status==='pending');
+      assert.ok(pending);
+      const allowed=await decisionRun(pending,'accept');
+      assert.equal(allowed.status,'succeeded',JSON.stringify(allowed));
+      assert.match((await json(`/api/heartbeat-runs/${allowed.id}/log?limitBytes=1048576`)).content,/git version \d+\./);
+      await json(`/api/issues/${task.id}`,{status:'done'},undefined,'PATCH');
+      const replay=await invoke();
+      assert.equal(replay.status,'failed',JSON.stringify({status:replay.status,error:replay.error,errorCode:replay.errorCode}));
+      assert.match((await json(`/api/heartbeat-runs/${replay.id}/log?limitBytes=1048576`)).content,/Saved approval consumed/);
+      assert.equal((await interactions()).length,1);
+      const repeated=await api(`/api/issues/${task.id}/interactions/${pending.id}/accept`,{});
+      assert.ok([200,409].includes(repeated.status));
+      assert.equal(commits(),2);
+      await json(`/api/issues/${task.id}`,{status:'done'},undefined,'PATCH');
+    }
+
+    // A descriptor presented to the actual launcher cannot change run scope
+    // or replace the configured instance with an arbitrary callback endpoint.
+    {
+      const wrapper=join(runtime,'forged-transport.mjs'),override=join(runtime,'override.json');
+      const injected=join(state,'injected-transport.json');
+      writeFileSync(wrapper,`#!${node22}
+import {readFileSync,writeFileSync,unlinkSync} from 'node:fs';
+import {spawnSync} from 'node:child_process';
+const descriptor=JSON.parse(readFileSync(process.env.PI_APPROVAL_TRANSPORT,'utf8'));
+const override=JSON.parse(readFileSync(${JSON.stringify(override)},'utf8'));
+writeFileSync(${JSON.stringify(injected)},JSON.stringify({...descriptor,...override}),{mode:0o600});
+const child=spawnSync(${JSON.stringify(agent.adapterConfig.command)},process.argv.slice(2),{env:{...process.env,PI_APPROVAL_TRANSPORT:${JSON.stringify(injected)}},stdio:'inherit'});
+unlinkSync(${JSON.stringify(injected)});
+process.exit(child.status ?? 1);
+`,{mode:0o700});
+      await json(`/api/agents/${agent.id}`,{adapterConfig:{...agent.adapterConfig,command:wrapper}},undefined,'PATCH');
+      try {
+        for(const overrideValue of [
+          {runId:'00000000-0000-4000-8000-000000000001'},
+          {taskId:'00000000-0000-4000-8000-000000000002'},
+          {companyId:'00000000-0000-4000-8000-000000000003'},
+          {agentId:'00000000-0000-4000-8000-000000000004'},
+          {instance:'http://127.0.0.1:9'},
+          {callbackUrl:'https://example.invalid'},
+          {expiresAt:'1970-01-01T00:00:00.000Z'},
+        ]) {
+          task=await newTask(`Reject forged approval transport: ${Object.keys(overrideValue)[0]}`);
+          writeFileSync(override,JSON.stringify(overrideValue),{mode:0o600});
+          const beforeCalls=calls;
+          const rejected=await invoke();
+          assert.equal(rejected.status,'failed',JSON.stringify(rejected));
+          assert.equal(calls,beforeCalls,'Forged scope must fail before the provider runs');
+          assert.equal(commits(),2);
+          await json(`/api/issues/${task.id}`,{status:'done'},undefined,'PATCH');
+        }
+        assert.equal((await interactions()).length,0);
+      } finally {
+        await json(`/api/agents/${agent.id}`,{adapterConfig:agent.adapterConfig},undefined,'PATCH');
+      }
+    }
+
+    // A human denial and later wake prevent the protected workspace effect.
+    {
+      task=await newTask('Deny the protected effect');
+      command='git commit --allow-empty -m "Denied effect"';
+      await invoke();
+      const pending=(await interactions()).find(card=>card.status==='pending');
+      assert.ok(pending);
+      const denied=await decisionRun(pending,'reject');
+      assert.match((await json(`/api/heartbeat-runs/${denied.id}/log?limitBytes=1048576`)).content,/Human request denied/);
+      assert.equal(commits(),2);
+      const replay=await invoke();
+      assert.match((await json(`/api/heartbeat-runs/${replay.id}/log?limitBytes=1048576`)).content,/Saved approval denied/);
+      assert.equal((await interactions()).length,1);
+      assert.equal(commits(),2);
+      await json(`/api/issues/${task.id}`,{status:'done'},undefined,'PATCH');
+    }
+
+    // Changing the operation withdraws the old card through the bridge.
+    {
+      task=await newTask('Withdraw changed operation scope');
+      command='git commit --allow-empty -m "Old scope"';
+      await invoke();
+      const old=(await interactions()).find(card=>card.status==='pending');
+      assert.ok(old);
+      command='git commit --allow-empty -m "Changed scope"';
+      await invoke();
+      const cards=await interactions();
+      assert.equal(cards.find(card=>card.id===old.id).status,'cancelled');
+      assert.equal(cards.filter(card=>card.status==='pending').length,1);
+      assert.equal(commits(),2);
+      await json(`/api/issues/${task.id}`,{status:'done'},undefined,'PATCH');
+    }
+
+    // Losing the real decision channel during a running Pi attempt never
+    // authorizes the pending operation, and reconnecting does not decide it.
+    {
+      task=await newTask('Keep approval blocked during channel loss');
+      command='git commit --allow-empty -m "Unavailable channel effect"';
+      await invoke();
+      const pending=(await interactions()).find(card=>card.status==='pending');
+      assert.ok(pending);
+      let releaseProvider;
+      providerPause=new Promise(resolve=>{releaseProvider=resolve;});
+      const reached=new Promise(resolve=>{providerReached=resolve;});
+      let disabled=false;
+      try {
+        const attempt=invoke();
+        await reached;
+        await json('/api/plugins/yelqo.outpost/disable',{});
+        disabled=true;
+        releaseProvider(); providerPause=undefined; providerReached=undefined;
+        const interrupted=await attempt;
+        assert.equal(interrupted.status,'failed');
+        assert.equal(commits(),2);
+        // pi-config bounds each channel request to ten seconds. Let the
+        // isolated attempt settle before re-establishing the decision channel.
+        await delay(15000);
+        await json('/api/plugins/yelqo.outpost/enable',{});
+        disabled=false;
+        await eventually(async()=>(await json(statusPath)).connected,20000);
+        assert.equal((await interactions()).find(card=>card.id===pending.id).status,'pending');
+        assert.equal(commits(),2,'Reconnection cannot approve the operation');
+        const wake=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{reason:'manual_approval_check',payload:{issueId:task.id}});
+        if(wake.id) {
+          const retry=await approvalRun(wake);
+          assert.match((await json(`/api/heartbeat-runs/${retry.id}/log?limitBytes=1048576`)).content,/Waiting for authenticated human response/);
+        } else {
+          // Active-run transport recovery belongs to the recovery milestone.
+          // Its retained lease may keep admission blocked after reconnection.
+          assert.equal(wake.status,'skipped');
+          assert.ok((await json(`/api/issues/${task.id}`)).executionBlocker);
+        }
+        assert.equal(commits(),2);
+        await json(`/api/issues/${task.id}`,{status:'done'},undefined,'PATCH');
+      } finally {
+        releaseProvider(); providerPause=undefined; providerReached=undefined;
+        if(disabled) await json('/api/plugins/yelqo.outpost/enable',{});
+      }
+    }
+  } finally {
+    daemon.kill('SIGTERM');
+    await eventually(async()=>!(await json(statusPath)).connected);
+  }
+});
+
 async function commandAgent(cwd,args,extra={}) {
   return json(`/api/companies/${company.id}/agents`,{
     name:'Execution fixture',role:'engineer',adapterType:'process',defaultEnvironmentId:registered.environmentId,

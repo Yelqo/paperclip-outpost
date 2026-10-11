@@ -13,8 +13,8 @@ runtime assets and workspace before dispatch.
 | Component | Supported version |
 | --- | --- |
 | Paperclip host and Pi adapter | `f858207161ba29c01c82f4674aef83d91b74480f` with `upstream/plugin-transport.patch` |
-| Plugin SDK / Outpost transport | `1.0.0+outpost.4` / `4` |
-| Outpost plugin and daemon | `0.4.0` |
+| Plugin SDK / Outpost transport | `1.0.0+outpost.5` / `5` |
+| Outpost plugin and daemon | `0.5.0` |
 | Pi | `1.0.3` (`@earendil-works/pi-coding-agent`) |
 | pi-config | `8f3a5726a254909a3100d8f719febc868237cd27` with `upstream/pi-config.patch` |
 | Worker Node / pi-config pnpm | `22.22.1` / `11.9.0` |
@@ -25,6 +25,11 @@ gateway as an operator-owned asset at `runtime/callback-bridge.mjs` inside the
 pi-config checkout. Use that prepared checkout's `scripts/paperclip-pi` as the
 adapter command. Installation and updates are explicit operator actions; runs
 consume the installed assets.
+
+Transport 5 requires the paired 0.5.0 plugin/daemon and the matching carried
+host patch. Prepare the host again when upgrading. The pins reject older
+combinations before work is admitted; transport 4's workspace queues and
+smaller reply frames are not compatible with this approval workflow.
 
 pi-config is currently private. Local preparation uses the operator's existing
 Git credential setup. CI needs the `PI_CONFIG_READ_TOKEN` repository secret,
@@ -105,7 +110,9 @@ runtime provisioning or overwrite local runtime files.
 The host creates a callback transport descriptor as an execution-interface
 field, separate from ordinary environment values. It contains the registered
 instance, company, agent, task, run, unique per-run queue directory, bridge
-token and expiry. The daemon checks registration/run scope and the deadline,
+token and expiry. Queues live beneath `machineSessionDir`, outside workspace
+and scratch roots, in a locally registered writable runtime root. The daemon
+checks registration/run scope, the runtime root and the deadline,
 then exposes one private descriptor file read-only inside the otherwise hidden
 connection directory. It never forwards the machine or access-layer credentials.
 
@@ -121,7 +128,35 @@ Task reads and progress use pi-config's `paperclip_coordination` tool. The actua
 Paperclip queue worker retains its route allowlist and forwards with the host's
 run token and fixed run attribution. Pi receives only the per-run bridge token.
 The existing bounded-progress and approval scope/consumption checks remain in
-pi-config. Full human approval continuation acceptance is a separate milestone.
+pi-config.
+
+## Human approvals
+
+When Pi requests a protected operation, pi-config publishes a human-only
+confirmation on the assigned task through the existing interaction routes.
+The task enters `in_review` and Pi ends the run without executing the operation.
+Approve or deny the card in Paperclip. Its `wake_assignee` continuation uses
+Paperclip's normal wake flow and reuses the Pi session in the same environment
+and workspace across per-run leases.
+
+Acceptance authorizes only the exact configured instance, company, agent,
+task, worker generation and operation scope. pi-config revalidates policy,
+workspace contents, executable evidence and the authenticated human decision
+before consuming the grant and again before execution. Consumption is durable
+and single use; a duplicate decision or wake cannot reuse it. Denial blocks
+the operation. Changing the requested command or its evidence invalidates the
+old local proposal and withdraws a pending card through the bridge.
+
+Callback queues and session files stay outside the workspace, and descriptor
+protection uses stable directories. A new run's transport token and private
+filename therefore do not invalidate an otherwise unchanged operation scope.
+They also do not replace the configured instance identity or grant tool access
+to runtime state. If the decision channel is unavailable, the operation stays
+blocked. Reconnection supplies transport connectivity, never human approval.
+
+The transport admits commands up to 60,000 serialized bytes within the host's
+64 KiB outbound frame budget, including normal approval wake context. Larger
+commands fail before dispatch; the machine-to-host frame limit remains 16 KiB.
 
 ## Acceptance
 
@@ -131,4 +166,7 @@ deterministic OpenAI-compatible HTTP fixture supplies model responses. It
 checks assigned-task reads, bounded progress, forbidden configuration access,
 isolated tool execution, persistent workspace effects and Git history, unchanged
 local provider files, repeat tasks, and rejection of injected loopback URLs.
+Approval acceptance additionally observes pending cards, session reuse, actual
+allowed/denied Git effects, consumed grants, scope withdrawal, forged transport
+context and decision-channel interruption through this same workflow.
 No paid provider or external repository/service mutation is required.
