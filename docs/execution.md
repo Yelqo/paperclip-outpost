@@ -260,7 +260,13 @@ alive until its original deadline plus the existing 10-second reconciliation
 grace. Reconnection resumes delivery, never dispatch. If the plugin worker or
 host restarts, or that grace expires, the heartbeat attempt can fail; recovered
 output and terminal receipts remain inspectable and never rewrite a completed
-attempt. Daemon interruption reports verified process loss as before.
+attempt. Grace expiry after dispatch reports `EXECUTION_OUTCOME_UNCERTAIN`;
+Paperclip records `execution_outcome_uncertain` and blocks automatic recovery,
+including Pi conversation continuation. A late output-limit receipt remains
+visible in execution history while the completed heartbeat keeps its uncertainty
+classification. Continuing requires a separate operator-authorized attempt
+after the previous operation's ownership is resolved. Daemon interruption
+reports verified process loss as before.
 
 The operator's outpost status API exposes `outputRetention` (retained bytes,
 operation count and configured bounds) while connected. Saved output is

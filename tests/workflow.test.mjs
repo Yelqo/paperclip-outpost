@@ -373,7 +373,7 @@ test('actual Pi human approvals preserve continuation, scope and one-time author
     await json(`/api/issues/${task.id}/interactions/${card.id}/${decision}`,{});
     let continuation;
     await eventually(async()=>{
-      continuation=(await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`)).find(run=>!before.has(run.id));
+      continuation=(await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`)).find(run=>!before.has(run.id) && run.contextSnapshot?.interactionId===card.id);
       if(!continuation) {
         const observed=await json(`/api/issues/${task.id}`);
         const pendingRun=observed.scheduledRetry?.runId ?? observed.executionRunId;
@@ -558,18 +558,18 @@ process.exit(child.status ?? 1);
 });
 
 async function commandAgent(cwd,args,extra={}) {
-  const {defaultEnvironmentId=registered.environmentId,...adapterConfig}=extra;
+  const {defaultEnvironmentId=registered.environmentId,adapterType='process',...adapterConfig}=extra;
   return json(`/api/companies/${company.id}/agents`,{
-    name:'Execution fixture',role:'engineer',adapterType:'process',defaultEnvironmentId,
+    name:'Execution fixture',role:'engineer',adapterType,defaultEnvironmentId,
     adapterConfig:{command:'/bin/sh',args:['-c',args],cwd,timeoutSec:5,...adapterConfig},
   });
 }
-async function terminalRun(run) {
+async function terminalRun(run,timeout=15000) {
   let outcome;
   await eventually(async () => {
     outcome=await json(`/api/heartbeat-runs/${run.id}`);
     return !['queued','running'].includes(outcome.status);
-  });
+  },timeout);
   return outcome;
 }
 
@@ -620,19 +620,20 @@ test('execution rejects a missing workspace without creating it',async () => {
   } finally { await stopExecutionDaemon(daemon); }
 });
 
-async function installExecutionAdapter() {
-  const fixture=join(home,'execution-adapter');
+async function installExecutionAdapter(adapterType='process') {
+  const fixture=join(home,`${adapterType}-execution-adapter`);
   mkdirSync(fixture,{recursive:true});
-  writeFileSync(join(fixture,'package.json'),JSON.stringify({name:'@yelqo/acceptance-execution-adapter',version:'1.0.0',type:'module',main:'index.mjs'}));
-  copyFileSync(join(root,'tests/fixtures/execution-adapter.mjs'),join(fixture,'index.mjs'));
+  writeFileSync(join(fixture,'package.json'),JSON.stringify({name:`@yelqo/acceptance-${adapterType}-execution-adapter`,version:'1.0.0',type:'module',main:'index.mjs'}));
+  copyFileSync(join(root,'tests/fixtures/execution-adapter.mjs'),join(fixture,'execution.mjs'));
+  writeFileSync(join(fixture,'index.mjs'),`import {createServerAdapter as adapter} from './execution.mjs';\nexport function createServerAdapter() { return adapter(${JSON.stringify(adapterType)}); }\n`);
   await json('/api/adapters/install',{packageName:fixture,isLocalPath:true});
-  await json('/api/adapters/process/override',{paused:false},cookie,'PATCH');
+  await json(`/api/adapters/${adapterType}/override`,{paused:false},cookie,'PATCH');
 }
-async function removeExecutionAdapter() {
+async function removeExecutionAdapter(adapterType='process') {
   // The pinned host retains process overrides on uninstall; pause it through
   // the public API first so following tests use the built-in process adapter.
-  await json('/api/adapters/process/override',{paused:true},cookie,'PATCH');
-  const response=await api('/api/adapters/process',undefined,cookie,'DELETE');
+  await json(`/api/adapters/${adapterType}/override`,{paused:true},cookie,'PATCH');
+  const response=await api(`/api/adapters/${adapterType}`,undefined,cookie,'DELETE');
   assert.ok(response.ok,await response.text());
 }
 
@@ -842,8 +843,7 @@ test('execution stops at its output limit and retains the workspace',async () =>
   } finally { await stopExecutionDaemon(daemon); await removeExecutionAdapter(); }
 });
 
-test('a disconnected execution recovers ordered output and succeeds without another launch', {timeout:60000}, async t => {
-  await installExecutionAdapter();
+async function bufferedOutpost(t,name,daemonArgs=[]) {
   let blocked=false;
   const sockets=new Set();
   const proxy=createTCPServer(client => {
@@ -858,33 +858,47 @@ test('a disconnected execution recovers ordered output and succeeds without anot
   });
   await new Promise(resolve=>proxy.listen(0,'127.0.0.1',resolve));
   t.after(()=>{for(const socket of sockets) socket.destroy(); proxy.close();});
-  const privatePath=join(home,'buffered-private');
+  const privatePath=join(home,`${name}-private`);
   const enrollment=spawn(join(root,'bin/outpost'),['register','--instance',`http://127.0.0.1:${proxy.address().port}`,'--company',company.id,
-    '--name','Buffered worker','--private-dir',privatePath,'--workspace-root',join(home,'workspaces'),'--scratch-root',join(home,'scratch')]);
+    '--name',name,'--private-dir',privatePath,'--workspace-root',join(home,'workspaces'),'--scratch-root',join(home,'scratch')]);
   let enrolled='',enrollmentError='';
   enrollment.stdout.on('data',data=>{enrolled+=data;});
   enrollment.stderr.on('data',data=>{enrollmentError+=data;});
   enrollment.stdin.end(JSON.stringify({operatorAuthorization:`Bearer ${boardToken}`}));
   assert.equal(await new Promise(resolve=>enrollment.once('close',resolve)),0,enrollmentError);
   const outpost=JSON.parse(enrolled);
-  const daemon=spawn(join(root,'bin/outpost'),['daemon','--private-dir',privatePath],{stdio:['ignore','pipe','pipe']});
+  const daemon=spawn(join(root,'bin/outpost'),['daemon','--private-dir',privatePath,...daemonArgs],{stdio:['ignore','pipe','pipe']});
   processes.push(daemon);
-  const workspace=join(home,'workspaces','buffered-output'); mkdirSync(workspace);
   const statusPath=`/api/plugins/yelqo.outpost/api/outposts/${outpost.outpostId}?companyId=${company.id}`;
+  t.after(async ()=>{
+    blocked=false;
+    if(daemon.exitCode===null && daemon.signalCode===null) {
+      daemon.kill('SIGTERM');
+      await new Promise(resolve=>daemon.once('exit',resolve));
+    }
+  });
+  await eventually(async ()=>(await json(statusPath)).executionReady);
+  return {outpost,statusPath,disconnect(){blocked=true; for(const socket of sockets) socket.destroy();},reconnect(){blocked=false;}};
+}
+
+test('a disconnected execution recovers ordered output and succeeds without another launch', {timeout:60000}, async t => {
+  await installExecutionAdapter();
+  const transport=await bufferedOutpost(t,'buffered-output');
+  const {outpost,statusPath}=transport;
+  const workspace=join(home,'workspaces','buffered-output'); mkdirSync(workspace);
   try {
-    await eventually(async ()=>(await json(statusPath)).executionReady);
     const agent=await commandAgent(workspace,'echo launch >> launches; printf start; while ! test -e release; do sleep .1; done; printf \'{"ok":true}\\n\'; printf recovered-error >&2; echo completed > completed',{defaultEnvironmentId:outpost.environmentId,timeoutSec:30});
     const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{});
     await eventually(async ()=>{
       const response=await api(`/api/heartbeat-runs/${run.id}/log`);
       return response.ok && (await response.json()).content.includes('start');
     });
-    blocked=true; for(const socket of sockets) socket.destroy();
+    transport.disconnect();
     await eventually(async ()=>!(await json(statusPath)).connected);
     writeFileSync(join(workspace,'release'),'');
     await eventually(()=>existsSync(join(workspace,'completed')));
     assert.equal((await json(`/api/heartbeat-runs/${run.id}`)).status,'running');
-    blocked=false;
+    transport.reconnect();
     const outcome=await terminalRun(run);
     assert.equal(outcome.status,'succeeded',JSON.stringify(outcome));
     assert.equal(outcome.resultJson.stdout,'start{"ok":true}\n');
@@ -895,7 +909,55 @@ test('a disconnected execution recovers ordered output and succeeds without anot
     const record=status.executionHistory.find(record=>record.runId===run.id);
     const retained=await json(`${statusPath.replace('?','/output?')}&operationId=${encodeURIComponent(record.operationId)}`);
     assert.equal(retained.chunks.filter(chunk=>chunk.stream==='stdout').map(chunk=>Buffer.from(chunk.data,'base64').toString()).join(''),'start{"ok":true}\n');
-  } finally { blocked=false; daemon.kill('SIGTERM'); await removeExecutionAdapter(); }
+  } finally { transport.reconnect(); await removeExecutionAdapter(); }
+});
+
+test('late recovered exhaustion cannot automatically continue a Pi task after grace expiry', {timeout:90000}, async t => {
+  await installExecutionAdapter('pi_local');
+  const transport=await bufferedOutpost(t,'late-exhaustion',['--output-buffer-bytes','4096','--output-total-bytes','8192']);
+  const {outpost,statusPath}=transport;
+  const workspace=join(home,'workspaces','late-exhaustion'); mkdirSync(workspace);
+  try {
+    const agent=await commandAgent(workspace,'echo launch >> launches; printf started; while ! test -e exhaust; do sleep .1; done; (sleep 2; echo escaped > escaped) & yes output',
+      {adapterType:'pi_local',defaultEnvironmentId:outpost.environmentId});
+    const task=await json(`/api/companies/${company.id}/issues`,{title:'Late exhaustion requires operator continuation',status:'in_progress',assigneeAgentId:agent.id});
+    await eventually(async ()=>{
+      const runs=await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`);
+      if(!runs[0]) return false;
+      const response=await api(`/api/heartbeat-runs/${runs[0].id}/log`);
+      return response.ok && (await response.json()).content.includes('started');
+    });
+    const [run]=await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`);
+    transport.disconnect();
+    await eventually(async ()=>!(await json(statusPath)).connected);
+    writeFileSync(join(workspace,'exhaust'),'');
+    let outcome;
+    await eventually(async ()=>{outcome=await json(`/api/heartbeat-runs/${run.id}`); return outcome.status==='failed';},30000);
+    assert.equal(outcome.errorCode,'execution_outcome_uncertain',JSON.stringify(outcome));
+    assert.match(outcome.error,/outcome is uncertain/);
+    assert.equal(outcome.resultJson.conversationContinuation,'continue_conversation_v1','exercise the Pi recovery policy that bypasses the legacy hold');
+    transport.reconnect();
+    let receipt;
+    await eventually(async ()=>{
+      const status=await json(statusPath);
+      receipt=status.executionHistory.find(record=>record.runId===run.id);
+      return status.executionReady && receipt?.status==='terminal' && status.outputRetention?.operations===0;
+    });
+    assert.equal(receipt.outcome.error,'output limit exceeded');
+    const recovered=await json(`${statusPath.replace('?','/output?')}&operationId=${encodeURIComponent(receipt.operationId)}`);
+    assert.ok(recovered.receipt.bytes>0 && recovered.receipt.bytes<4096);
+    assert.equal((await json(`/api/heartbeat-runs/${run.id}`)).errorCode,'execution_outcome_uncertain','late receipts must not rewrite completed attempts');
+    // The real scheduler runs every 10 seconds. Observe two sweeps after the
+    // recovered terminal receipt has released the workspace fence.
+    await delay(21000);
+    const runs=await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`);
+    assert.equal(runs.length,1,'conversation continuation must not create a replacement run');
+    const observed=await json(`/api/issues/${task.id}`);
+    assert.equal(observed.status,'blocked','the periodic recovery sweep must recognize the nonretryable failure');
+    assert.equal(observed.scheduledRetry,null);
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'launch\n');
+    assert.equal(existsSync(join(workspace,'escaped')),false,'buffer exhaustion must stop descendants');
+  } finally { transport.reconnect(); await removeExecutionAdapter('pi_local'); }
 });
 
 test('execution refuses to launch when durable intent cannot be written',async () => {
@@ -925,7 +987,9 @@ test('daemon interruption reports verified process loss and frees the workspace 
     });
     daemon.kill('SIGKILL');
     await eventually(async () => !(await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).connected);
-    await terminalRun(run);
+    // A disconnected request remains pending through its 5-second deadline
+    // and 10-second grace period; leave room for host finalization afterward.
+    await terminalRun(run,20000);
     daemon=await startExecutionDaemon();
     let recovered;
     await eventually(async () => {

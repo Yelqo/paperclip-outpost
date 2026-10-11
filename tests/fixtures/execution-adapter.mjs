@@ -1,8 +1,8 @@
 // Installed through Paperclip's public adapter API. This adapter exercises the
 // execution-driver contract; assertions remain at public runs, logs and files.
-export function createServerAdapter() {
+export function createServerAdapter(adapterType='process') {
   return {
-    type:'process',runtimeToolDelivery:'environment',models:[],
+    type:adapterType,runtimeToolDelivery:'environment',models:[],
     async execute({runId,config,executionTarget,onLog}) {
       const runner=executionTarget?.runner;
       if(!runner) throw new Error('A real environment execution driver is required');

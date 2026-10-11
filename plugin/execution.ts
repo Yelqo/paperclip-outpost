@@ -27,6 +27,9 @@ type Pending = {
 function unavailable(message:string):Error {
   return Object.assign(new Error(message),{code:PLUGIN_RPC_ERROR_CODES.EXECUTION_UNAVAILABLE});
 }
+function uncertain(message:string):Error {
+  return Object.assign(new Error(message),{code:PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTCOME_UNCERTAIN});
+}
 
 function object(value:unknown):Record<string,unknown> {
   if(!value || typeof value!=="object" || Array.isArray(value)) throw new Error("Invalid Outpost response");
@@ -72,7 +75,7 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
       const dispose = () => { clearTimeout(timer); pending.delete(requestId); const queue=queues.get(key(companyId,outpostId)); if(queue) queues.set(key(companyId,outpostId),queue.filter(value => value.requestId !== requestId)); };
       const timer = setTimeout(() => {
         const sent=pending.get(requestId)?.sent && request.type==="execute";
-        dispose(); reject(sent ? new Error("Outpost operation outcome is uncertain") : unavailable("Outpost unavailable before dispatch"));
+        dispose(); reject(sent ? uncertain("Outpost operation outcome is uncertain") : unavailable("Outpost unavailable before dispatch"));
       },Math.max(10000,Date.parse(request.deadline)-Date.now()+10000));
       pending.set(requestId,{
         outpostId,companyId,sent:false,outputSequence:0,onSent,identity:request.type==="execute" ? request : undefined,
@@ -122,8 +125,8 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
       }
     } else request?.deliver(frame);
   };
-  const close = (companyId:string,outpostId:string,permanent=false) => {
-    for (const request of [...pending.values()]) if (request.companyId===companyId && request.outpostId===outpostId && (permanent || !request.sent || !request.identity)) request.reject(request.sent && request.identity ? new Error("Outpost disconnected; operation outcome is uncertain") : unavailable("Outpost disconnected before launch"));
+  const close = (companyId:string,outpostId:string) => {
+    for (const request of [...pending.values()]) if (request.companyId===companyId && request.outpostId===outpostId && (!request.sent || !request.identity)) request.reject(unavailable("Outpost disconnected before launch"));
     queues.delete(key(companyId,outpostId));
   };
   const reconcile = (companyId:string,outpostId:string,record:ExecutionRecord) => {
@@ -226,7 +229,7 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
         settle();
         // Setup controls can defer too, but an outstanding operation or an
         // already executed agent makes a replacement run unsafe.
-        if(lease.executedAgent || lease.operations.size>0) throw new Error(error.message);
+        if(lease.executedAgent || lease.operations.size>0) throw uncertain(error.message);
       }
       throw error;
     }
@@ -237,6 +240,7 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
       if(stream==="stdout") stdout+=chunk; else stderr+=chunk;
       if(chunk) log(stream,chunk);
     }
+    if (result.ownershipUncertain===true) throw uncertain(result.error ?? "Outpost operation outcome is uncertain");
     if (result.error) throw Object.assign(new Error(result.error),result.error==="output limit exceeded" ? {code:PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTPUT_LIMIT} : {});
     return {...result,stdout,stderr};
   };
