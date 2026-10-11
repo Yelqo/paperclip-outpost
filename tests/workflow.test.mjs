@@ -52,7 +52,7 @@ function providerResponse(res, delta, finishReason) {
   res.end('data: [DONE]\n\n');
 }
 
-before(async () => {
+async function startHost() {
   server = spawn(process.execPath, ['--import', 'tsx', 'src/index.ts'], {
     cwd: join(host, 'server'), env: {
       ...process.env, PAPERCLIP_HOME: home, PAPERCLIP_INSTANCE_ID: 'acceptance',
@@ -71,6 +71,10 @@ before(async () => {
     if (server.exitCode !== null) throw new Error(`Host exited: ${logs.slice(-5000)}`);
     try { return (await fetch(origin + '/api/health')).ok; } catch { return false; }
   }, 90000);
+}
+
+before(async () => {
+  await startHost();
   const signup = await api('/api/auth/sign-up/email', {name:'Operator', email:'operator@outpost.test', password:'fixture-password-123'});
   assert.ok(signup.ok, await signup.text());
   cookie = signup.headers.getSetCookie().map(value => value.split(';')[0]).join('; ');
@@ -945,6 +949,39 @@ test('disconnected cancellation remains unconfirmed and blocks conflicting work 
   assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'launch\n');
   const continuation=await commandAgent(workspace,'echo continued > continued',{defaultEnvironmentId:outpost.environmentId});
   assert.equal((await terminalRun(await json(`/api/agents/${continuation.id}/heartbeat/invoke`,{}))).status,'succeeded');
+});
+
+test('pending cancellation survives graceful host restart and reconciles the original run', {timeout:120000}, async t => {
+  const transport=await bufferedOutpost(t,'cancel-host-restart');
+  const workspace=join(home,'workspaces','cancel-host-restart'); mkdirSync(workspace);
+  const agent=await commandAgent(workspace,'echo launch >> launches; while :; do echo alive >> progress; sleep .1; done',
+    {defaultEnvironmentId:transport.outpost.environmentId,timeoutSec:90});
+  const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{});
+  await eventually(()=>existsSync(join(workspace,'progress')));
+  transport.disconnect();
+  await eventually(async ()=>!(await json(transport.statusPath)).connected);
+  const requested=await json(`/api/heartbeat-runs/${run.id}/cancel`,{});
+  assert.equal(requested.status,'running');
+  assert.equal(requested.resultJson.executionCancellation.state,'requested');
+  server.kill('SIGTERM');
+  await Promise.race([new Promise(resolve=>server.once('exit',resolve)),delay(25000)]);
+  assert.ok(server.exitCode!==null || server.signalCode!==null,'host must finish graceful shutdown');
+  const progress=readFileSync(join(workspace,'progress'),'utf8');
+  await delay(300);
+  assert.ok(readFileSync(join(workspace,'progress'),'utf8').length>progress.length,'host shutdown has not stopped the remote process');
+  await startHost();
+  const pending=await json(`/api/heartbeat-runs/${run.id}`);
+  assert.equal(pending.status,'running','host shutdown cannot establish remote termination');
+  assert.equal(pending.resultJson.executionCancellation.state,'requested');
+  assert.equal(pending.resultJson.executionCancellation.proof,'machine_pending');
+  transport.reconnect();
+  const stopped=await terminalRun(run,35000);
+  assert.equal(stopped.status,'cancelled',JSON.stringify(stopped));
+  assert.equal(stopped.resultJson.executionCancellation.state,'acknowledged');
+  assert.equal(stopped.resultJson.executionCancellation.proof,'machine_termination');
+  assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'launch\n');
+  const runs=await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`);
+  assert.equal(runs.length,1,'host restart must not create a replacement attempt');
 });
 
 test('completion during an outage wins over cancellation and stays unconfirmed beyond the RPC grace period', {timeout:90000}, async t => {
