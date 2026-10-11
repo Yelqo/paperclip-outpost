@@ -194,8 +194,10 @@ func (s *supervisor) reconcileExpected(expected executionRecord) (executionRecor
 	if exists && (local.RunID != expected.RunID || local.Purpose != expected.Purpose || local.Workspace != expected.Workspace || local.Deadline != expected.Deadline) {
 		return executionRecord{}, errors.New("conflicting execution history identity")
 	}
+	// Startup may already have established interruption from a reboot. That
+	// proves process loss, but cannot repair process evidence lost to rollback.
 	if !exists || expected.HistoryMissing || (expected.Outcome != nil && !reflect.DeepEqual(expected.Outcome, local.Outcome)) ||
-		(expected.ProcessStart != "" && local.ProcessStart != expected.ProcessStart && local.Outcome == nil) {
+		(expected.ProcessStart != "" && local.ProcessStart != expected.ProcessStart) {
 		local = expected
 		local.Outcome = nil
 		local.Status = "uncertain"

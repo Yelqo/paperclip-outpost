@@ -161,6 +161,76 @@ func TestRebootReportsInterruptionWithoutRepeatingLaunch(t *testing.T) {
 	requireExecutionSuccess(t, handleResult(t, restarted, f.operation("next", "next", "agent_execution")))
 }
 
+func TestRebootReconciliationPreservesObservedProcessHistory(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		localStart    string
+		expectedStart string
+		wantFence     bool
+	}{
+		{"missing process evidence", "", "observed-start", true},
+		{"regressed process evidence", "older-start", "observed-start", true},
+		{"retained process evidence", "observed-start", "observed-start", false},
+		{"unobserved process evidence", "", "", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newExecutionFixture(t)
+			op := f.operation("previous", "snapshot-operation", "agent_execution")
+			local := executionRecord{RunID: op.RunID, OperationID: op.OperationID, Purpose: op.Purpose,
+				Workspace: f.identity, Deadline: op.Deadline, BootID: "previous-boot", Status: "uncertain"}
+			if test.localStart != "" {
+				local.ProcessID, local.ProcessStart = 12345, test.localStart
+			}
+			if err := f.supervisor.persist(local, true); err != nil {
+				t.Fatal(err)
+			}
+			// The restored journal can predate process evidence already witnessed
+			// by Paperclip. Startup observes a reboot and synthesizes interruption.
+			expected := local
+			if test.expectedStart != "" {
+				expected.ProcessID, expected.ProcessStart, expected.Status = 12345, test.expectedStart, "running"
+			}
+			closeTestSupervisor(f.supervisor)
+			restarted, err := newSupervisor(f.supervisor.dir, f.supervisor.connection)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeTestSupervisor(restarted)
+			record, err := restarted.reconcileExpected(expected)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if record.HistoryMissing != test.wantFence {
+				t.Errorf("reboot reconciliation lost the history comparison: %+v", record)
+			}
+			if !test.wantFence {
+				if record.Status != "interrupted" || record.Outcome == nil || !record.Outcome.Interrupted {
+					t.Fatalf("intact history did not establish interruption: %+v", record)
+				}
+				requireExecutionSuccess(t, handleResult(t, restarted, f.operation("next", "next", "agent_execution")))
+				return
+			}
+			if record.Status != "uncertain" || record.Outcome != nil {
+				t.Errorf("regressed history was reported as terminated: %+v", record)
+			}
+			for _, run := range []string{"previous", "next"} {
+				if result := handleResult(t, restarted, f.operation(run, run+":control", "control")); result["errorCode"] != "execution_unavailable" {
+					t.Errorf("regressed history allowed %s to launch: %v", run, result)
+				}
+			}
+			closeTestSupervisor(restarted)
+			fenced, err := newSupervisor(f.supervisor.dir, f.supervisor.connection)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeTestSupervisor(fenced)
+			if result := handleResult(t, fenced, f.operation("next", "after-restart", "agent_execution")); result["errorCode"] != "execution_unavailable" {
+				t.Errorf("restart lost the durable history fence: %v", result)
+			}
+		})
+	}
+}
+
 func TestMissingHistoryFenceSurvivesRepeatedReconciliation(t *testing.T) {
 	f := newExecutionFixture(t)
 	op := f.operation("previous", "missing-operation", "agent_execution")
