@@ -31,6 +31,8 @@ against a pinned upstream commit. [Pi integration](docs/pi.md) uses machine-owne
 runtime assets, scoped callbacks and human approval continuation with session
 reuse. [Standalone installation and a durable worker-account systemd service](docs/service.md)
 support boot startup and recovery without replay.
+Operator-managed upgrades drain active runs and their controls before replacing
+the selected binary; explicit forced stops verify interruption before recovery.
 
 The design was reconstructed with the operator on 2026-10-06. Its documents
 distinguish accepted decisions from source findings and proposed integration

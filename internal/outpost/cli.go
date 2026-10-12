@@ -2,6 +2,7 @@ package outpost
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -49,9 +50,9 @@ type enrollment struct {
 
 func Run(args []string, input io.Reader, output io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: outpost version|service-install|service-status|configure|check|register|connect|daemon|diagnose|status|protect")
+		return errors.New("usage: outpost version|service-install|service-status|service-drain|service-upgrade|service-stop|configure|check|upgrade-check|register|connect|daemon|drain|resume|diagnose|status|protect")
 	}
-	if args[0] == "service-install" || args[0] == "service-status" {
+	if strings.HasPrefix(args[0], "service-") {
 		return manageService(args, output)
 	}
 	f := flag.NewFlagSet(args[0], flag.ContinueOnError)
@@ -167,6 +168,34 @@ func Run(args []string, input io.Reader, output io.Writer) error {
 	}
 	c.OutputBufferBytes, c.OutputTotalBytes = *outputBuffer, *outputTotal
 	switch args[0] {
+	case "drain":
+		return setLifecycle(*privateDir, "draining", output)
+	case "stop-intent":
+		return persistLifecycle(*privateDir, lifecycleState{Status: "draining", ForceStop: true}, output)
+	case "resume":
+		return setLifecycle(*privateDir, "running", output)
+	case "upgrade-check":
+		err := session(context.Background(), c, io.Discard, false, nil)
+		if err != nil && !errors.Is(err, errAlreadyConnected) {
+			return err
+		}
+		return json.NewEncoder(output).Encode(map[string]string{"status": "compatible"})
+	case "verify-stopped":
+		s, err := newSupervisor(*privateDir, c)
+		if err != nil {
+			return err
+		}
+		defer s.lock.Close()
+		records, err := s.recoveryReports(true)
+		if err != nil {
+			return err
+		}
+		for _, record := range records {
+			if record.Outcome == nil || record.Outcome.OwnershipUncertain || record.HistoryMissing {
+				return errors.New("process termination or durable history is uncertain; inspect Paperclip execution history before restart")
+			}
+		}
+		return json.NewEncoder(output).Encode(map[string]string{"status": "termination-confirmed"})
 	case "protect":
 		return protect(*privateDir, c, f.Args(), output)
 	case "diagnose":

@@ -16,9 +16,10 @@ type daemonStatus struct {
 	ProcessID    int       `json:"processId"`
 	ProcessStart string    `json:"processStart"`
 	BootID       string    `json:"bootId"`
+	Lifecycle    string    `json:"lifecycle,omitempty"`
 }
 
-func writeDaemonStatus(dir, status string) error {
+func writeDaemonStatus(dir, status string, lifecycle ...string) error {
 	start, _, err := processIdentity(os.Getpid())
 	boot, bootErr := os.ReadFile("/proc/sys/kernel/random/boot_id")
 	if err != nil || bootErr != nil {
@@ -29,7 +30,11 @@ func writeDaemonStatus(dir, status string) error {
 		return errors.New("cannot write protected daemon status")
 	}
 	defer os.Remove(file.Name())
-	err = json.NewEncoder(file).Encode(daemonStatus{status, time.Now().UTC(), os.Getpid(), start, strings.TrimSpace(string(boot))})
+	state := ""
+	if len(lifecycle) > 0 {
+		state = lifecycle[0]
+	}
+	err = json.NewEncoder(file).Encode(daemonStatus{status, time.Now().UTC(), os.Getpid(), start, strings.TrimSpace(string(boot)), state})
 	closeErr := file.Close()
 	if err != nil || closeErr != nil || os.Rename(file.Name(), filepath.Join(dir, "daemon-status.json")) != nil {
 		return errors.New("cannot update protected daemon status")
@@ -55,9 +60,20 @@ func connectionStatus(dir string, c Connection, output io.Writer) error {
 			}
 		}
 	}
+	state, err := readLifecycle(dir)
+	if err != nil {
+		return err
+	}
+	lifecycle := state.Status
+	if lifecycle == "draining" && status == "connected" && recorded.Lifecycle == "drained" {
+		if requestedAt := lifecycleRequestedAt(dir); !requestedAt.IsZero() && recorded.UpdatedAt.After(requestedAt) {
+			lifecycle = "drained"
+		}
+	}
 	return json.NewEncoder(output).Encode(map[string]any{
 		"status": status, "updatedAt": recorded.UpdatedAt,
-		"instance": c.Instance, "companyId": c.CompanyID, "outpostId": c.OutpostID,
+		"lifecycle": lifecycle,
+		"instance":  c.Instance, "companyId": c.CompanyID, "outpostId": c.OutpostID,
 		"environmentId": c.EnvironmentID, "versions": supported,
 	})
 }

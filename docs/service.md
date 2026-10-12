@@ -72,7 +72,6 @@ destination binary. It does not replace or restart an existing installation.
 New installation directories use mode 0755 even with a restrictive operator
 umask. Existing parents must already allow worker traversal; the installer
 does not loosen their permissions.
-Ordinary drain/upgrade management belongs to the subsequent lifecycle milestone.
 If enable/start fails after files are installed, inspect `service-status` and
 the journal, correct the local problem, then run:
 
@@ -137,6 +136,91 @@ See the upstream [service](https://www.freedesktop.org/software/systemd/man/late
 and [process termination](https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html)
 documentation for the unit settings.
 
+## Operator-managed upgrades
+
+Download and verify the explicit selected release as above. Invoke management
+from an installed or downloaded standalone binary, with root authority:
+
+```sh
+sudo /opt/paperclip-outpost/0.8.0/outpost service-upgrade \
+  --binary /absolute/download/selected-outpost --version SELECTED_VERSION
+```
+
+The command stages the binary in a protected installation directory and checks
+its reported version and authenticated host/plugin compatibility as the worker
+before changing admission. A rejected candidate leaves the installed service
+running. The command never downloads a release or selects a moving latest version.
+
+Ordinary upgrades then stop admitting new agent runs. Paperclip retains new work
+through its existing execution-unavailable retry scheduling. Already active runs,
+their callback bridge and associated controls continue within their original
+deadlines and output limits. Drain completion requires settled machine outcomes,
+acknowledged output and released Paperclip run leases. Uncertain ownership or
+lost connectivity prevents completion rather than authorizing replacement.
+
+After draining, the command stops systemd, verifies its process group and durable
+history, atomically installs the selected executable, updates the unit and
+installation metadata, checks compatibility again, resumes admission and starts
+the service. Success means the selected daemon has reconnected. Previous releases
+remain installed; selecting the same version explicitly reinstalls it. Workspaces,
+local provider credentials, protected connection state, buffered output and
+execution/approval history are retained.
+
+Compatibility currently requires exact matching host, SDK, protocol and
+plugin/daemon release pins. When changing the instance-side release too, drain
+**before** updating that plugin/host:
+
+```sh
+sudo /opt/paperclip-outpost/0.8.0/outpost service-drain
+# Install the selected matching Outpost plugin and supported Paperclip host.
+sudo /absolute/download/selected-outpost service-upgrade \
+  --binary /absolute/download/selected-outpost --version SELECTED_VERSION
+```
+
+The old daemon may reject reconnection once the plugin changes; its completed
+history and persisted drain remain available to management. A stopped service
+can be upgraded only when termination and durable history are confirmed. These
+commands require an installed daemon with lifecycle support; an older installation
+without it needs a separately planned shutdown.
+
+`--timeout` defaults to 70 minutes and accepts a positive duration up to two
+hours. A drain timeout leaves the old service running and admission drained;
+it does not shorten an active run's original limits. Inspect `service-status`
+and Paperclip history, then retry. To abandon a drain, run:
+
+```sh
+sudo -H -u worker /opt/paperclip-outpost/0.8.0/outpost resume \
+  --private-dir /home/worker/.outpost-private
+```
+
+The worker's `drain` command requests draining without waiting; `status` exposes
+`lifecycle` as `running`, `draining` or `drained`. A drain survives daemon restart.
+`service-drain` waits for completion without replacing or stopping the service.
+`service-stop` ordinarily waits for the same drain before stopping.
+
+To explicitly interrupt active work, use `service-stop --force` or
+`service-upgrade --force`.
+
+The command persists forced-stop intent before signalling the service process
+group. Affected operations record interruption even if their launcher exits
+before the daemon handles its own signal; completed history remains unchanged.
+
+```sh
+sudo /opt/paperclip-outpost/0.8.0/outpost service-stop --force
+# Or select a replacement and explicitly interrupt rather than drain:
+sudo /opt/paperclip-outpost/0.8.0/outpost service-upgrade --force \
+  --binary /absolute/download/selected-outpost --version SELECTED_VERSION
+```
+
+Forced stop waits for process-tree termination and durable interruption evidence.
+Interrupted attempts are reported on reconnect without replay. A forced
+`service-stop` keeps admission drained on a later manual service start; use
+`resume` deliberately after inspecting recovery. Unconfirmed termination blocks
+replacement. Failed replacement or compatibility revalidation leaves the service
+stopped and drained, with an actionable error. Inspect the selected version,
+unit and journal, correct the problem and retry `service-upgrade`; startup never
+accepts work under incompatible pins.
+
 ## Diagnosis and recovery
 
 `service-status` prints selected version, durable binary path, worker, private
@@ -185,9 +269,12 @@ OUTPOST_SYSTEMD_ACCEPTANCE=1 node --test \
 The test removes the downloaded binary, observes the durable service under the
 worker UID, records a workspace effect and Git history, forces an actual VM
 reboot and verifies changed boot identity, unattended startup, same registration,
-interrupted history and one launch effect. This verifies local Linux installation
-and reboot acceptance; it does not claim live deployed-instance or Cloudflare
-acceptance.
+interrupted history and one launch effect. It also checks completion before
+replacement, drain timeout, incompatible-candidate rejection, a distinct selected
+release with a matching plugin, and forced interruption followed by recovery.
+The public Pi workflow exercises callbacks during draining. This verifies local
+Linux installation and lifecycle acceptance; it does not claim live
+deployed-instance or Cloudflare acceptance.
 
 Local acceptance on 2026-10-12 passed this workflow with the static `0.8.0`
 Linux amd64 artifact, the pinned authenticated Paperclip host and actual plugin.
