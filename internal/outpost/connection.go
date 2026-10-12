@@ -61,6 +61,10 @@ func connect(privateDir string, c Connection, output io.Writer, daemon bool) err
 			return err
 		}
 		defer supervisor.lock.Close()
+		if err := writeDaemonStatus(privateDir, "connecting"); err != nil {
+			return err
+		}
+		defer writeDaemonStatus(privateDir, "stopped")
 	}
 	backoff := time.Second
 	for {
@@ -69,6 +73,9 @@ func connect(privateDir string, c Connection, output io.Writer, daemon bool) err
 			return nil
 		}
 		if !daemon || errors.Is(err, errRejected) || errors.Is(err, errAlreadyConnected) {
+			return err
+		}
+		if err := writeDaemonStatus(privateDir, "reconnecting"); err != nil {
 			return err
 		}
 		// Neither request errors nor remote payloads cross the diagnostic boundary.
@@ -147,6 +154,9 @@ func session(ctx context.Context, c Connection, output io.Writer, daemon bool, s
 	if !daemon {
 		_ = ws.Close(websocket.StatusNormalClosure, "connection checked")
 		return nil
+	}
+	if err := writeDaemonStatus(s.dir, "connected"); err != nil {
+		return err
 	}
 	var writeMu sync.Mutex
 	sessionCtx, endSession := context.WithCancel(ctx)

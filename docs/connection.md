@@ -4,6 +4,7 @@ Issue #3 implements registration, named environment selection and the outbound
 connection. Issue #4 adds [bounded process command execution](execution.md).
 Issue #5 adds [Pi with machine-owned assets and scoped callbacks](pi.md).
 Issue #8 adds local access-layer configuration, correction and connectivity checks.
+Issue #14 adds [standalone installation and the worker-account systemd service](service.md).
 
 ## Supported development installation
 

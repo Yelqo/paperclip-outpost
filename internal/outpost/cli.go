@@ -49,7 +49,10 @@ type enrollment struct {
 
 func Run(args []string, input io.Reader, output io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: outpost configure|check|register|connect|daemon|diagnose|protect")
+		return errors.New("usage: outpost version|service-install|service-status|configure|check|register|connect|daemon|diagnose|status|protect")
+	}
+	if args[0] == "service-install" || args[0] == "service-status" {
+		return manageService(args, output)
 	}
 	f := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	f.SetOutput(io.Discard)
@@ -63,6 +66,9 @@ func Run(args []string, input io.Reader, output io.Writer) error {
 	outputTotal := f.Int64("output-total-bytes", defaultOutputTotalBytes, "retained output bytes across operations")
 	if f.Parse(args[1:]) != nil || (f.NArg() != 0 && args[0] != "protect") {
 		return errors.New("invalid command arguments")
+	}
+	if args[0] == "version" {
+		return json.NewEncoder(output).Encode(supported)
 	}
 	if args[0] == "configure" || args[0] == "register" {
 		lock, err := lockConnection(*privateDir)
@@ -165,6 +171,8 @@ func Run(args []string, input io.Reader, output io.Writer) error {
 		return protect(*privateDir, c, f.Args(), output)
 	case "diagnose":
 		return json.NewEncoder(output).Encode(map[string]any{"instance": c.Instance, "companyId": c.CompanyID, "outpostId": c.OutpostID, "environmentId": c.EnvironmentID, "versions": supported})
+	case "status":
+		return connectionStatus(*privateDir, c, output)
 	case "check":
 		if c.Credential == "" {
 			return checkConnection(c, output)

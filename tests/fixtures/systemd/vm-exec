@@ -1,0 +1,5 @@
+#!/bin/sh
+exec ssh -i /tmp/fixture-key -p 32222 -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=3 \
+    -o ServerAliveInterval=1 -o ServerAliveCountMax=3 \
+    root@127.0.0.1 "$@"

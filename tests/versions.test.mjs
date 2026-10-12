@@ -5,6 +5,12 @@ import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } fro
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { versions } from '../plugin/versions.ts';
+
+test('standalone binary reports its selected release without connection state or a compiler', () => {
+  const reported=execFileSync(resolve('bin/outpost'),['version'],{encoding:'utf8',env:{PATH:'/nonexistent'}});
+  assert.deepEqual(JSON.parse(reported),versions);
+});
 
 test('changing release and upstream pins requires regeneration before checks pass', async () => {
   const root = resolve('.');
