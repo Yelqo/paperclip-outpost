@@ -1269,13 +1269,12 @@ new file mode 100644
 index 000000000..5270824ba
 --- /dev/null
 +++ b/server/src/realtime/plugin-ws.ts
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,138 @@
 +import { execFileSync } from "node:child_process";
 +import { readFileSync } from "node:fs";
-+import { createRequire } from "node:module";
 +import { randomUUID } from "node:crypto";
 +import type { Server } from "node:http";
-+import { fileURLToPath, pathToFileURL } from "node:url";
++import { fileURLToPath } from "node:url";
 +import { WebSocketServer, WebSocket } from "ws";
 +import type { Db } from "@paperclipai/db";
 +import { PLUGIN_WEBSOCKET_SDK_VERSION, type PluginWebSocketReply } from "@paperclipai/plugin-sdk";
@@ -1294,8 +1293,8 @@ index 000000000..5270824ba
 +  }).trim(); } catch { /* Packaged hosts must carry the build commit stamp. */ }
 +  let shared = "";
 +  try {
-+    const entry = createRequire(import.meta.url).resolve("@paperclipai/shared");
-+    shared = JSON.parse(readFileSync(new URL("../package.json", pathToFileURL(entry)), "utf8")).version;
++    const entry = import.meta.resolve("@paperclipai/shared");
++    shared = JSON.parse(readFileSync(new URL("../package.json", entry), "utf8")).version;
 +  } catch { /* Missing package metadata must reject compatibility before work. */ }
 +  const host = { commit, sdk: PLUGIN_WEBSOCKET_SDK_VERSION, shared, transport: 9 };
 +  let admitted = 0, opening = 0, stopping = false;

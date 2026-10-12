@@ -8,6 +8,6 @@
   "pi": "1.0.3",
   "piConfig": "8f3a5726a254909a3100d8f719febc868237cd27",
   "node": "22.22.1",
-  "hostPatchSHA256": "5aba145c5bf9f014791f9e827fdef090ebe0bd16103ae3e13f340feafdfdbdee",
+  "hostPatchSHA256": "200e6576777dd02feb2b9e70ac878b5a9976d9cd74b4fa1d3ac6f9541321c190",
   "piConfigPatchSHA256": "13a0e019848281fe40312485ca7002ad7f099f9ef2ab64be80346af23b542342"
 }
