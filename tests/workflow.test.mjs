@@ -585,7 +585,14 @@ test('actual Pi human approvals preserve continuation, scope and one-time author
     // A resolved card may wait for the preceding lease's cleanup and the
     // scheduler tick before its distinct continuation becomes observable.
     await eventually(async()=>{
-      continuation=(await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`)).find(run=>!before.has(run.id) && run.contextSnapshot?.interactionId===card.id);
+      // Run lists summarize context and omit interactionId. Inspect each new
+      // run's details so a completed continuation remains discoverable after
+      // the issue's temporary executionRunId/scheduledRetry pointer clears.
+      const candidates=(await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`)).filter(run=>!before.has(run.id));
+      for(const candidate of candidates) {
+        const observed=await json(`/api/heartbeat-runs/${candidate.id}`);
+        if(observed.contextSnapshot?.interactionId===card.id) { continuation=observed; break; }
+      }
       if(!continuation) {
         const observed=await json(`/api/issues/${task.id}`);
         const pendingRun=observed.scheduledRetry?.runId ?? observed.executionRunId;
@@ -768,53 +775,6 @@ process.exit(child.status ?? 1);
       await json(`/api/issues/${task.id}`,{status:'done'},undefined,'PATCH');
     }
 
-    // Losing the real decision channel during a running Pi attempt never
-    // authorizes the pending operation, and reconnecting does not decide it.
-    {
-      task=await newTask('Keep approval blocked during channel loss');
-      command='git commit --allow-empty -m "Unavailable channel effect"';
-      await invoke();
-      const pending=(await interactions()).find(card=>card.status==='pending');
-      assert.ok(pending);
-      let releaseProvider;
-      providerPause=new Promise(resolve=>{releaseProvider=resolve;});
-      const reached=new Promise(resolve=>{providerReached=resolve;});
-      let disabled=false;
-      try {
-        const attempt=invoke();
-        await reached;
-        await json('/api/plugins/yelqo.outpost/disable',{});
-        disabled=true;
-        releaseProvider(); providerPause=undefined; providerReached=undefined;
-        const interrupted=await attempt;
-        assert.equal(interrupted.status,'failed');
-        assert.equal(commits(),2);
-        // pi-config bounds each channel request to ten seconds. Let the
-        // isolated attempt settle before re-establishing the decision channel.
-        await delay(15000);
-        await json('/api/plugins/yelqo.outpost/enable',{});
-        disabled=false;
-        await eventually(async()=>(await json(statusPath)).executionReady,20000);
-        assert.equal((await interactions()).find(card=>card.id===pending.id).status,'pending');
-        assert.equal(commits(),2,'Reconnection cannot approve the operation');
-        const wake=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{reason:'manual_approval_check',payload:{issueId:task.id}});
-        if(wake.id) {
-          const retry=await approvalRun(wake);
-          assert.match((await json(`/api/heartbeat-runs/${retry.id}/log?limitBytes=1048576`)).content,/Waiting for authenticated human response/);
-        } else {
-          // Active-run transport recovery belongs to the recovery milestone.
-          // Its retained lease may keep admission blocked after reconnection.
-          assert.equal(wake.status,'skipped');
-          assert.ok((await json(`/api/issues/${task.id}`)).executionBlocker);
-        }
-        assert.equal(commits(),2);
-        await json(`/api/issues/${task.id}`,{status:'done'},undefined,'PATCH');
-      } finally {
-        releaseProvider(); providerPause=undefined; providerReached=undefined;
-        if(disabled) await json('/api/plugins/yelqo.outpost/enable',{});
-      }
-    }
-
     // Combine a real approved effect, loss of the executing daemon, recovery
     // of that same operation and a separately scheduled Pi continuation.
     {
@@ -866,6 +826,55 @@ process.exit(child.status ?? 1);
         await json(`/api/issues/${task.id}`,{status:'done'},undefined,'PATCH');
       } finally {
         paused.release();
+      }
+    }
+
+    // This scenario may retain an uncertain lease after channel loss. Keep it
+    // last so later scenarios do not depend on that lease recovering.
+    // Losing the real decision channel during a running Pi attempt never
+    // authorizes the pending operation, and reconnecting does not decide it.
+    {
+      task=await newTask('Keep approval blocked during channel loss');
+      command='git commit --allow-empty -m "Unavailable channel effect"';
+      await invoke();
+      const pending=(await interactions()).find(card=>card.status==='pending');
+      assert.ok(pending);
+      let releaseProvider;
+      providerPause=new Promise(resolve=>{releaseProvider=resolve;});
+      const reached=new Promise(resolve=>{providerReached=resolve;});
+      let disabled=false;
+      try {
+        const attempt=invoke();
+        await reached;
+        await json('/api/plugins/yelqo.outpost/disable',{});
+        disabled=true;
+        releaseProvider(); providerPause=undefined; providerReached=undefined;
+        const interrupted=await attempt;
+        assert.equal(interrupted.status,'failed');
+        assert.equal(commits(),4);
+        // pi-config bounds each channel request to ten seconds. Let the
+        // isolated attempt settle before re-establishing the decision channel.
+        await delay(15000);
+        await json('/api/plugins/yelqo.outpost/enable',{});
+        disabled=false;
+        await eventually(async()=>(await json(statusPath)).executionReady,20000);
+        assert.equal((await interactions()).find(card=>card.id===pending.id).status,'pending');
+        assert.equal(commits(),4,'Reconnection cannot approve the operation');
+        const wake=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{reason:'manual_approval_check',payload:{issueId:task.id}});
+        if(wake.id) {
+          const retry=await approvalRun(wake);
+          assert.match((await json(`/api/heartbeat-runs/${retry.id}/log?limitBytes=1048576`)).content,/Waiting for authenticated human response/);
+        } else {
+          // Active-run transport recovery belongs to the recovery milestone.
+          // Its retained lease may keep admission blocked after reconnection.
+          assert.equal(wake.status,'skipped');
+          assert.ok((await json(`/api/issues/${task.id}`)).executionBlocker);
+        }
+        assert.equal(commits(),4);
+        await json(`/api/issues/${task.id}`,{status:'done'},undefined,'PATCH');
+      } finally {
+        releaseProvider(); providerPause=undefined; providerReached=undefined;
+        if(disabled) await json('/api/plugins/yelqo.outpost/enable',{});
       }
     }
   } finally {
