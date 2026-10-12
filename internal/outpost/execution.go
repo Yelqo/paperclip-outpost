@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -58,21 +59,23 @@ type processOutcome struct {
 	Error              string `json:"error,omitempty"`
 	OwnershipUncertain bool   `json:"ownershipUncertain,omitempty"`
 	Interrupted        bool   `json:"interrupted,omitempty"`
+	Cancelled          bool   `json:"cancelled,omitempty"`
 }
 
 type executionRecord struct {
-	RunID          string          `json:"runId"`
-	OperationID    string          `json:"operationId"`
-	Purpose        string          `json:"purpose"`
-	Workspace      string          `json:"workspace"`
-	Deadline       string          `json:"deadline"`
-	BootID         string          `json:"bootId,omitempty"`
-	ProcessID      int             `json:"processId,omitempty"`
-	ProcessStart   string          `json:"processStart,omitempty"`
-	HistoryMissing bool            `json:"historyMissing,omitempty"`
-	Refused        bool            `json:"refused,omitempty"`
-	Status         string          `json:"status"`
-	Outcome        *processOutcome `json:"outcome,omitempty"`
+	RunID           string          `json:"runId"`
+	OperationID     string          `json:"operationId"`
+	Purpose         string          `json:"purpose"`
+	Workspace       string          `json:"workspace"`
+	Deadline        string          `json:"deadline"`
+	BootID          string          `json:"bootId,omitempty"`
+	ProcessID       int             `json:"processId,omitempty"`
+	ProcessStart    string          `json:"processStart,omitempty"`
+	HistoryMissing  bool            `json:"historyMissing,omitempty"`
+	Refused         bool            `json:"refused,omitempty"`
+	CancelRequested bool            `json:"cancelRequested,omitempty"`
+	Status          string          `json:"status"`
+	Outcome         *processOutcome `json:"outcome,omitempty"`
 	// Local delivery metadata is excluded from the shared recovery fingerprint.
 	PendingResultRequestID string `json:"pendingResultRequestId,omitempty"`
 }
@@ -100,6 +103,7 @@ type supervisor struct {
 	reports        map[string]executionRecord
 	fault          func(string)
 	outputs        *outputStore
+	cancels        map[string]context.CancelFunc
 }
 
 func newSupervisor(dir string, c Connection) (*supervisor, error) {
@@ -114,7 +118,7 @@ func newSupervisor(dir string, c Connection) (*supervisor, error) {
 		lock.Close()
 		return nil, errors.New("daemon already running")
 	}
-	s := &supervisor{dir: dir, connection: c, records: map[string]executionRecord{}, owners: map[string]*workspaceOwnership{}, reports: map[string]executionRecord{}, lock: lock}
+	s := &supervisor{dir: dir, connection: c, records: map[string]executionRecord{}, owners: map[string]*workspaceOwnership{}, reports: map[string]executionRecord{}, cancels: map[string]context.CancelFunc{}, lock: lock}
 	ready := false
 	defer func() {
 		if !ready {
@@ -309,6 +313,13 @@ func (s *supervisor) workspace(path string) (*os.File, string, error) {
 }
 
 func (s *supervisor) handle(ctx context.Context, op operation, send func(any) error) {
+	if op.Type == "cancel" {
+		record, err := s.requestCancellation(op.RunID, op.OperationID)
+		if err == nil {
+			_ = send(map[string]any{"type": "history", "record": record})
+		}
+		return
+	}
 	admitted := false
 	checkpoint := func(stage string) {
 		if s.fault != nil {
@@ -477,9 +488,15 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 	} else {
 		s.activeControls++
 	}
+	processCtx, cancel := context.WithDeadline(ctx, deadline)
+	if s.cancels == nil {
+		s.cancels = map[string]context.CancelFunc{}
+	}
+	s.cancels[op.OperationID] = cancel
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
+		delete(s.cancels, op.OperationID)
 		if op.Purpose == "agent_execution" {
 			s.activeAgents--
 		} else {
@@ -487,7 +504,6 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 		}
 		s.mu.Unlock()
 	}()
-	processCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	args := protectionArgs(s.dir, s.connection, op.Cwd)
 	// Pin the actual directory at admission across path renames/replacements.
@@ -496,6 +512,14 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 		args = append(args[:len(args)-1], "--ro-bind", descriptorPath, descriptorPath, "--")
 	}
 	cmd := exec.CommandContext(processCtx, "bwrap", append(args, append([]string{op.Command}, op.Args...)...)...)
+	var cancellationKilled atomic.Bool
+	cmd.Cancel = func() error {
+		err := cmd.Process.Kill()
+		if err == nil {
+			cancellationKilled.Store(true)
+		}
+		return err
+	}
 	cmd.ExtraFiles = []*os.File{file}
 	cmd.Env = workerEnv(s.connection)
 	for name, value := range op.Env {
@@ -547,6 +571,7 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 	cmd.Args = append(cmd.Args[:1], append([]string{"--info-fd", "4"}, cmd.Args[1:]...)...)
 	err = cmd.Start()
 	infoWrite.Close()
+	namespaceGone := false
 	if err == nil {
 		checkpoint("after-launch")
 		var info struct {
@@ -554,8 +579,10 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 		}
 		if json.NewDecoder(io.LimitReader(infoRead, 4096)).Decode(&info) == nil && info.ProcessID > 0 {
 			start, _, evidenceErr := processIdentity(info.ProcessID)
+			namespaceGone = os.IsNotExist(evidenceErr)
 			if evidenceErr == nil {
 				s.mu.Lock()
+				record.CancelRequested = s.records[op.OperationID].CancelRequested
 				record.ProcessID, record.ProcessStart, record.Status = info.ProcessID, start, "running"
 				if s.persist(record, false) != nil {
 					cancel()
@@ -584,10 +611,31 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 		outcome.Error = "output retention failed"
 	}
 	s.mu.Lock()
+	record.CancelRequested = s.records[op.OperationID].CancelRequested
+	record.HistoryMissing = s.records[op.OperationID].HistoryMissing
+	if record.HistoryMissing {
+		outcome.OwnershipUncertain = true
+		outcome.Error = "execution history is missing; ownership remains uncertain"
+	}
+	// Wait establishes the launcher outcome; namespace evidence establishes
+	// termination of the supervised tree. A request alone proves neither.
+	if record.CancelRequested && cmd.ProcessState != nil && !outcome.OwnershipUncertain {
+		for !namespaceGone && !s.terminated(record) {
+			s.mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+			s.mu.Lock()
+			if record.ProcessStart == "" {
+				outcome.OwnershipUncertain = true
+				outcome.Error = "cancellation termination evidence is unavailable"
+				break
+			}
+		}
+		outcome.Cancelled = !outcome.OwnershipUncertain && cancellationKilled.Load() && processCtx.Err() == context.Canceled && outcome.Signal == syscall.SIGKILL.String() && !limited && !outputFailed
+	}
 	record.Outcome = &outcome
 	record.Status = recordStatus(record)
 	checkpoint("before-terminal")
-	if s.persist(record, false) == nil {
+	if !outcome.OwnershipUncertain && s.persist(record, false) == nil {
 		s.records[op.OperationID] = record
 		s.releaseOperation(record)
 	} else {

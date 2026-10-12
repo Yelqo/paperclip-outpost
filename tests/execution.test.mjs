@@ -157,6 +157,72 @@ test('controls cancelled before dispatch do not retain workspace ownership',asyn
   await f.admit('B');
 });
 
+test('unresolved cancellation does not starve sibling operations or other runs',async () => {
+  const f=fixture();
+  const scope={companyId:'company',config:{companyId:'company',outpostId:'outpost'}};
+  const deadline=new Date(Date.now()+60000).toISOString();
+  const records=[
+    {runId:'A',operationId:'missing',purpose:'agent_execution',workspace:'1:2',deadline,status:'uncertain',historyMissing:true},
+    {runId:'B',operationId:'agent',purpose:'agent_execution',workspace:'2:3',deadline,status:'running'},
+    {runId:'B',operationId:'control',purpose:'control',workspace:'2:3',deadline,status:'running'},
+  ];
+  for(const record of records) await f.execution.history.prepare('company','outpost',record);
+  await f.execution.cancelRun({...scope,runId:'A'});
+  await f.execution.cancelRun({...scope,runId:'B'});
+  const delivered=new Set();
+  for(let i=0;i<records.length;i++) {
+    const request=await f.drain();
+    assert.equal(request.type,'cancel');
+    delivered.add(request.operationId);
+  }
+  assert.deepEqual(delivered,new Set(['missing','agent','control']));
+  await f.execution.history.report('company','outpost',{
+    ...records[1],status:'terminal',outcome:{exitCode:null,timedOut:false,cancelled:true},
+  });
+  const retried=new Set();
+  for(let i=0;i<records.length;i++) retried.add((await f.drain()).operationId);
+  assert.deepEqual(retried,new Set(['missing','control']),'only unresolved cancellations need redelivery');
+  assert.equal((await f.execution.cancelRun({...scope,runId:'A',queryOnly:true})).state,'requested');
+  assert.equal((await f.execution.cancelRun({...scope,runId:'B',queryOnly:true})).state,'requested');
+});
+
+test('unresolved cancellation permits unrelated dispatch while retaining its workspace fence',async t => {
+  const f=fixture();
+  const scope={companyId:'company',config:{companyId:'company',outpostId:'outpost'},adapterType:'process'};
+  const record={runId:'A',operationId:'missing',purpose:'agent_execution',workspace:'1:2',
+    deadline:new Date(Date.now()+60000).toISOString(),status:'uncertain',historyMissing:true};
+  await f.execution.history.prepare('company','outpost',record);
+  f.execution.restore('company','outpost',[record]);
+  await f.execution.cancelRun({...scope,runId:'A'});
+  t.after(()=>f.execution.close('company','outpost'));
+  const lease=await f.execution.acquire({...scope,runId:'B'});
+  const realized=f.execution.realize({...scope,lease,workspace:{localPath:'/other'}});
+  realized.catch(()=>{});
+  const poll=await f.execution.drain('company','outpost');
+  assert.ok(poll.some(request=>request.type==='cancel' && request.operationId==='missing'));
+  const inspection=poll.find(request=>request.type==='inspect');
+  assert.ok(inspection,'unrelated workspace inspection must share the delivery lane');
+  await f.reply(inspection,{cwd:'/other',workspaceId:'2:3',ownerRunId:''});
+  await realized;
+  const running=f.execution.execute({...scope,lease,runId:'B',operationId:'unrelated',purpose:'agent_execution',
+    cwd:'/other',command:'/bin/true',timeoutMs:5000});
+  running.catch(()=>{});
+  const dispatch=(await f.execution.drain('company','outpost')).find(request=>request.type==='execute');
+  assert.ok(dispatch,'unrelated execution must be delivered despite unresolved cancellation');
+  await f.reply(dispatch,{exitCode:0,timedOut:false});
+  assert.equal((await running).exitCode,0);
+  await f.release(lease);
+  const conflictingLease=await f.execution.acquire({...scope,runId:'C'});
+  const conflicting=f.execution.realize({...scope,lease:conflictingLease,workspace:{localPath:'/workspace'}});
+  const rejected=assert.rejects(conflicting,/busy|uncertain/);
+  const conflictInspection=(await f.execution.drain('company','outpost')).find(request=>request.type==='inspect');
+  assert.ok(conflictInspection);
+  await f.reply(conflictInspection,{cwd:'/workspace',workspaceId:'1:2',ownerRunId:''});
+  await rejected;
+  await f.release(conflictingLease);
+  assert.equal((await f.execution.cancelRun({...scope,runId:'A',queryOnly:true})).state,'requested');
+});
+
 test('lease release waits for every control to settle and then frees the workspace',async () => {
   const f=fixture();
   const lease=await f.admit('A');

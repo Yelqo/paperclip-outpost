@@ -52,7 +52,7 @@ function providerResponse(res, delta, finishReason) {
   res.end('data: [DONE]\n\n');
 }
 
-before(async () => {
+async function startHost() {
   server = spawn(process.execPath, ['--import', 'tsx', 'src/index.ts'], {
     cwd: join(host, 'server'), env: {
       ...process.env, PAPERCLIP_HOME: home, PAPERCLIP_INSTANCE_ID: 'acceptance',
@@ -71,6 +71,10 @@ before(async () => {
     if (server.exitCode !== null) throw new Error(`Host exited: ${logs.slice(-5000)}`);
     try { return (await fetch(origin + '/api/health')).ok; } catch { return false; }
   }, 90000);
+}
+
+before(async () => {
+  await startHost();
   const signup = await api('/api/auth/sign-up/email', {name:'Operator', email:'operator@outpost.test', password:'fixture-password-123'});
   assert.ok(signup.ok, await signup.text());
   cookie = signup.headers.getSetCookie().map(value => value.split(';')[0]).join('; ');
@@ -880,6 +884,197 @@ async function bufferedOutpost(t,name,daemonArgs=[]) {
   await eventually(async ()=>(await json(statusPath)).executionReady);
   return {outpost,statusPath,disconnect(){blocked=true; for(const socket of sockets) socket.destroy();},reconnect(){blocked=false;}};
 }
+
+test('connected public cancellation confirms descendant termination and preserves the workspace', {timeout:60000}, async t => {
+  const {outpost,statusPath}=await bufferedOutpost(t,'connected-cancel');
+  const workspace=join(home,'workspaces','connected-cancel'); mkdirSync(workspace);
+  const agent=await commandAgent(workspace,
+    "echo launch >> launches; echo preserved > artifact; (sleep 3; echo escaped > escaped) & printf started; while :; do sleep .1; done",
+    {defaultEnvironmentId:outpost.environmentId,timeoutSec:30});
+  const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{});
+  await eventually(async ()=>{
+    const response=await api(`/api/heartbeat-runs/${run.id}/log`);
+    return response.ok && (await response.json()).content.includes('started');
+  });
+  await json(`/api/heartbeat-runs/${run.id}/cancel`,{});
+  const stopped=await terminalRun(run);
+  assert.equal(stopped.status,'cancelled',JSON.stringify(stopped));
+  assert.equal(stopped.resultJson.executionCancellation.state,'acknowledged');
+  let record;
+  await eventually(async ()=>{
+    record=(await json(statusPath)).executionHistory.find(record=>record.runId===run.id);
+    return record?.status==='terminal';
+  });
+  assert.equal(record.outcome.cancelled,true,'machine evidence must confirm the cancellation');
+  await delay(3500);
+  assert.equal(existsSync(join(workspace,'escaped')),false,'a descendant must not survive cancellation');
+  assert.equal(readFileSync(join(workspace,'artifact'),'utf8'),'preserved\n');
+  const continuation=await commandAgent(workspace,'echo continuation > continuation',{defaultEnvironmentId:outpost.environmentId});
+  assert.equal((await terminalRun(await json(`/api/agents/${continuation.id}/heartbeat/invoke`,{}))).status,'succeeded');
+  assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'launch\n');
+});
+
+test('disconnected cancellation remains unconfirmed and blocks conflicting work until reconciliation', {timeout:60000}, async t => {
+  const transport=await bufferedOutpost(t,'disconnected-cancel');
+  const {outpost,statusPath}=transport;
+  const workspace=join(home,'workspaces','disconnected-cancel'); mkdirSync(workspace);
+  const agent=await commandAgent(workspace,
+    "echo launch >> launches; (echo ready > child-ready; while ! test -e release-descendant; do sleep .1; done; echo escaped > escaped) & printf started; while :; do echo alive >> progress; sleep .1; done",
+    {defaultEnvironmentId:outpost.environmentId,timeoutSec:30});
+  const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{});
+  await eventually(()=>existsSync(join(workspace,'progress')) && existsSync(join(workspace,'child-ready')));
+  transport.disconnect();
+  await eventually(async ()=>!(await json(statusPath)).connected);
+  const requested=await json(`/api/heartbeat-runs/${run.id}/cancel`,{});
+  assert.equal(requested.status,'running',JSON.stringify(requested));
+  assert.equal(requested.resultJson.executionCancellation.state,'requested');
+  const progress=readFileSync(join(workspace,'progress'),'utf8');
+  await delay(300);
+  assert.ok(readFileSync(join(workspace,'progress'),'utf8').length>progress.length,'the offline process has not stopped');
+  const competing=await commandAgent(workspace,'echo conflicting > conflicting',{defaultEnvironmentId:outpost.environmentId});
+  const refused=await terminalRun(await json(`/api/agents/${competing.id}/heartbeat/invoke`,{}));
+  assert.equal(refused.errorCode,'execution_unavailable');
+  const retry=await scheduledRetry(refused);
+  await json(`/api/heartbeat-runs/${retry.id}/cancel`,{});
+  assert.equal(existsSync(join(workspace,'conflicting')),false);
+  transport.reconnect();
+  const stopped=await terminalRun(run,35000);
+  assert.equal(stopped.status,'cancelled',JSON.stringify(stopped));
+  assert.equal(stopped.resultJson.executionCancellation.state,'acknowledged');
+  const after=readFileSync(join(workspace,'progress'),'utf8');
+  writeFileSync(join(workspace,'release-descendant'),'');
+  await delay(300);
+  assert.equal(readFileSync(join(workspace,'progress'),'utf8'),after);
+  assert.equal(existsSync(join(workspace,'escaped')),false);
+  assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'launch\n');
+  const continuation=await commandAgent(workspace,'echo continued > continued',{defaultEnvironmentId:outpost.environmentId});
+  assert.equal((await terminalRun(await json(`/api/agents/${continuation.id}/heartbeat/invoke`,{}))).status,'succeeded');
+});
+
+test('pending cancellation survives graceful host restart and reconciles the original run', {timeout:120000}, async t => {
+  const transport=await bufferedOutpost(t,'cancel-host-restart');
+  const workspace=join(home,'workspaces','cancel-host-restart'); mkdirSync(workspace);
+  const agent=await commandAgent(workspace,'echo launch >> launches; while :; do echo alive >> progress; sleep .1; done',
+    {defaultEnvironmentId:transport.outpost.environmentId,timeoutSec:90});
+  const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{});
+  await eventually(()=>existsSync(join(workspace,'progress')));
+  transport.disconnect();
+  await eventually(async ()=>!(await json(transport.statusPath)).connected);
+  const requested=await json(`/api/heartbeat-runs/${run.id}/cancel`,{});
+  assert.equal(requested.status,'running');
+  assert.equal(requested.resultJson.executionCancellation.state,'requested');
+  server.kill('SIGTERM');
+  await Promise.race([new Promise(resolve=>server.once('exit',resolve)),delay(25000)]);
+  assert.ok(server.exitCode!==null || server.signalCode!==null,'host must finish graceful shutdown');
+  const progress=readFileSync(join(workspace,'progress'),'utf8');
+  await delay(300);
+  assert.ok(readFileSync(join(workspace,'progress'),'utf8').length>progress.length,'host shutdown has not stopped the remote process');
+  await startHost();
+  const pending=await json(`/api/heartbeat-runs/${run.id}`);
+  assert.equal(pending.status,'running','host shutdown cannot establish remote termination');
+  assert.equal(pending.resultJson.executionCancellation.state,'requested');
+  assert.equal(pending.resultJson.executionCancellation.proof,'machine_pending');
+  transport.reconnect();
+  const stopped=await terminalRun(run,35000);
+  assert.equal(stopped.status,'cancelled',JSON.stringify(stopped));
+  assert.equal(stopped.resultJson.executionCancellation.state,'acknowledged');
+  assert.equal(stopped.resultJson.executionCancellation.proof,'machine_termination');
+  assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'launch\n');
+  const runs=await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`);
+  assert.equal(runs.length,1,'host restart must not create a replacement attempt');
+});
+
+test('completion during an outage wins over cancellation and stays unconfirmed beyond the RPC grace period', {timeout:90000}, async t => {
+  const transport=await bufferedOutpost(t,'cancel-completion-race');
+  const {outpost,statusPath}=transport;
+  const workspace=join(home,'workspaces','cancel-completion-race'); mkdirSync(workspace);
+  const agent=await commandAgent(workspace,
+    'echo launch >> launches; echo started > started; while ! test -e finish; do sleep .1; done; echo natural-output; echo preserved > completed',
+    {defaultEnvironmentId:outpost.environmentId,timeoutSec:3});
+  const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{});
+  await eventually(()=>existsSync(join(workspace,'started')));
+  transport.disconnect();
+  await eventually(async ()=>!(await json(statusPath)).connected);
+  await json(`/api/heartbeat-runs/${run.id}/cancel`,{});
+  writeFileSync(join(workspace,'finish'),'');
+  await eventually(()=>existsSync(join(workspace,'completed')));
+  // The original execute RPC expires at its three-second deadline plus ten
+  // seconds. Its timeout still cannot turn an offline request into a receipt.
+  await delay(14000);
+  const pending=await json(`/api/heartbeat-runs/${run.id}`);
+  assert.equal(pending.status,'running',JSON.stringify(pending));
+  assert.equal(pending.resultJson.executionCancellation.state,'requested');
+  transport.reconnect();
+  const outcome=await terminalRun(run,45000);
+  assert.equal(outcome.status,'succeeded',JSON.stringify(outcome));
+  assert.equal(outcome.resultJson.executionCancellation.state,'acknowledged');
+  assert.equal(outcome.resultJson.executionCancellation.outcome.exitCode,0);
+  assert.notEqual(outcome.resultJson.executionCancellation.outcome.cancelled,true);
+  const history=(await json(statusPath)).executionHistory.filter(record=>record.runId===run.id);
+  assert.equal(history.length,1);
+  assert.equal(history[0].outcome.exitCode,0);
+  assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'launch\n');
+  assert.equal(readFileSync(join(workspace,'completed'),'utf8'),'preserved\n');
+  const retained=await json(`${statusPath.replace('?','/output?')}&operationId=${encodeURIComponent(history[0].operationId)}`);
+  assert.equal(retained.chunks.map(chunk=>Buffer.from(chunk.data,'base64').toString()).join(''),'natural-output\n');
+});
+
+test('public cancellation settles both the agent and its associated control before freeing ownership', {timeout:60000}, async t => {
+  await installExecutionAdapter();
+  const {outpost,statusPath}=await bufferedOutpost(t,'cancel-associated-control');
+  const workspace=join(home,'workspaces','cancel-associated-control'); mkdirSync(workspace);
+  try {
+    const agent=await commandAgent(workspace,'',{defaultEnvironmentId:outpost.environmentId,scenario:'ownership'});
+    const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{});
+    await eventually(()=>existsSync(join(workspace,'control')));
+    await json(`/api/heartbeat-runs/${run.id}/cancel`,{});
+    const stopped=await terminalRun(run);
+    assert.equal(stopped.status,'cancelled',JSON.stringify(stopped));
+    assert.equal(stopped.resultJson.executionCancellation.state,'acknowledged');
+    const records=(await json(statusPath)).executionHistory.filter(record=>record.runId===run.id);
+    assert.equal(records.length,2);
+    assert.ok(records.every(record=>record.status==='terminal' && record.outcome.cancelled===true),JSON.stringify(records));
+    const continuation=await commandAgent(workspace,'echo continued > continued',{defaultEnvironmentId:outpost.environmentId});
+    assert.equal((await terminalRun(await json(`/api/agents/${continuation.id}/heartbeat/invoke`,{}))).status,'succeeded');
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'agent\n');
+  } finally { await removeExecutionAdapter(); }
+});
+
+test('a signal termination before disconnected cancellation delivery retains the failed outcome', {timeout:60000}, async t => {
+  const transport=await bufferedOutpost(t,'cancel-signal-race');
+  const {outpost,statusPath}=transport;
+  const workspace=join(home,'workspaces','cancel-signal-race'); mkdirSync(workspace);
+  const agent=await commandAgent(workspace,'echo launch >> launches; echo started > started; while :; do sleep .1; done',
+    {defaultEnvironmentId:outpost.environmentId,timeoutSec:30});
+  const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{});
+  await eventually(()=>existsSync(join(workspace,'started')));
+  // Reconciliation exposes the current namespace identity through the public
+  // status API. Use it to inject an external launcher failure during an outage.
+  transport.disconnect();
+  await eventually(async ()=>!(await json(statusPath)).connected);
+  transport.reconnect();
+  let record;
+  await eventually(async ()=>{
+    const status=await json(statusPath);
+    record=status.executionHistory.find(record=>record.runId===run.id);
+    return status.executionReady && record?.processId;
+  });
+  const namespaceStat=readFileSync(`/proc/${record.processId}/stat`,'utf8');
+  const launcherPid=Number(namespaceStat.slice(namespaceStat.lastIndexOf(')')+1).trim().split(/\s+/)[1]);
+  assert.equal(readFileSync(`/proc/${launcherPid}/comm`,'utf8').trim(),'bwrap');
+  transport.disconnect();
+  await eventually(async ()=>!(await json(statusPath)).connected);
+  await json(`/api/heartbeat-runs/${run.id}/cancel`,{});
+  process.kill(launcherPid,'SIGTERM');
+  await delay(300);
+  transport.reconnect();
+  const stopped=await terminalRun(run,35000);
+  assert.equal(stopped.status,'failed',JSON.stringify(stopped));
+  assert.equal(stopped.resultJson.executionCancellation.state,'acknowledged');
+  assert.equal(stopped.resultJson.executionCancellation.outcome.signal,'terminated');
+  assert.notEqual(stopped.resultJson.executionCancellation.outcome.cancelled,true);
+  assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'launch\n');
+});
 
 test('a disconnected execution recovers ordered output and succeeds without another launch', {timeout:60000}, async t => {
   await installExecutionAdapter();

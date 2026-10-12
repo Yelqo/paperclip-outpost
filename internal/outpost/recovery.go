@@ -143,10 +143,10 @@ func recordDigest(record executionRecord) string {
 	var outcome any
 	if record.Outcome != nil {
 		r := record.Outcome
-		outcome = []any{r.ExitCode, r.Signal, r.TimedOut, r.Error, r.OwnershipUncertain, r.Interrupted}
+		outcome = []any{r.ExitCode, r.Signal, r.TimedOut, r.Error, r.OwnershipUncertain, r.Interrupted, r.Cancelled}
 	}
 	data, _ := json.Marshal([]any{record.RunID, record.OperationID, record.Purpose, record.Workspace, record.Deadline, record.BootID,
-		record.ProcessID, record.ProcessStart, record.HistoryMissing, record.Refused, record.Status, outcome})
+		record.ProcessID, record.ProcessStart, record.HistoryMissing, record.Refused, record.Status, outcome, record.CancelRequested})
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:])
 }

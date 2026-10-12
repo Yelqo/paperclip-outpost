@@ -5,7 +5,7 @@ import { StringDecoder } from "node:string_decoder";
 import { createOutputHistory, type OutputFrame } from "./output.ts";
 import { createRecoveryHistory, readOutcome, type Outcome, type ExecutionRecord } from "./recovery.ts";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import type { PluginEnvironmentAcquireLeaseParams, PluginEnvironmentExecuteParams, PluginEnvironmentRealizeWorkspaceParams, PluginEnvironmentReleaseLeaseParams } from "@paperclipai/plugin-sdk/protocol";
+import type { PluginEnvironmentAcquireLeaseParams, PluginEnvironmentExecuteParams, PluginEnvironmentRealizeWorkspaceParams, PluginEnvironmentReleaseLeaseParams, PluginEnvironmentCancelRunParams, PluginEnvironmentCancelRunResult } from "@paperclipai/plugin-sdk/protocol";
 
 type CallbackTransport = NonNullable<PluginEnvironmentExecuteParams["callbackTransport"]>;
 type Identity = { runId:string; operationId:string; purpose:"agent_execution"|"control" };
@@ -55,6 +55,8 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
   const history=createRecoveryHistory(ctx);
   const output=createOutputHistory(ctx);
   const pending = new Map<string,Pending>();
+  const cancelledRuns = new Set<string>();
+  const cancellationCursor = new Map<string,string>();
   const queues = new Map<string,Array<OperationRequest & {requestId:string}>>();
   type Lease = {runId:string;outpostKey:string;workspaceId?:string;workspaceKey?:string;operations:Map<string,Identity["purpose"]>;released:boolean;executedAgent:boolean};
   const leases = new Map<string,Lease>();
@@ -95,21 +97,34 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
     });
   };
   const drain = async (companyId:string,outpostId:string) => {
+    const outpostKey=key(companyId,outpostId);
+    const cancellations=(await history.all(companyId,outpostId)).filter(record=>record.cancelRequested && (!record.outcome || record.outcome.ownershipUncertain));
+    const previous=cancellations.findIndex(record=>record.operationId===cancellationCursor.get(outpostKey));
+    const cancellation=cancellations.length ? cancellations[(previous+1)%cancellations.length] : undefined;
+    // Bound each poll to one cancellation plus one queued operation. Rotate
+    // retries so missing evidence cannot starve other stops or workspace checks.
+    const operations=cancellation ? [{type:"cancel" as const,runId:cancellation.runId,operationId:cancellation.operationId}] : [];
+    if(cancellation) cancellationCursor.set(outpostKey,cancellation.operationId);
+    else cancellationCursor.delete(outpostKey);
     const queue=queues.get(key(companyId,outpostId));
     const message=queue?.shift();
     const request=message && pending.get(message.requestId);
     if(request && message?.type==="execute") {
+      if(await ctx.state.get(cancellationScope(companyId,outpostId,message.runId))===true) {
+        request.reject(Object.assign(new Error("Run cancelled before dispatch"),{beforeLaunch:true}));
+        return operations;
+      }
       try {
         await history.prepare(companyId,outpostId,{runId:message.runId,operationId:message.operationId,purpose:message.purpose,
           workspace:message.workspaceId,deadline:message.deadline,status:"uncertain"});
-      } catch(error) { request.reject(Object.assign(new Error(error instanceof Error ? error.message : "Cannot persist delivery witness"),{beforeLaunch:true})); return []; }
+      } catch(error) { request.reject(Object.assign(new Error(error instanceof Error ? error.message : "Cannot persist delivery witness"),{beforeLaunch:true})); return operations; }
       if(pending.get(message.requestId)!==request) {
         await history.refuse(companyId,outpostId,message.operationId,message.runId);
-        return [];
+        return operations;
       }
     }
     if(request) { request.sent=true; request.onSent?.(); }
-    return message ? [message] : [];
+    return message ? [...operations,message] : operations;
   };
   const message = async (companyId:string,outpostId:string,value:unknown) => {
     const frame=readFrame(value);
@@ -128,6 +143,7 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
   const close = (companyId:string,outpostId:string) => {
     for (const request of [...pending.values()]) if (request.companyId===companyId && request.outpostId===outpostId && (!request.sent || !request.identity)) request.reject(unavailable("Outpost disconnected before launch"));
     queues.delete(key(companyId,outpostId));
+    cancellationCursor.delete(key(companyId,outpostId));
   };
   const reconcile = (companyId:string,outpostId:string,record:ExecutionRecord) => {
     const workspaceKey=`${key(companyId,outpostId)}:${record.workspace}`;
@@ -157,6 +173,25 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
     if (input.config.companyId!==input.companyId || typeof input.config.outpostId!=="string") throw new Error("Outpost company scope mismatch");
     return input.config.outpostId;
   };
+  const cancellationScope=(companyId:string,outpostId:string,runId:string) => ({scopeKind:"company" as const,scopeId:companyId,stateKey:`outpost-cancellation:${outpostId}:${runId}`});
+  const cancelRun = async (input:PluginEnvironmentCancelRunParams):Promise<PluginEnvironmentCancelRunResult> => {
+    const id=outpost(input);
+    if(!input.runId) throw new Error("Cancellation requires the original run identity");
+    if(!input.queryOnly) {
+      await ctx.state.set(cancellationScope(input.companyId,id,input.runId),true);
+      cancelledRuns.add(`${key(input.companyId,id)}:${input.runId}`);
+      await history.cancelRun(input.companyId,id,input.runId);
+      for(const request of [...pending.values()]) if(request.companyId===input.companyId && request.outpostId===id && request.identity?.runId===input.runId && !request.sent)
+        request.reject(Object.assign(new Error("Run cancelled before dispatch"),{beforeLaunch:true}));
+    }
+    const records=(await history.all(input.companyId,id)).filter(record=>record.runId===input.runId);
+    if(!records.length) return await ctx.state.get(cancellationScope(input.companyId,id,input.runId))===true
+      ? {state:"confirmed",outcome:{exitCode:null,timedOut:false,cancelled:true}} : {state:"requested"};
+    if(records.some(record=>!record.outcome || record.outcome.ownershipUncertain || record.historyMissing)) return {state:"requested"};
+    const agent=records.find(record=>record.purpose==="agent_execution");
+    if(!agent || agent.refused) return {state:"confirmed",outcome:{exitCode:null,timedOut:false,cancelled:true}};
+    return {state:"confirmed",outcome:agent.outcome!};
+  };
   const acquire = async (input:PluginEnvironmentAcquireLeaseParams) => {
     const id=outpost(input);
     if (!online(input.companyId,id)) throw unavailable("Outpost is offline");
@@ -164,7 +199,7 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
     if (!["process","pi_local"].includes(input.adapterType ?? "")) throw new Error("This Outpost release supports process and pi_local adapters");
     const providerLeaseId=randomUUID();
     leases.set(providerLeaseId,{runId:input.runId,outpostKey:key(input.companyId,id),operations:new Map(),released:false,executedAgent:false});
-    return {providerLeaseId};
+    return {providerLeaseId,metadata:{cancellationConfig:{companyId:input.companyId,outpostId:id},runId:input.runId}};
   };
   const leaseFor = (input:PluginEnvironmentRealizeWorkspaceParams | PluginEnvironmentExecuteParams) => {
     const lease=leases.get(input.lease.providerLeaseId ?? "");
@@ -197,6 +232,7 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
     if (!input.runId || !input.operationId || (input.purpose!=="agent_execution" && input.purpose!=="control")) throw new Error("Paperclip must author execution identity and purpose");
     if(!input.cwd?.startsWith("/")) throw new Error("An existing absolute workspace path is required");
     const lease=leaseFor(input);
+    if(cancelledRuns.has(`${lease.outpostKey}:${input.runId}`)) throw new Error("Run cancellation prevents further execution");
     if(lease.runId!==input.runId || !lease.workspaceId || !lease.workspaceKey) throw new Error("Execution requires the run's admitted workspace");
     if(owners.get(lease.workspaceKey)!==input.runId) throw new Error("Execution workspace ownership changed");
     const timeout=Math.min(input.timeoutMs && input.timeoutMs>0 ? input.timeoutMs : 60000,3600000);
@@ -244,5 +280,5 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
     if (result.error) throw Object.assign(new Error(result.error),result.error==="output limit exceeded" ? {code:PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTPUT_LIMIT} : {});
     return {...result,stdout,stderr};
   };
-  return {acquire,realize,execute,release,drain,message,close,history,output,reconcile,restore};
+  return {acquire,realize,execute,release,drain,message,close,history,output,reconcile,restore,cancelRun};
 }

@@ -78,8 +78,37 @@ The daemon records the terminal process outcome durably before releasing its
 workspace ownership. A killed process namespace also terminates descendants.
 If an operation's outcome is uncertain after a crash or a failed terminal write,
 conflicting dispatch remains blocked until recovery establishes termination.
-Preserve the private history. Cancellation receipts and operator resolution of
-missing history remain subsequent milestones.
+Preserve the private history. Operator resolution of missing history remains
+a subsequent milestone. Cancellation follows the evidence rules below.
+
+## Operator cancellation
+
+Request cancellation through `POST /api/heartbeat-runs/RUN_ID/cancel`. Paperclip
+records `resultJson.executionCancellation.state: "requested"` on the original
+run and durably fences further operations for that run. The request is delivered
+to every outstanding agent and control operation using their original identities.
+Cancellation has its own delivery lane and consumes no execution admission slot.
+Unresolved cancellation for one operation does not block cancellation delivery or
+admission checks for other workspaces.
+
+The daemon records the request before cancelling the supervised launcher. Its
+protected PID namespace terminates the process tree, including descendants.
+Paperclip acknowledges cancellation only after every operation has a durable
+terminal receipt. A cancelled machine outcome produces a `cancelled` run with
+`executionCancellation.state: "acknowledged"` and `proof: "machine_termination"`.
+The receipt includes the machine outcome; workspace files and execution history
+remain available. A lost terminal durability barrier retains workspace ownership
+and leaves the request unconfirmed.
+
+While disconnected, cancellation stays requested and the run stays `running`.
+The process can continue within its original deadline and output limits. Neither
+the execute RPC's expiry nor lease teardown establishes termination. Conflicting
+dispatch remains blocked. Reconnection delivers the request or reconciles an
+already recorded outcome without launching the operation again. Natural
+completion, timeout, output exhaustion or verified interruption that wins the
+race retains its evidenced outcome rather than becoming a cancelled process.
+The scheduler reconciles pending cancellations after the original RPC or host
+execution has ended, retaining the original run identity.
 
 On startup, the daemon locates uncertain workspace identities under its worker
 root and reacquires their directory locks before opening its transport. This
@@ -191,7 +220,7 @@ modify consumption records or access the supervisor through `/proc`.
 
 ## Ordered output, acknowledgement and retention
 
-These bounds are implementation decisions for Outpost 0.7.0. The daemon
+These bounds are implementation decisions for Outpost 0.8.0. The daemon
 defaults to a **2 MiB output spool per operation**, **64 MiB across retained
 operations**, and **1024 retained operations**. Operator flags on `daemon`
 configure the first two bounds:
