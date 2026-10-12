@@ -52,8 +52,14 @@ func serviceLifecycle(action, sourcePath, version string, force bool, timeout ti
 		}
 		defer os.Remove(staged)
 	}
-	if _, err := runAsWorker(selected.Binary, account, "drain", "--private-dir", selected.PrivateDir); err != nil {
-		return errors.New("cannot request drain; run drain as the worker and inspect service-status")
+	request := "drain"
+	if force {
+		// Durable intent precedes systemd's signal to the entire process group;
+		// a launcher can exit before the daemon handles its own signal.
+		request = "stop-intent"
+	}
+	if _, err := runAsWorker(selected.Binary, account, request, "--private-dir", selected.PrivateDir); err != nil {
+		return errors.New("cannot persist lifecycle request; inspect service-status before retrying")
 	}
 	if !force {
 		if err := waitForDrain(selected, account, timeout); err != nil {

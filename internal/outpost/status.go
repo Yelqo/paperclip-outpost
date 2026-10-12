@@ -60,10 +60,11 @@ func connectionStatus(dir string, c Connection, output io.Writer) error {
 			}
 		}
 	}
-	lifecycle, err := readLifecycle(dir)
+	state, err := readLifecycle(dir)
 	if err != nil {
 		return err
 	}
+	lifecycle := state.Status
 	if lifecycle == "draining" && status == "connected" && recorded.Lifecycle == "drained" {
 		if requestedAt := lifecycleRequestedAt(dir); !requestedAt.IsZero() && recorded.UpdatedAt.After(requestedAt) {
 			lifecycle = "drained"

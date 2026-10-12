@@ -198,7 +198,12 @@ The worker's `drain` command requests draining without waiting; `status` exposes
 `service-drain` waits for completion without replacing or stopping the service.
 `service-stop` ordinarily waits for the same drain before stopping.
 
-To explicitly interrupt active work instead:
+To explicitly interrupt active work, use `service-stop --force` or
+`service-upgrade --force`.
+
+The command persists forced-stop intent before signalling the service process
+group. Affected operations record interruption even if their launcher exits
+before the daemon handles its own signal; completed history remains unchanged.
 
 ```sh
 sudo /opt/paperclip-outpost/0.8.0/outpost service-stop --force

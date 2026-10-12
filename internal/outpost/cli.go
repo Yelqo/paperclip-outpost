@@ -170,6 +170,8 @@ func Run(args []string, input io.Reader, output io.Writer) error {
 	switch args[0] {
 	case "drain":
 		return setLifecycle(*privateDir, "draining", output)
+	case "stop-intent":
+		return persistLifecycle(*privateDir, lifecycleState{Status: "draining", ForceStop: true}, output)
 	case "resume":
 		return setLifecycle(*privateDir, "running", output)
 	case "upgrade-check":

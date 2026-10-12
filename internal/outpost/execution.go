@@ -421,12 +421,13 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 	}
 
 	s.mu.Lock()
-	if err := s.refreshLifecycle(); err != nil {
+	state, err := s.refreshLifecycle()
+	if err != nil {
 		s.mu.Unlock()
 		reply(nil, err)
 		return
 	}
-	if s.stopping || (s.draining && (op.Purpose == "agent_execution" || !s.drainRuns[op.RunID])) {
+	if s.stopping || state.ForceStop || (s.draining && (op.Purpose == "agent_execution" || !s.drainRuns[op.RunID])) {
 		s.mu.Unlock()
 		reply(nil, &executionUnavailable{"outpost is draining; new work stays in Paperclip"})
 		return
@@ -633,7 +634,12 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 	}
 	// Wait establishes the launcher outcome; namespace evidence establishes
 	// termination of the supervised tree. A request alone proves neither.
-	forced := ctx.Err() != nil && cancellationKilled.Load() && !record.CancelRequested && !limited && !outputFailed
+	state, lifecycleErr := readLifecycle(s.dir)
+	if lifecycleErr != nil {
+		outcome.OwnershipUncertain = true
+		outcome.Error = "cannot read lifecycle intent; execution outcome remains uncertain"
+	}
+	forced := (state.ForceStop || (ctx.Err() != nil && cancellationKilled.Load())) && !record.CancelRequested && !outcome.TimedOut && !limited && !outputFailed
 	if (record.CancelRequested || forced) && cmd.ProcessState != nil && !outcome.OwnershipUncertain {
 		for !namespaceGone && !s.terminated(record) {
 			s.mu.Unlock()
