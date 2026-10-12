@@ -45,5 +45,11 @@ export async function systemdVM(t, port, version) {
       '-R', `${port}:127.0.0.1:${port}`, 'root@127.0.0.1']);
   };
   await connect();
-  return {command, connect};
+  const copy = async (source, destination) => {
+    await exec('docker',['cp',source,`${name}:/tmp/selected-release`]);
+    await exec('docker',['exec',name,'scp','-i','/tmp/fixture-key','-P','32222',
+      '-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=/dev/null','-o','LogLevel=ERROR',
+      '/tmp/selected-release',`root@127.0.0.1:${destination}`]);
+  };
+  return {command, connect, copy};
 }

@@ -17,7 +17,7 @@ export type OutpostError = InvalidCredentials | RevokedOutpost | IncompatibleVer
 
 type Outpost = { id:string; companyId:string; name:string; credentialHash:string; revoked:boolean };
 type Session = { outpostId:string; companyId:string; scope:Scope.CloseableScope; authenticated?:boolean; reconciled?:boolean;
-  outputRetention?:unknown;
+  outputRetention?:unknown; draining?:boolean;
   expected?:ExecutionRecord[]; inventory?:Map<string,string>; recovery?:Array<{operationId:string;record?:ExecutionRecord}>; recoveryIndex?:number };
 const uuid = (value:unknown):value is string => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 const digest = (value:string) => createHash("sha256").update(value).digest();
@@ -31,7 +31,9 @@ function validVersions(value:unknown):boolean {
 /** SDK promises are adapted here; the workflows above this boundary use Effects. */
 export function createOutpostWorkflows(ctx:PluginContext) {
   const sessions = new Map<string,Session>();
-  const execution = createExecutionWorkflows(ctx,(companyId,outpostId) => [...sessions.values()].some(s => s.authenticated && s.reconciled && s.companyId===companyId && s.outpostId===outpostId));
+  const online = (companyId:string,outpostId:string) => [...sessions.values()].some(s => s.authenticated && s.reconciled && s.companyId===companyId && s.outpostId===outpostId);
+  const admitting = (companyId:string,outpostId:string) => [...sessions.values()].some(s => s.authenticated && s.reconciled && s.draining===false && s.companyId===companyId && s.outpostId===outpostId);
+  const execution = createExecutionWorkflows(ctx,online,admitting);
   const persistence = <A>(operation:() => Promise<A>) => Effect.tryPromise({try:operation, catch:() => new PersistenceFailure()});
   const read = (companyId:string,id:string) => persistence(() => ctx.state.get(stateKey(companyId,id))).pipe(Effect.map(value => value as Outpost | null));
   const write = (record:Outpost) => persistence(() => ctx.state.set(stateKey(record.companyId,record.id),record));
@@ -65,10 +67,11 @@ export function createOutpostWorkflows(ctx:PluginContext) {
       return {headers:{"Cache-Control":"no-store"},body:output};
     }
     const connected = [...sessions.values()].some(session => session.authenticated && session.companyId === record.companyId && session.outpostId === record.id);
-    const executionReady = [...sessions.values()].some(session => session.authenticated && session.reconciled && session.companyId === record.companyId && session.outpostId === record.id);
+    const executionReady = admitting(record.companyId,record.id);
+    const draining = [...sessions.values()].some(session => session.authenticated && session.draining && session.companyId === record.companyId && session.outpostId === record.id);
     const executionHistory=yield* persistence(()=>execution.history.all(record.companyId,record.id));
     const outputRetention=[...sessions.values()].find(session=>session.companyId===record.companyId && session.outpostId===record.id)?.outputRetention;
-    return {headers:{"Cache-Control":"no-store"},body:{outpostId:record.id,name:record.name,companyId:record.companyId,revoked:record.revoked,connected,executionReady,executionHistory,outputRetention}};
+    return {headers:{"Cache-Control":"no-store"},body:{outpostId:record.id,name:record.name,companyId:record.companyId,revoked:record.revoked,connected,executionReady,draining,executionHistory,outputRetention}};
   });
   const authenticate = (input:PluginWebSocketOpen) => Effect.gen(function* () {
     const id = input.query.outpostId;
@@ -154,14 +157,17 @@ export function createOutpostWorkflows(ctx:PluginContext) {
       session.reconciled=true;
       return {messages:[JSON.stringify({type:"recovery_ready"})]};
     }
-    if (data?.type === "heartbeat" && Object.keys(data).every(key=>key==="type" || key==="outputRetention")) {
+    if (data?.type === "heartbeat" && Object.keys(data).every(key=>key==="type" || key==="outputRetention" || key==="draining")) {
+      if(data.draining!==undefined && typeof data.draining!=="boolean") return yield* Effect.fail(new InvalidCredentials());
+      session.draining=data.draining===true;
       const retention=data.outputRetention;
       if(retention!==undefined) {
         if(!retention || typeof retention!=="object" || !["bytes","operations","perOperationBytes","totalBytes","maxOperations"].every(key=>Number.isSafeInteger(retention[key]) && retention[key]>=0)) return yield* Effect.fail(new InvalidCredentials());
         session.outputRetention=retention;
       }
       const operations=session.reconciled ? yield* persistence(()=>execution.drain(session.companyId,session.outpostId)) : [];
-      return {messages:[JSON.stringify({type:"pong",operations})]};
+      const drainComplete=session.draining && execution.drained(session.companyId,session.outpostId);
+      return {messages:[JSON.stringify({type:"pong",operations,drainComplete})]};
     }
     if (data?.type === "output" || data?.type === "result") {
       if(!session.reconciled) return yield* Effect.fail(new InvalidCredentials());

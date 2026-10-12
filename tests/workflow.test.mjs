@@ -10,10 +10,12 @@ import { createServer } from 'node:http';
 import { createServer as createTCPServer, connect as connectTCP } from 'node:net';
 import { versions as supportedVersions } from '../plugin/versions.ts';
 import { systemdVM } from './fixtures/systemd-vm.mjs';
+import { lifecycleRelease } from './fixtures/lifecycle-release.mjs';
 
 const root = resolve('.');
 const host = join(root, '.cache/paperclip');
 const home = mkdtempSync(join(tmpdir(), 'outpost-workflow-'));
+const pluginPackage = join(home,'outpost-plugin');
 const port = 32187;
 const origin = `http://127.0.0.1:${port}`;
 let server, cookie, company, boardToken;
@@ -90,7 +92,10 @@ before(async () => {
   company = await json('/api/companies', {name:'Outpost acceptance'});
   const key = await json('/api/board-api-keys', {name:'Outpost fixture operator', requestedCompanyId:company.id});
   boardToken = key.token;
-  const installed = await json('/api/plugins/install', {packageName:root, isLocalPath:true});
+  mkdirSync(pluginPackage);
+  cpSync(join(root,'dist'),join(pluginPackage,'dist'),{recursive:true});
+  cpSync(join(root,'package.json'),join(pluginPackage,'package.json'));
+  const installed = await json('/api/plugins/install', {packageName:pluginPackage, isLocalPath:true});
   assert.ok(installed);
 }, {timeout:120000});
 
@@ -164,6 +169,7 @@ test('selected standalone installation starts under systemd and recovers a real 
   assert.equal(recovered.outcome.interrupted,true);
   assert.equal((await vm.command(['cat','/home/worker/workspaces/launches'])).trim(),'effect');
   assert.equal((await vm.command(['git','-c','safe.directory=*','-C','/home/worker/workspaces','rev-parse','HEAD'])).trim(),history);
+
   const rebootStatus=JSON.parse(await vm.command([durable,'service-status']));
   assert.equal(rebootStatus.version,supportedVersions.daemon);
   assert.equal(rebootStatus.service.activeState,'active');
@@ -172,6 +178,84 @@ test('selected standalone installation starts under systemd and recovers a real 
   assert.equal(JSON.parse(await vm.command([durable,'version'])).daemon,supportedVersions.daemon);
   assert.equal((await terminalRun(run,20000)).status,'failed');
   assert.equal((await json(statusPath)).executionHistory.filter(record=>record.runId===run.id).length,1);
+
+  // A selected compatible artifact replaces the durable executable only after
+  // the active run finishes. The same release is a valid explicit reinstall.
+  await vm.command(['cp',durable,'/srv/upgrade-outpost']);
+  await assert.rejects(vm.command([durable,'service-upgrade','--binary','/srv/upgrade-outpost','--version','9.8.7']),/requested release version/);
+  const beforeUpgrade=JSON.parse(await vm.command([durable,'service-status']));
+  const upgradeAgent=await json(`/api/companies/${company.id}/agents`,{
+    name:'Systemd drain command',role:'engineer',adapterType:'process',defaultEnvironmentId:registration.environmentId,
+    adapterConfig:{command:'/bin/sh',args:['-c','echo drain >> launches; echo draining-work; while ! test -e finish-upgrade; do sleep .1; done; echo completed > completed'],cwd:'/home/worker/workspaces',timeoutSec:90},
+  });
+  const active=await json(`/api/agents/${upgradeAgent.id}/heartbeat/invoke`,{});
+  await eventually(async ()=>{
+    const response=await api(`/api/heartbeat-runs/${active.id}/log`);
+    return response.ok && (await response.json()).content.includes('draining-work');
+  },60000);
+  await assert.rejects(vm.command([durable,'service-upgrade','--binary','/srv/upgrade-outpost','--version',supportedVersions.daemon,'--timeout','1s']),/drain timed out/);
+  assert.equal(JSON.parse(await vm.command([durable,'service-status'])).service.mainPID,beforeUpgrade.service.mainPID);
+  const upgrading=vm.command([durable,'service-upgrade','--binary','/srv/upgrade-outpost','--version',supportedVersions.daemon,'--timeout','60s']);
+  upgrading.catch(()=>{});
+  await eventually(async ()=>(await json(statusPath)).draining,30000);
+  const duringUpgrade=JSON.parse(await vm.command([durable,'service-status']));
+  assert.equal(duringUpgrade.service.mainPID,beforeUpgrade.service.mainPID,'replacement waits for active work');
+  await vm.command(['runuser','-u','worker','--','touch','/home/worker/workspaces/finish-upgrade']);
+  assert.equal((await terminalRun(active,60000)).status,'succeeded');
+  assert.equal(JSON.parse(await upgrading).version,supportedVersions.daemon);
+  await eventually(async ()=>(await json(statusPath)).executionReady,60000);
+  const upgraded=JSON.parse(await vm.command([durable,'service-status']));
+  assert.notEqual(upgraded.service.mainPID,beforeUpgrade.service.mainPID);
+  assert.equal(upgraded.connection.outpostId,registration.outpostId);
+  assert.equal((await vm.command(['cat','/home/worker/workspaces/completed'])).trim(),'completed');
+  assert.equal((await vm.command(['git','-c','safe.directory=*','-C','/home/worker/workspaces','rev-parse','HEAD'])).trim(),history);
+
+  const selectedVersion='0.8.1-lifecycle-fixture';
+  const release=lifecycleRelease(join(home,'selected-release'),supportedVersions.daemon,selectedVersion);
+  await vm.copy(release,'/srv/new-release');
+  await vm.command(['chmod','755','/srv/new-release']);
+  await assert.rejects(vm.command([durable,'service-upgrade','--binary','/srv/new-release','--version',selectedVersion]),/incompatible/);
+  assert.equal(JSON.parse(await vm.command([durable,'service-status'])).service.mainPID,upgraded.service.mainPID);
+  // Drain before changing the instance's exact plugin/daemon release pins.
+  await vm.command([durable,'service-drain','--timeout','30s']);
+  const selectPlugin = async version => {
+    const pkg=JSON.parse(readFileSync(join(root,'package.json'),'utf8'));
+    pkg.version=version;
+    writeFileSync(join(pluginPackage,'package.json'),JSON.stringify(pkg));
+    for(const file of ['worker.js','manifest.js']) writeFileSync(join(pluginPackage,'dist',file),
+      readFileSync(join(root,'dist',file),'utf8').replaceAll(`"${supportedVersions.plugin}"`,`"${version}"`));
+    await json('/api/plugins/yelqo.outpost/upgrade',{version});
+  };
+  t.after(async()=>{await selectPlugin(supportedVersions.plugin);});
+  await selectPlugin(selectedVersion);
+  const changed=JSON.parse(await vm.command([durable,'service-upgrade','--binary','/srv/new-release','--version',selectedVersion,'--timeout','60s']));
+  const selectedBinary=`/opt/paperclip-outpost/${selectedVersion}/outpost`;
+  assert.equal(changed.version,selectedVersion);
+  assert.equal(changed.binary,selectedBinary);
+  assert.equal(JSON.parse(await vm.command([selectedBinary,'version'])).daemon,selectedVersion);
+  await eventually(async ()=>(await json(statusPath)).executionReady,60000);
+  assert.equal(JSON.parse(await vm.command([selectedBinary,'service-status'])).connection.outpostId,registration.outpostId);
+
+  await json(`/api/agents/${upgradeAgent.id}`,{adapterConfig:{command:'/bin/sh',args:['-c','echo forced >> launches; (sleep 5; echo escaped > escaped) & echo forced-start; sleep 90'],cwd:'/home/worker/workspaces',timeoutSec:120}},undefined,'PATCH');
+  const interrupted=await json(`/api/agents/${upgradeAgent.id}/heartbeat/invoke`,{});
+  await eventually(async ()=>{
+    const response=await api(`/api/heartbeat-runs/${interrupted.id}/log`);
+    return response.ok && (await response.json()).content.includes('forced-start');
+  },60000);
+  assert.equal(JSON.parse(await vm.command([selectedBinary,'service-stop','--force'])).status,'termination-confirmed');
+  assert.equal(JSON.parse(await vm.command([selectedBinary,'service-status'])).service.activeState,'inactive');
+  await vm.command(['systemctl','start','paperclip-outpost.service']);
+  await eventually(async ()=>{
+    const status=await json(statusPath);
+    recovered=status.executionHistory.find(record=>record.runId===interrupted.id);
+    return recovered?.status==='interrupted';
+  },60000);
+  assert.equal(recovered.outcome.interrupted,true);
+  assert.equal(recovered.outcome.ownershipUncertain,undefined);
+  await delay(5500);
+  await vm.command(['test','!','-e','/home/worker/workspaces/escaped']);
+  assert.equal((await vm.command(['cat','/home/worker/workspaces/launches'])).trim(),'effect\ndrain\nforced');
+  assert.equal((await terminalRun(interrupted,20000)).status,'failed');
 });
 
 test('operator registers a distinct outpost and selects its named environment', async () => {
@@ -255,7 +339,8 @@ async function startExecutionDaemon(env={},args=[]) {
   let output=''; daemon.stdout.on('data',data => {output+=data;}); daemon.stderr.on('data',data => {output+=data;});
   await eventually(async () => {
     assert.equal(daemon.exitCode,null,output);
-    return (await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).executionReady;
+    const status=await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`);
+    return status.executionReady || (status.connected && status.draining);
   });
   return daemon;
 }
@@ -277,6 +362,10 @@ test('actual Pi reads its assigned task through the callback bridge and retains 
     let input=''; for await(const chunk of req) input+=chunk;
     const body=JSON.parse(input);
     assert.equal(req.headers.authorization,'Bearer machine-provider-key');
+    if(calls===0) {
+      cli(['drain','--private-dir',piPrivate]);
+      await eventually(async ()=>(await json(`/api/plugins/yelqo.outpost/api/outposts/${piRegistration.outpostId}?companyId=${company.id}`)).draining);
+    }
     for (const secret of Object.values(proxySecrets)) assert.ok(!JSON.stringify(body).includes(secret),'Access credential reached Pi through runtime or callback input');
     const steps=[
       ['paperclip_coordination',{operation:'task'}],
@@ -345,8 +434,14 @@ test('actual Pi reads its assigned task through the callback bridge and retains 
       }
       const comments=await json(`/api/issues/${task.id}/comments`);
       assert.equal(comments.length,attempt+1);
+      assert.ok(existsSync(join(workspace,'pi-effect.txt')),log.content);
       assert.equal(readFileSync(join(workspace,'pi-effect.txt'),'utf8'),'machine-owned Pi effect\n');
       assert.equal(execFileSync('git',['-C',workspace,'rev-parse','HEAD'],{encoding:'utf8'}),history);
+      if(attempt===0) {
+        await eventually(()=>JSON.parse(cli(['status','--private-dir',piPrivate])).lifecycle==='drained');
+        cli(['resume','--private-dir',piPrivate]);
+        await eventually(async ()=>(await json(`/api/plugins/yelqo.outpost/api/outposts/${piRegistration.outpostId}?companyId=${company.id}`)).executionReady);
+      }
     }
     assert.equal(readFileSync(join(workspace,'pi-second-effect.txt'),'utf8'),'machine-owned Pi effect\n');
     assert.equal(readFileSync(join(agentDir,'models.json'),'utf8'),modelConfig);
@@ -804,6 +899,98 @@ async function scheduledRetry(run) {
   });
   return json(`/api/heartbeat-runs/${retry.id}`);
 }
+
+test('operator drain retains new work while an active run and later associated control finish', {timeout:60000}, async () => {
+  await installExecutionAdapter();
+  const daemon=await startExecutionDaemon();
+  const workspace=join(home,'workspaces','drain'); mkdirSync(workspace);
+  const pendingWorkspace=join(home,'workspaces','drain-pending'); mkdirSync(pendingWorkspace);
+  const statusPath=`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`;
+  try {
+    const agent=await commandAgent(workspace,'',{scenario:'drain'});
+    const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{});
+    await eventually(()=>existsSync(join(workspace,'started')));
+    assert.equal(JSON.parse(cli(['drain','--private-dir',privateDir])).status,'draining');
+    await eventually(async ()=>(await json(statusPath)).draining);
+    const next=await commandAgent(pendingWorkspace,'echo next >> launches');
+    const deferred=await terminalRun(await json(`/api/agents/${next.id}/heartbeat/invoke`,{}));
+    assert.equal(deferred.errorCode,'execution_unavailable');
+    const retry=await scheduledRetry(deferred);
+    assert.equal(retry.scheduledRetryReason,'execution_unavailable');
+    assert.equal(existsSync(join(pendingWorkspace,'launches')),false);
+    writeFileSync(join(workspace,'start-control'),'');
+    await eventually(()=>existsSync(join(workspace,'control')));
+    assert.equal(JSON.parse(cli(['status','--private-dir',privateDir])).lifecycle,'draining');
+    writeFileSync(join(workspace,'allow-finish'),'');
+    assert.equal((await terminalRun(run)).status,'succeeded');
+    await eventually(()=>JSON.parse(cli(['status','--private-dir',privateDir])).lifecycle==='drained');
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'agent\n');
+    await stopExecutionDaemon(daemon);
+    const restarted=await startExecutionDaemon();
+    await eventually(async ()=>(await json(statusPath)).draining);
+    cli(['resume','--private-dir',privateDir]);
+    await eventually(async ()=>(await json(statusPath)).executionReady);
+    const resumed=await json(`/api/agents/${next.id}/heartbeat/invoke`,{});
+    assert.equal((await terminalRun(resumed)).status,'succeeded');
+    await json(`/api/heartbeat-runs/${retry.id}/cancel`,{});
+    await stopExecutionDaemon(restarted);
+  } finally {
+    cli(['resume','--private-dir',privateDir]);
+    await stopExecutionDaemon(daemon);
+    await removeExecutionAdapter();
+  }
+});
+
+test('drain preserves an active run lease through the gap before its later control', {timeout:60000}, async () => {
+  await installExecutionAdapter();
+  const daemon=await startExecutionDaemon();
+  const workspace=join(home,'workspaces','drain-operation-gap'); mkdirSync(workspace);
+  try {
+    const agent=await commandAgent(workspace,'',{scenario:'drain-after-agent'});
+    const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{});
+    await eventually(async ()=>{
+      const response=await api(`/api/heartbeat-runs/${run.id}/log`);
+      return response.ok && (await response.json()).content.includes('awaiting-associated-control');
+    });
+    cli(['drain','--private-dir',privateDir]);
+    await eventually(async ()=>(await json(`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`)).draining);
+    assert.equal(JSON.parse(cli(['status','--private-dir',privateDir])).lifecycle,'draining');
+    writeFileSync(join(workspace,'start-control'),'');
+    assert.equal((await terminalRun(run)).status,'succeeded');
+    assert.equal(readFileSync(join(workspace,'control'),'utf8'),'control\n');
+    await eventually(()=>JSON.parse(cli(['status','--private-dir',privateDir])).lifecycle==='drained');
+  } finally {
+    cli(['resume','--private-dir',privateDir]);
+    await stopExecutionDaemon(daemon);
+    await removeExecutionAdapter();
+  }
+});
+
+test('forced daemon stop confirms interruption and preserves descendant termination across restart', {timeout:60000}, async () => {
+  let daemon=await startExecutionDaemon();
+  const workspace=join(home,'workspaces','forced-stop'); mkdirSync(workspace);
+  const statusPath=`/api/plugins/yelqo.outpost/api/outposts/${registered.outpostId}?companyId=${company.id}`;
+  try {
+    const agent=await commandAgent(workspace,'echo once >> launches; (sleep 3; echo escaped > escaped) & echo started > started; sleep 60',{timeoutSec:90});
+    const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{});
+    await eventually(()=>existsSync(join(workspace,'started')));
+    await stopExecutionDaemon(daemon);
+    await eventually(()=>daemon.exitCode!==null || daemon.signalCode!==null);
+    daemon=await startExecutionDaemon();
+    let record;
+    await eventually(async ()=>{
+      record=(await json(statusPath)).executionHistory.find(value=>value.runId===run.id);
+      return record?.outcome;
+    });
+    assert.equal(record.status,'interrupted');
+    assert.equal(record.outcome.interrupted,true);
+    assert.equal(record.outcome.ownershipUncertain,undefined);
+    assert.equal((await terminalRun(run)).status,'failed');
+    await delay(3500);
+    assert.equal(existsSync(join(workspace,'escaped')),false);
+    assert.equal(readFileSync(join(workspace,'launches'),'utf8'),'once\n');
+  } finally { await stopExecutionDaemon(daemon); }
+});
 
 test('offline work stays pending in Paperclip and the scheduler launches it after reconnection', {timeout:60000}, async () => {
   const workspace=join(home,'workspaces','offline'); mkdirSync(workspace);

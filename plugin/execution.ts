@@ -51,7 +51,7 @@ function readInspection(value:unknown):Inspection {
 
 /** Commands enter through Paperclip's driver; the transport only delivers them.
  * No transport redelivery or lease reuse creates a new execution identity. */
-export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:string,outpostId:string) => boolean) {
+export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:string,outpostId:string) => boolean, admitting = online) {
   const history=createRecoveryHistory(ctx);
   const output=createOutputHistory(ctx);
   const pending = new Map<string,Pending>();
@@ -64,6 +64,7 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
   const key = (companyId:string,outpostId:string) => `${companyId}:${outpostId}`;
   const dispatch = <A>(companyId:string,outpostId:string,request:OperationRequest,readResult:(value:unknown)=>A,onOutput?:(frame:OutputFrame)=>void,onSent?:()=>void):Promise<A> => {
     if (!online(companyId,outpostId)) return Promise.reject(unavailable("Outpost is offline"));
+    if(request.type==="execute" && request.purpose==="agent_execution" && !admitting(companyId,outpostId)) return Promise.reject(unavailable("Outpost is draining"));
     const role=request.type==="inspect" ? undefined : request.purpose;
     const rolePending=[...pending.values()].filter(value => value.companyId===companyId && value.outpostId===outpostId && value.identity?.purpose===role).length;
     if (rolePending >= 16) return Promise.reject(unavailable("Outpost admission capacity reached"));
@@ -110,6 +111,10 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
     const message=queue?.shift();
     const request=message && pending.get(message.requestId);
     if(request && message?.type==="execute") {
+      if(message.purpose==="agent_execution" && !admitting(companyId,outpostId)) {
+        request.reject(Object.assign(unavailable("Outpost is draining"),{beforeLaunch:true}));
+        return operations;
+      }
       if(await ctx.state.get(cancellationScope(companyId,outpostId,message.runId))===true) {
         request.reject(Object.assign(new Error("Run cancelled before dispatch"),{beforeLaunch:true}));
         return operations;
@@ -194,7 +199,7 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
   };
   const acquire = async (input:PluginEnvironmentAcquireLeaseParams) => {
     const id=outpost(input);
-    if (!online(input.companyId,id)) throw unavailable("Outpost is offline");
+    if (!admitting(input.companyId,id)) throw unavailable("Outpost is offline or draining");
     if (!input.runId) throw new Error("An explicit run is required");
     if (!["process","pi_local"].includes(input.adapterType ?? "")) throw new Error("This Outpost release supports process and pi_local adapters");
     const providerLeaseId=randomUUID();
@@ -280,5 +285,10 @@ export function createExecutionWorkflows(ctx:PluginContext, online:(companyId:st
     if (result.error) throw Object.assign(new Error(result.error),result.error==="output limit exceeded" ? {code:PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTPUT_LIMIT} : {});
     return {...result,stdout,stderr};
   };
-  return {acquire,realize,execute,release,drain,message,close,history,output,reconcile,restore,cancelRun};
+  const drained = (companyId:string,outpostId:string) => {
+    const outpostKey=key(companyId,outpostId);
+    return ![...leases.values()].some(lease=>lease.outpostKey===outpostKey) &&
+      ![...pending.values()].some(request=>request.companyId===companyId && request.outpostId===outpostId);
+  };
+  return {acquire,realize,execute,release,drain,drained,message,close,history,output,reconcile,restore,cancelRun};
 }

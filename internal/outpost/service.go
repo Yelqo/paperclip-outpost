@@ -40,6 +40,8 @@ func manageService(args []string, output io.Writer) error {
 	version := f.String("version", "", "explicit selected release")
 	worker := f.String("worker", "", "existing unprivileged worker account")
 	privateDir := f.String("private-dir", "", "persisted protected connection directory")
+	force := f.Bool("force", false, "explicitly interrupt active work and verify termination")
+	timeout := f.Duration("timeout", 70*time.Minute, "maximum time to wait for drain and restart")
 	if f.Parse(args[1:]) != nil || f.NArg() != 0 {
 		return errors.New("invalid service command arguments")
 	}
@@ -48,6 +50,15 @@ func manageService(args []string, output io.Writer) error {
 	}
 	if args[0] == "service-status" {
 		return serviceStatus(output)
+	}
+	if args[0] == "service-upgrade" || args[0] == "service-drain" || args[0] == "service-stop" {
+		if *timeout <= 0 || *timeout > 2*time.Hour {
+			return errors.New("lifecycle timeout must be positive and at most 2h")
+		}
+		return serviceLifecycle(args[0], *binary, *version, *force, *timeout, output)
+	}
+	if args[0] != "service-install" {
+		return errors.New("unknown system service command")
 	}
 	selected := installation{Version: *version, Worker: *worker, PrivateDir: *privateDir}
 	if !releaseVersion.MatchString(*version) || !filepath.IsAbs(*binary) {
@@ -113,7 +124,29 @@ func manageService(args []string, output io.Writer) error {
 	if err != nil || json.Unmarshal(data, &identity) != nil || identity.OutpostID == "" {
 		return errors.New("worker must have valid protected registration state; run configure, register and check as the worker first")
 	}
-	unit := fmt.Sprintf(`[Unit]
+	unit := serviceUnit(selected, account)
+	if err := writeInstalledFile(unitPath, []byte(unit)); err != nil {
+		return err
+	}
+	unitWritten = true
+	// Retain a complete installation if systemd enable/start fails, so status
+	// and a documented systemctl retry can diagnose and finish setup.
+	metadata, _ := json.Marshal(selected)
+	if err := writeInstalledFile(filepath.Join(installRoot, "installation.json"), metadata); err != nil {
+		return err
+	}
+	installed = true
+	if _, err := systemctl("daemon-reload"); err != nil {
+		return err
+	}
+	if _, err := systemctl("enable", "--now", serviceName); err != nil {
+		return err
+	}
+	return json.NewEncoder(output).Encode(selected)
+}
+
+func serviceUnit(selected installation, account *user.User) string {
+	return fmt.Sprintf(`[Unit]
 Description=Paperclip Outpost
 Wants=network-online.target
 After=network-online.target
@@ -139,24 +172,6 @@ StandardError=journal
 WantedBy=multi-user.target
 `, selected.Worker, account.Gid, account.HomeDir, account.HomeDir, account.HomeDir,
 		selected.PrivateDir, selected.Binary, selected.PrivateDir)
-	if err := writeInstalledFile(unitPath, []byte(unit)); err != nil {
-		return err
-	}
-	unitWritten = true
-	// Retain a complete installation if systemd enable/start fails, so status
-	// and a documented systemctl retry can diagnose and finish setup.
-	metadata, _ := json.Marshal(selected)
-	if err := writeInstalledFile(filepath.Join(installRoot, "installation.json"), metadata); err != nil {
-		return err
-	}
-	installed = true
-	if _, err := systemctl("daemon-reload"); err != nil {
-		return err
-	}
-	if _, err := systemctl("enable", "--now", serviceName); err != nil {
-		return err
-	}
-	return json.NewEncoder(output).Encode(selected)
 }
 
 func serviceAccount(selected installation) (*user.User, error) {
@@ -235,24 +250,32 @@ func systemctl(args ...string) ([]byte, error) {
 	command.Env = []string{"PATH=/usr/bin:/bin", "SYSTEMD_PAGER=cat"}
 	data, err := command.Output()
 	if err != nil {
-		return nil, errors.New("systemd command failed; inspect service-status and journalctl -u paperclip-outpost.service, then retry daemon-reload and enable --now")
+		return nil, fmt.Errorf("systemd %s failed; inspect service-status and journalctl -u paperclip-outpost.service before retrying the command", args[0])
 	}
 	return data, nil
 }
 
-func serviceStatus(output io.Writer) error {
+func readInstallation() (installation, error) {
+	var selected installation
 	if err := secureInstallDirectory(installRoot); err != nil {
-		return err
+		return selected, err
 	}
 	path := filepath.Join(installRoot, "installation.json")
 	info, err := os.Lstat(path)
 	if err != nil || !info.Mode().IsRegular() || !owned(info) || info.Mode().Perm()&0022 != 0 {
-		return errors.New("no protected service installation metadata; install a selected standalone release first")
+		return selected, errors.New("no protected service installation metadata; install a selected standalone release first")
 	}
 	data, err := os.ReadFile(path)
-	var selected installation
 	if err != nil || json.Unmarshal(data, &selected) != nil || !releaseVersion.MatchString(selected.Version) || selected.Binary != filepath.Join(installRoot, selected.Version, "outpost") {
-		return errors.New("invalid service installation metadata")
+		return selected, errors.New("invalid service installation metadata")
+	}
+	return selected, nil
+}
+
+func serviceStatus(output io.Writer) error {
+	selected, err := readInstallation()
+	if err != nil {
+		return err
 	}
 	account, err := serviceAccount(selected)
 	if err != nil {
@@ -269,7 +292,7 @@ func serviceStatus(output io.Writer) error {
 			service[strings.ToLower(key[:1])+key[1:]] = value
 		}
 	}
-	data, err = runAsWorker(selected.Binary, account, "status", "--private-dir", selected.PrivateDir)
+	data, err := runAsWorker(selected.Binary, account, "status", "--private-dir", selected.PrivateDir)
 	var connection any
 	if err != nil || json.Unmarshal(data, &connection) != nil {
 		connection = map[string]string{"status": "unavailable", "diagnostic": "run status as the worker to inspect protected connection state"}

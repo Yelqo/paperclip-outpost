@@ -104,6 +104,10 @@ type supervisor struct {
 	fault          func(string)
 	outputs        *outputStore
 	cancels        map[string]context.CancelFunc
+	draining       bool
+	drainRuns      map[string]bool
+	stopping       bool
+	workers        sync.WaitGroup
 }
 
 func newSupervisor(dir string, c Connection) (*supervisor, error) {
@@ -417,6 +421,16 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 	}
 
 	s.mu.Lock()
+	if err := s.refreshLifecycle(); err != nil {
+		s.mu.Unlock()
+		reply(nil, err)
+		return
+	}
+	if s.stopping || (s.draining && (op.Purpose == "agent_execution" || !s.drainRuns[op.RunID])) {
+		s.mu.Unlock()
+		reply(nil, &executionUnavailable{"outpost is draining; new work stays in Paperclip"})
+		return
+	}
 	if _, seen := s.records[op.OperationID]; seen {
 		s.mu.Unlock()
 		reply(nil, errors.New("operation was already admitted; it will not launch again"))
@@ -619,18 +633,23 @@ func (s *supervisor) handle(ctx context.Context, op operation, send func(any) er
 	}
 	// Wait establishes the launcher outcome; namespace evidence establishes
 	// termination of the supervised tree. A request alone proves neither.
-	if record.CancelRequested && cmd.ProcessState != nil && !outcome.OwnershipUncertain {
+	forced := ctx.Err() != nil && cancellationKilled.Load() && !record.CancelRequested && !limited && !outputFailed
+	if (record.CancelRequested || forced) && cmd.ProcessState != nil && !outcome.OwnershipUncertain {
 		for !namespaceGone && !s.terminated(record) {
 			s.mu.Unlock()
 			time.Sleep(10 * time.Millisecond)
 			s.mu.Lock()
 			if record.ProcessStart == "" {
 				outcome.OwnershipUncertain = true
-				outcome.Error = "cancellation termination evidence is unavailable"
+				outcome.Error = "process termination evidence is unavailable"
 				break
 			}
 		}
-		outcome.Cancelled = !outcome.OwnershipUncertain && cancellationKilled.Load() && processCtx.Err() == context.Canceled && outcome.Signal == syscall.SIGKILL.String() && !limited && !outputFailed
+		outcome.Cancelled = record.CancelRequested && !outcome.OwnershipUncertain && cancellationKilled.Load() && processCtx.Err() == context.Canceled && outcome.Signal == syscall.SIGKILL.String() && !limited && !outputFailed
+		if forced && !outcome.OwnershipUncertain {
+			outcome.Interrupted = true
+			outcome.Error = interruptedOutcome().Error
+		}
 	}
 	record.Outcome = &outcome
 	record.Status = recordStatus(record)

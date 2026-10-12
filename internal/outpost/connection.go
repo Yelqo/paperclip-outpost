@@ -61,6 +61,13 @@ func connect(privateDir string, c Connection, output io.Writer, daemon bool) err
 			return err
 		}
 		defer supervisor.lock.Close()
+		defer func() {
+			supervisor.mu.Lock()
+			supervisor.stopping = true
+			supervisor.mu.Unlock()
+			stop()
+			supervisor.workers.Wait()
+		}()
 		if err := writeDaemonStatus(privateDir, "connecting"); err != nil {
 			return err
 		}
@@ -155,7 +162,12 @@ func session(ctx context.Context, c Connection, output io.Writer, daemon bool, s
 		_ = ws.Close(websocket.StatusNormalClosure, "connection checked")
 		return nil
 	}
-	if err := writeDaemonStatus(s.dir, "connected"); err != nil {
+	recordedLifecycle, err := s.lifecycle()
+	if err != nil {
+		return err
+	}
+	recordedRequest := lifecycleRequestedAt(s.dir)
+	if err := writeDaemonStatus(s.dir, "connected", recordedLifecycle); err != nil {
 		return err
 	}
 	var writeMu sync.Mutex
@@ -169,9 +181,10 @@ func session(ctx context.Context, c Connection, output io.Writer, daemon bool, s
 		return wsjson.Write(writeCtx, ws, value)
 	}
 	type incoming struct {
-		Type       string      `json:"type"`
-		DeliveryID string      `json:"deliveryId"`
-		Operations []operation `json:"operations"`
+		Type          string      `json:"type"`
+		DeliveryID    string      `json:"deliveryId"`
+		Operations    []operation `json:"operations"`
+		DrainComplete bool        `json:"drainComplete"`
 	}
 	pongs := make(chan incoming, 1)
 	acks := make(chan string, 1)
@@ -251,7 +264,11 @@ func session(ctx context.Context, c Connection, output io.Writer, daemon bool, s
 				return errDisconnected
 			}
 		}
-		if err = write(map[string]any{"type": "heartbeat", "outputRetention": s.outputs.retention()}); err != nil {
+		lifecycle, lifecycleErr := s.lifecycle()
+		if lifecycleErr != nil {
+			return lifecycleErr
+		}
+		if err = write(map[string]any{"type": "heartbeat", "outputRetention": s.outputs.retention(), "draining": lifecycle == "draining"}); err != nil {
 			return errDisconnected
 		}
 		var reply incoming
@@ -270,7 +287,18 @@ func session(ctx context.Context, c Connection, output io.Writer, daemon bool, s
 			return errDisconnected
 		}
 		for _, op := range reply.Operations {
-			go s.handle(ctx, op, send)
+			s.workers.Add(1)
+			go func(op operation) { defer s.workers.Done(); s.handle(ctx, op, send) }(op)
+		}
+		if reply.DrainComplete && lifecycle == "draining" && s.drained() {
+			lifecycle = "drained"
+		}
+		requestedAt := lifecycleRequestedAt(s.dir)
+		if lifecycle != recordedLifecycle || !requestedAt.Equal(recordedRequest) {
+			if err := writeDaemonStatus(s.dir, "connected", lifecycle); err != nil {
+				return err
+			}
+			recordedLifecycle, recordedRequest = lifecycle, requestedAt
 		}
 		select {
 		case <-ctx.Done():
