@@ -324,6 +324,15 @@ test('actual Pi human approvals preserve continuation, scope and one-time author
   });
   await new Promise(r=>provider.listen(0,'127.0.0.1',r));
   t.after(async()=>{provider.closeAllConnections(); await new Promise(r=>provider.close(r));});
+  const pauseProviderAfterTool=()=>{
+    let release;
+    providerPause=new Promise(resolve=>{release=resolve;});
+    holdAfterTool=true;
+    const reached=new Promise(resolve=>{providerReached=resolve;});
+    return {reached,release(){
+      release(); providerPause=undefined; providerReached=undefined; holdAfterTool=false;
+    }};
+  };
   writeFileSync(join(agentDir,'models.json'),JSON.stringify({providers:{fixture:{baseUrl:`http://127.0.0.1:${provider.address().port}/v1`,api:'openai-completions',apiKey:'fixture-key',models:[{id:'fixture',reasoning:false,input:['text'],cost:{input:0,output:0,cacheRead:0,cacheWrite:0},contextWindow:128000,maxTokens:4096}]}}}));
   execFileSync('git',['init',workspace],{stdio:'ignore'});
   execFileSync('git',['-C',workspace,'config','user.name','Fixture']);
@@ -408,6 +417,8 @@ test('actual Pi human approvals preserve continuation, scope and one-time author
     const before=new Set((await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`)).map(run=>run.id));
     await json(`/api/issues/${task.id}/interactions/${card.id}/${decision}`,{});
     let continuation;
+    // A resolved card may wait for the preceding lease's cleanup and the
+    // scheduler tick before its distinct continuation becomes observable.
     await eventually(async()=>{
       continuation=(await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`)).find(run=>!before.has(run.id) && run.contextSnapshot?.interactionId===card.id);
       if(!continuation) {
@@ -419,7 +430,7 @@ test('actual Pi human approvals preserve continuation, scope and one-time author
         }
       }
       return continuation;
-    });
+    },60000);
     continuation=await approvalRun(continuation);
     assert.equal(continuation.contextSnapshot.interactionId,card.id);
     return continuation;
@@ -431,18 +442,15 @@ test('actual Pi human approvals preserve continuation, scope and one-time author
       task=await newTask('Preserve context from the first interrupted Pi attempt');
       tool={name:'write',arguments:{path:'interrupted-context.txt',content:'Prior attempt context survives interruption.\n'}};
       await json(`/api/agents/${agent.id}`,{adapterConfig:{...agent.adapterConfig,timeoutSec:15}},undefined,'PATCH');
-      let releaseProvider;
-      providerPause=new Promise(resolve=>{releaseProvider=resolve;});
-      holdAfterTool=true;
-      const reached=new Promise(resolve=>{providerReached=resolve;});
+      const paused=pauseProviderAfterTool();
       try {
         const attempt=invoke();
-        await reached;
+        await paused.reached;
         const interrupted=await attempt;
         assert.equal(interrupted.status,'timed_out');
         assert.ok(interrupted.sessionIdAfter,'An interrupted first attempt must retain its actual Pi session');
         assert.equal(readFileSync(join(workspace,'interrupted-context.txt'),'utf8'),'Prior attempt context survives interruption.\n');
-        releaseProvider(); providerPause=undefined; providerReached=undefined; holdAfterTool=false;
+        paused.release();
         await eventually(async()=>!(await json(`/api/issues/${task.id}`)).executionBlocker,35000);
         tool={name:'read',arguments:{path:'interrupted-context.txt'}};
         observeContinuation=true;
@@ -458,7 +466,7 @@ test('actual Pi human approvals preserve continuation, scope and one-time author
         assert.equal(new Set(operations.map(record=>record.operationId)).size,2);
         await json(`/api/issues/${task.id}`,{status:'done'},undefined,'PATCH');
       } finally {
-        releaseProvider(); providerPause=undefined; providerReached=undefined; holdAfterTool=false; observeContinuation=false; tool=undefined;
+        paused.release(); observeContinuation=false; tool=undefined;
         await json(`/api/agents/${agent.id}`,{adapterConfig:agent.adapterConfig},undefined,'PATCH');
       }
       task=await newTask('Commit the approved local effect once');
@@ -650,18 +658,15 @@ process.exit(child.status ?? 1);
       const proposalRun=await invoke();
       const pending=(await interactions()).find(card=>card.status==='pending');
       assert.ok(pending);
-      let releaseProvider;
-      providerPause=new Promise(resolve=>{releaseProvider=resolve;});
-      holdAfterTool=true;
-      const reached=new Promise(resolve=>{providerReached=resolve;});
+      const paused=pauseProviderAfterTool();
       try {
         const attempt=decisionRun(pending,'accept');
-        await reached;
+        await paused.reached;
         assert.equal(commits(),3,'The accepted action must execute once before interruption');
         daemon.kill('SIGTERM');
         await new Promise(resolve=>daemon.once('exit',resolve));
         await eventually(async()=>!(await json(statusPath)).connected);
-        releaseProvider(); providerPause=undefined; providerReached=undefined; holdAfterTool=false;
+        paused.release();
         daemon=startDaemon();
         await eventually(async()=>(await json(statusPath)).executionReady);
         const interrupted=await attempt;
@@ -695,7 +700,7 @@ process.exit(child.status ?? 1);
         assert.equal(new Set(operations.map(record=>record.operationId)).size,3);
         await json(`/api/issues/${task.id}`,{status:'done'},undefined,'PATCH');
       } finally {
-        releaseProvider(); providerPause=undefined; providerReached=undefined; holdAfterTool=false;
+        paused.release();
       }
     }
   } finally {
