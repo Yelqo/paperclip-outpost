@@ -330,3 +330,41 @@ test('exhaustion recovered after the grace period cannot make the original failu
   // It must never change the original failure into a retryable adapter failure.
   await f.admit('operator-continuation');
 });
+
+test('a continuation waits for reconciliation and old operation redelivery cannot launch it',async t => {
+  t.mock.timers.enable({apis:['setTimeout']});
+  const f=fixture();
+  const originalLease=await f.admit('original');
+  const original=f.execute(originalLease,'original','original:agent','agent_execution');
+  const lost=assert.rejects(original,{code:PLUGIN_RPC_ERROR_CODES.EXECUTION_OUTCOME_UNCERTAIN});
+  const request=await f.drain();
+  f.offline();
+  f.execution.close('company','outpost');
+  t.mock.timers.tick(15001);
+  await lost;
+  await f.release(originalLease);
+  f.reconnect();
+  await assert.rejects(f.admit('continuation'),/busy|uncertain/);
+  const record={runId:'original',operationId:'original:agent',purpose:'agent_execution',workspace:'1:2',deadline:request.deadline,
+    status:'interrupted',outcome:{exitCode:null,timedOut:false,interrupted:true,error:'execution interrupted'}};
+  await f.execution.history.report('company','outpost',record);
+  await f.execution.reconcile('company','outpost',record);
+  const replayLease=await f.admit('original');
+  const replay=f.execute(replayLease,'original','original:agent','agent_execution');
+  const refused=assert.rejects(replay,/already admitted/);
+  assert.equal(await f.drain(),undefined,'Redelivery cannot dispatch another launch');
+  await refused;
+  await f.release(replayLease);
+  const continuationLease=await f.admit('continuation');
+  const continuation=f.execute(continuationLease,'continuation','continuation:agent','agent_execution');
+  const dispatch=await f.drain();
+  assert.equal(dispatch.runId,'continuation');
+  assert.equal(dispatch.operationId,'continuation:agent');
+  await f.reply(dispatch,{exitCode:0,timedOut:false});
+  assert.equal((await continuation).exitCode,0);
+  await f.release(continuationLease);
+  const records=await f.execution.history.all('company','outpost');
+  assert.deepEqual(records.map(record=>[record.runId,record.operationId]),[
+    ['original','original:agent'],['continuation','continuation:agent'],
+  ]);
+});

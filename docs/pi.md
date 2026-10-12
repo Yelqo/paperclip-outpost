@@ -147,6 +147,14 @@ and single use; a duplicate decision or wake cannot reuse it. Denial blocks
 the operation. Changing the requested command or its evidence invalidates the
 old local proposal and withdraws a pending card through the bridge.
 
+Before executing an accepted operation, pi-config consumes it in private local
+state and atomically claims its Paperclip card through the callback bridge.
+Paperclip records `result.executionConsumption` with the claiming run and time.
+Both records are required; a lost claim response consumes the grant without
+executing it. Revalidation requires the same instance record immediately before
+execution. Restoring local approval state cannot reuse the accepted card, and
+losing instance consumption history cannot override the local consumed record.
+
 Callback queues and session files stay outside the workspace, and descriptor
 protection uses stable directories. A new run's transport token and private
 filename therefore do not invalidate an otherwise unchanged operation scope.
@@ -157,6 +165,33 @@ blocked. Reconnection supplies transport connectivity, never human approval.
 The transport admits commands up to 60,000 serialized bytes within the host's
 64 KiB outbound frame budget, including normal approval wake context. Larger
 commands fail before dispatch; the machine-to-host frame limit remains 16 KiB.
+
+## Interrupted work
+
+Paperclip checkpoints the adapter-selected machine session before dispatch and
+retains it after a timeout or lost result, including on the first attempt. The
+next attempt checks the existing session header, environment and workspace
+before resuming. Session history supplies task context; it does not authorize
+another launch or another protected tool action.
+
+After the previous operation has a reconciled terminal outcome, explicitly
+schedule a new attempt through Paperclip's normal wake flow. An operator can
+call `POST /api/agents/AGENT_ID/heartbeat/invoke` with:
+
+```json
+{
+  "reason": "continue_interrupted_work",
+  "payload": { "issueId": "TASK_ID", "resumeFromRunId": "PRIOR_RUN_ID" }
+}
+```
+
+The new attempt has a new Paperclip run and execution operation identity.
+Redelivery and reconnection retain the original identities and cannot create
+this continuation. An unresolved workspace owner or missing execution history
+still blocks admission. A consumed grant stays consumed during session reuse;
+a new protected operation publishes a fresh exact-scope card and waits for a
+new authenticated human decision. A machine-owned Pi attempt never retries an
+already launched operation automatically because a session becomes unavailable.
 
 ## Acceptance
 
@@ -169,4 +204,9 @@ local provider files, repeat tasks, and rejection of injected loopback URLs.
 Approval acceptance additionally observes pending cards, session reuse, actual
 allowed/denied Git effects, consumed grants, scope withdrawal, forged transport
 context and decision-channel interruption through this same workflow.
+It also checks first-attempt interruption, explicit continuation with distinct
+identities, preserved context and rejection of restored pre-consumption state.
+The combined recovery case interrupts the daemon after an approved Git effect,
+reconciles the original operation, explicitly resumes the saved session and
+requires a fresh scoped decision before another Git effect.
 No paid provider or external repository/service mutation is required.

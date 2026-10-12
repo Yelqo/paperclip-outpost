@@ -96,10 +96,12 @@ before(async () => {
 after(async () => {
   for (const child of processes) child.kill('SIGTERM');
   if (server) { server.kill('SIGTERM'); await Promise.race([new Promise(r => server.once('exit', r)), delay(10000)]); }
-  writeFileSync(join(home, 'host.log'), logs);
-  // Keep logs and workspace evidence, but release the disposable database
-  // once its owning host has exited so repeated workflow runs fit in /tmp.
-  if(server && server.exitCode!==null) rmSync(join(home,'instances/acceptance/db'),{recursive:true,force:true});
+  try { writeFileSync(join(home, 'host.log'), logs); }
+  finally {
+    // Release the stopped disposable database even if writing a diagnostic
+    // fails (for example after exhausting temporary storage).
+    if(server && server.exitCode!==null) rmSync(join(home,'instances/acceptance/db'),{recursive:true,force:true});
+  }
 });
 
 test('operator registers a distinct outpost and selects its named environment', async () => {
@@ -294,27 +296,43 @@ test('actual Pi reads its assigned task through the callback bridge and retains 
     await eventually(async()=>!(await json(`/api/plugins/yelqo.outpost/api/outposts/${piRegistration.outpostId}?companyId=${company.id}`)).connected);
   }
 });
-test('actual Pi human approvals preserve continuation, scope and one-time authority', {timeout:600000}, async t => {
+test('actual Pi human approvals preserve continuation, scope and one-time authority', {timeout:900000}, async t => {
   const workspace=join(home,'workspaces','pi-approval'); mkdirSync(workspace);
   const runtime=join(home,'pi-approval-runtime'); mkdirSync(runtime);
   const agentDir=join(runtime,'agent'),state=join(runtime,'state'),sessions=join(runtime,'sessions');
   for(const directory of [agentDir,state,sessions]) mkdirSync(directory,{mode:0o700});
   const policyPath=join(runtime,'policy.json'),workerPath=join(runtime,'worker.json');
   const node22=process.env.OUTPOST_TEST_NODE22 ?? execFileSync('mise',['where','node@22.22.1'],{encoding:'utf8'}).trim()+'/bin/node';
-  let calls=0,providerPause,providerReached;
+  let calls=0,providerPause,providerReached,holdAfterTool=false,observeContinuation=false,tool;
   let command='git commit --allow-empty -m "Human approved effect"';
   const provider=createServer(async (req,res) => {
     let input=''; for await(const chunk of req) input+=chunk;
     const body=JSON.parse(input);
-    providerReached?.();
-    await providerPause;
     const complete=body.messages.at(-1).role==='tool';
+    if (observeContinuation && !complete) {
+      assert.ok(body.messages.some(message=>message.tool_calls?.some(call=>
+        call.function.name==='write' && JSON.parse(call.function.arguments).path==='interrupted-context.txt')),
+      'The provider must receive the prior attempt’s tool context from the reused session');
+    }
+    if (!holdAfterTool || complete) {
+      providerReached?.(body);
+      await providerPause;
+    }
     calls++;
-    const delta=complete ? {role:'assistant',content:'Protected operation completed.'} : {role:'assistant',tool_calls:[{index:0,id:`approval-${calls}`,type:'function',function:{name:'bash',arguments:JSON.stringify({command})}}]};
+    const delta=complete ? {role:'assistant',content:'Protected operation completed.'} : {role:'assistant',tool_calls:[{index:0,id:`approval-${calls}`,type:'function',function:{name:tool?.name ?? 'bash',arguments:JSON.stringify(tool?.arguments ?? {command})}}]};
     providerResponse(res,delta,complete?'stop':'tool_calls');
   });
   await new Promise(r=>provider.listen(0,'127.0.0.1',r));
   t.after(async()=>{provider.closeAllConnections(); await new Promise(r=>provider.close(r));});
+  const pauseProviderAfterTool=()=>{
+    let release;
+    providerPause=new Promise(resolve=>{release=resolve;});
+    holdAfterTool=true;
+    const reached=new Promise(resolve=>{providerReached=resolve;});
+    return {reached,release(){
+      release(); providerPause=undefined; providerReached=undefined; holdAfterTool=false;
+    }};
+  };
   writeFileSync(join(agentDir,'models.json'),JSON.stringify({providers:{fixture:{baseUrl:`http://127.0.0.1:${provider.address().port}/v1`,api:'openai-completions',apiKey:'fixture-key',models:[{id:'fixture',reasoning:false,input:['text'],cost:{input:0,output:0,cacheRead:0,cacheWrite:0},contextWindow:128000,maxTokens:4096}]}}}));
   execFileSync('git',['init',workspace],{stdio:'ignore'});
   execFileSync('git',['-C',workspace,'config','user.name','Fixture']);
@@ -337,9 +355,13 @@ test('actual Pi human approvals preserve continuation, scope and one-time author
     '--private-dir',piPrivate,'--workspace-root',join(home,'workspaces'),'--scratch-root',join(home,'scratch')],
     {operatorAuthorization:`Bearer ${boardToken}`,runtimeRoots:[state,sessions,agentDir]}));
   await json(`/api/agents/${agent.id}`,{defaultEnvironmentId:registration.environmentId},undefined,'PATCH');
-  const daemon=spawn(join(root,'bin/outpost'),['daemon','--private-dir',piPrivate],{env:{...process.env,PATH:node22.slice(0,-5)+':/usr/bin:/bin',
-    PI_CODING_AGENT_DIR:agentDir,PI_APPROVAL_POLICY:policyPath,PI_APPROVAL_STATE:state,PI_APPROVAL_PAPERCLIP:workerPath},stdio:['ignore','pipe','pipe']});
-  processes.push(daemon);
+  const startDaemon=()=>{
+    const child=spawn(join(root,'bin/outpost'),['daemon','--private-dir',piPrivate],{env:{...process.env,PATH:node22.slice(0,-5)+':/usr/bin:/bin',
+      PI_CODING_AGENT_DIR:agentDir,PI_APPROVAL_POLICY:policyPath,PI_APPROVAL_STATE:state,PI_APPROVAL_PAPERCLIP:workerPath},stdio:['ignore','pipe','pipe']});
+    processes.push(child);
+    return child;
+  };
+  let daemon=startDaemon();
   const statusPath=`/api/plugins/yelqo.outpost/api/outposts/${registration.outpostId}?companyId=${company.id}`;
   await eventually(async()=>(await json(statusPath)).executionReady);
   const interactions=()=>json(`/api/issues/${task.id}/interactions`);
@@ -355,14 +377,33 @@ test('actual Pi human approvals preserve continuation, scope and one-time author
     }
     assert.fail('Approval continuation remained unavailable after scheduler retries');
   };
-  const invoke=async()=>{
+  const invoke=async(payload={})=>{
+    if (payload.resumeFromRunId) {
+      // Closing the fixture task drains generic scheduler retries. Reopen it
+      // in backlog so only the explicit invocation below requests execution.
+      await json(`/api/issues/${task.id}`,{status:'done'},undefined,'PATCH');
+      const runs=await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`);
+      for (const run of runs.filter(run=>run.contextSnapshot?.issueId===task.id && ['queued','scheduled_retry'].includes(run.status))) {
+        await json(`/api/heartbeat-runs/${run.id}/cancel`,{});
+      }
+      await eventually(async()=>{
+        const observed=await json(`/api/issues/${task.id}`);
+        return !observed.executionBlocker && !observed.executionRunId;
+      },35000);
+      await json(`/api/issues/${task.id}`,{status:'backlog'},undefined,'PATCH');
+    }
     const before=new Set((await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`)).map(run=>run.id));
     // Manual retries explicitly leave the task's human-review posture. This
     // changes scheduling, while the durable approval still decides authority.
     if(['in_review','done'].includes((await json(`/api/issues/${task.id}`)).status)) {
       await json(`/api/issues/${task.id}`,{status:'in_progress'},undefined,'PATCH');
     }
-    let run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{reason:'manual_approval_check',payload:{issueId:task.id}});
+    let run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{
+      reason:payload.resumeFromRunId ? 'continue_interrupted_work' : 'manual_approval_check',
+      ...(payload.resumeFromRunId ? {idempotencyKey:`continue:${payload.resumeFromRunId}`} : {}),
+      payload:{issueId:task.id,...payload},
+    });
+    if (payload.resumeFromRunId) assert.ok(run.id,'An explicit continuation must create its own run');
     if(!run.id) {
       const observed=await json(`/api/issues/${task.id}`);
       const pendingRun=observed.scheduledRetry?.runId ?? observed.executionRunId;
@@ -376,6 +417,8 @@ test('actual Pi human approvals preserve continuation, scope and one-time author
     const before=new Set((await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`)).map(run=>run.id));
     await json(`/api/issues/${task.id}/interactions/${card.id}/${decision}`,{});
     let continuation;
+    // A resolved card may wait for the preceding lease's cleanup and the
+    // scheduler tick before its distinct continuation becomes observable.
     await eventually(async()=>{
       continuation=(await json(`/api/companies/${company.id}/heartbeat-runs?agentId=${agent.id}`)).find(run=>!before.has(run.id) && run.contextSnapshot?.interactionId===card.id);
       if(!continuation) {
@@ -387,12 +430,47 @@ test('actual Pi human approvals preserve continuation, scope and one-time author
         }
       }
       return continuation;
-    });
+    },60000);
     continuation=await approvalRun(continuation);
     assert.equal(continuation.contextSnapshot.interactionId,card.id);
     return continuation;
   };
   try {
+    // The first attempt has no previously saved Paperclip session to fall back
+    // to. Its actual Pi context must survive reaching the original deadline.
+    {
+      task=await newTask('Preserve context from the first interrupted Pi attempt');
+      tool={name:'write',arguments:{path:'interrupted-context.txt',content:'Prior attempt context survives interruption.\n'}};
+      await json(`/api/agents/${agent.id}`,{adapterConfig:{...agent.adapterConfig,timeoutSec:15}},undefined,'PATCH');
+      const paused=pauseProviderAfterTool();
+      try {
+        const attempt=invoke();
+        await paused.reached;
+        const interrupted=await attempt;
+        assert.equal(interrupted.status,'timed_out');
+        assert.ok(interrupted.sessionIdAfter,'An interrupted first attempt must retain its actual Pi session');
+        assert.equal(readFileSync(join(workspace,'interrupted-context.txt'),'utf8'),'Prior attempt context survives interruption.\n');
+        paused.release();
+        await eventually(async()=>!(await json(`/api/issues/${task.id}`)).executionBlocker,35000);
+        tool={name:'read',arguments:{path:'interrupted-context.txt'}};
+        observeContinuation=true;
+        const resumed=await invoke({resumeFromRunId:interrupted.id});
+        assert.notEqual(resumed.id,interrupted.id);
+        assert.equal(resumed.sessionIdBefore,interrupted.sessionIdAfter);
+        assert.equal(resumed.sessionIdAfter,interrupted.sessionIdAfter);
+        const log=(await json(`/api/heartbeat-runs/${resumed.id}/log?limitBytes=1048576`)).content;
+        assert.match(log,/Prior attempt context survives interruption/);
+        assert.doesNotMatch(log,/"toolName":"write"/,'Session reuse must not replay the prior tool');
+        const operations=(await json(statusPath)).executionHistory.filter(record=>record.purpose==='agent_execution' && [interrupted.id,resumed.id].includes(record.runId));
+        assert.equal(operations.length,2);
+        assert.equal(new Set(operations.map(record=>record.operationId)).size,2);
+        await json(`/api/issues/${task.id}`,{status:'done'},undefined,'PATCH');
+      } finally {
+        paused.release(); observeContinuation=false; tool=undefined;
+        await json(`/api/agents/${agent.id}`,{adapterConfig:agent.adapterConfig},undefined,'PATCH');
+      }
+      task=await newTask('Commit the approved local effect once');
+    }
     const first=await invoke();
     const cards=await interactions();
     assert.equal(cards.length,1,JSON.stringify({first,cards}));
@@ -421,6 +499,8 @@ test('actual Pi human approvals preserve continuation, scope and one-time author
       await invoke();
       const pending=(await interactions()).find(card=>card.status==='pending');
       assert.ok(pending);
+      const snapshot=join(runtime,'pending-approval-snapshot');
+      cpSync(join(state,'requests'),snapshot,{recursive:true});
       const allowed=await decisionRun(pending,'accept');
       assert.equal(allowed.status,'succeeded',JSON.stringify(allowed));
       assert.match((await json(`/api/heartbeat-runs/${allowed.id}/log?limitBytes=1048576`)).content,/git version \d+\./);
@@ -432,6 +512,20 @@ test('actual Pi human approvals preserve continuation, scope and one-time author
       const repeated=await api(`/api/issues/${task.id}/interactions/${pending.id}/accept`,{});
       assert.ok([200,409].includes(repeated.status));
       assert.equal(commits(),2);
+      daemon.kill('SIGTERM');
+      await new Promise(resolve=>daemon.once('exit',resolve));
+      await eventually(async()=>!(await json(statusPath)).connected);
+      rmSync(join(state,'requests'),{recursive:true});
+      cpSync(snapshot,join(state,'requests'),{recursive:true});
+      chmodSync(join(state,'requests'),0o700);
+      daemon=startDaemon();
+      await eventually(async()=>(await json(statusPath)).executionReady);
+      const restored=await invoke();
+      assert.equal(restored.status,'failed','Restoring pending approval state must not reuse the accepted grant');
+      const restoredLog=(await json(`/api/heartbeat-runs/${restored.id}/log?limitBytes=1048576`)).content;
+      assert.match(restoredLog,/Saved approval consumed in Paperclip/);
+      assert.doesNotMatch(restoredLog,/"text":"git version/,'A rolled-back grant cannot execute again');
+      assert.equal((await interactions()).length,1);
       await json(`/api/issues/${task.id}`,{status:'done'},undefined,'PATCH');
     }
 
@@ -553,6 +647,60 @@ process.exit(child.status ?? 1);
       } finally {
         releaseProvider(); providerPause=undefined; providerReached=undefined;
         if(disabled) await json('/api/plugins/yelqo.outpost/enable',{});
+      }
+    }
+
+    // Combine a real approved effect, loss of the executing daemon, recovery
+    // of that same operation and a separately scheduled Pi continuation.
+    {
+      task=await newTask('Continue an approved interrupted operation with fresh authority');
+      command='git commit --allow-empty -m "Approved interrupted effect"';
+      const proposalRun=await invoke();
+      const pending=(await interactions()).find(card=>card.status==='pending');
+      assert.ok(pending);
+      const paused=pauseProviderAfterTool();
+      try {
+        const attempt=decisionRun(pending,'accept');
+        await paused.reached;
+        assert.equal(commits(),3,'The accepted action must execute once before interruption');
+        daemon.kill('SIGTERM');
+        await new Promise(resolve=>daemon.once('exit',resolve));
+        await eventually(async()=>!(await json(statusPath)).connected);
+        paused.release();
+        daemon=startDaemon();
+        await eventually(async()=>(await json(statusPath)).executionReady);
+        const interrupted=await attempt;
+        assert.equal(interrupted.status,'failed');
+        assert.equal(interrupted.sessionIdBefore,proposalRun.sessionIdAfter);
+        assert.equal(commits(),3,'Reconciliation cannot repeat the approved action');
+        const original=(await json(statusPath)).executionHistory.filter(record=>record.purpose==='agent_execution' && record.runId===interrupted.id);
+        assert.equal(original.length,1,'Recovery must retain the original operation identity');
+        assert.ok(['terminal','interrupted'].includes(original[0].status));
+        const consumed=(await interactions()).find(card=>card.id===pending.id);
+        assert.equal(consumed.result.executionConsumption.runId,interrupted.id);
+        // Closing the task also clears generic failure retries before the
+        // explicit continuation reopens it with its named predecessor.
+        await json(`/api/issues/${task.id}`,{status:'done'},undefined,'PATCH');
+        const resumed=await invoke({resumeFromRunId:interrupted.id});
+        assert.notEqual(resumed.id,interrupted.id);
+        assert.equal(resumed.contextSnapshot.resumeFromRunId,interrupted.id);
+        assert.equal(resumed.sessionIdBefore,proposalRun.sessionIdAfter);
+        assert.equal(resumed.sessionIdAfter,proposalRun.sessionIdAfter);
+        assert.equal(commits(),3,'A continuation must wait for fresh human authority');
+        const fresh=(await interactions()).find(card=>card.status==='pending');
+        assert.ok(fresh);
+        assert.notEqual(fresh.id,pending.id);
+        assert.equal((await interactions()).find(card=>card.id===pending.id).result.executionConsumption.runId,interrupted.id);
+        const allowed=await decisionRun(fresh,'accept');
+        assert.equal(allowed.status,'succeeded');
+        assert.equal(allowed.sessionIdAfter,proposalRun.sessionIdAfter);
+        assert.equal(commits(),4,'Only the fresh decision may authorize the new action');
+        const operations=(await json(statusPath)).executionHistory.filter(record=>record.purpose==='agent_execution' && [interrupted.id,resumed.id,allowed.id].includes(record.runId));
+        assert.equal(operations.length,3);
+        assert.equal(new Set(operations.map(record=>record.operationId)).size,3);
+        await json(`/api/issues/${task.id}`,{status:'done'},undefined,'PATCH');
+      } finally {
+        paused.release();
       }
     }
   } finally {
