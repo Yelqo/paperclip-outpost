@@ -1,11 +1,20 @@
 diff --git a/doc/run-log-events.md b/doc/run-log-events.md
-index 1757c04fe..72d67a2c2 100644
+index 1757c04fe..ba4300de1 100644
 --- a/doc/run-log-events.md
 +++ b/doc/run-log-events.md
-@@ -5,6 +5,18 @@ Run-log events write to the `heartbeat_run_events` table
+@@ -5,6 +5,27 @@ Run-log events write to the `heartbeat_run_events` table
  Paperclip Telemetry events, and they are not OpenTelemetry exports. A run-log
  event needs no operator endpoint.
  
++## Machine-owned Pi session checkpoint
++
++The `adapter.invoke` event for machine-owned Pi includes `sessionParams` with
++the adapter-selected session path, workspace cwd and remote environment identity.
++Paperclip checkpoints those same parameters before dispatch so an interrupted
++first attempt can retain its session. This records context only; reconnecting
++does not authorize another operation. Session paths contain no credentials, and
++the event stays in the instance run log.
++
 +## Plugin run cancellation reconciliation
 +
 +Providers that advertise `environmentCancelRun` receive the original company and
@@ -145,8 +154,33 @@ index aa66d00dd..39f6aa027 100644
      server = await startSandboxCallbackBridgeServer({
        runner,
        remoteCwd: target.remoteCwd,
+diff --git a/packages/adapter-utils/src/sandbox-callback-bridge.ts b/packages/adapter-utils/src/sandbox-callback-bridge.ts
+index ff56a94a7..c5385f6a3 100644
+--- a/packages/adapter-utils/src/sandbox-callback-bridge.ts
++++ b/packages/adapter-utils/src/sandbox-callback-bridge.ts
+@@ -184,7 +184,7 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
+   // Issue-thread interactions (create, resolve, verdict, and withdraw)
+   { method: "GET", path: /^\/api\/issues\/[^/]+\/interactions(?:\/[^/]+)?$/ },
+   { method: "POST", path: /^\/api\/issues\/[^/]+\/interactions$/ },
+-  { method: "POST", path: /^\/api\/issues\/[^/]+\/interactions\/[^/]+\/(?:accept|reject|respond|verdicts|withdraw)$/ },
++  { method: "POST", path: /^\/api\/issues\/[^/]+\/interactions\/[^/]+\/(?:accept|reject|respond|verdicts|withdraw|consume)$/ },
+ 
+   // Subtasks / delegation
+   { method: "POST", path: /^\/api\/companies\/[^/]+\/issues$/ },
+diff --git a/packages/adapter-utils/src/types.ts b/packages/adapter-utils/src/types.ts
+index c11343cae..239679048 100644
+--- a/packages/adapter-utils/src/types.ts
++++ b/packages/adapter-utils/src/types.ts
+@@ -150,6 +150,7 @@ export interface AdapterSessionCodec {
+ 
+ export interface AdapterInvocationMeta {
+   adapterType: string;
++  sessionParams?: Record<string, unknown>;
+   command: string;
+   cwd?: string;
+   commandArgs?: string[];
 diff --git a/packages/adapters/pi-local/src/server/execute.ts b/packages/adapters/pi-local/src/server/execute.ts
-index 3149642b3..3499b7cf6 100644
+index 3149642b3..18e92c6dd 100644
 --- a/packages/adapters/pi-local/src/server/execute.ts
 +++ b/packages/adapters/pi-local/src/server/execute.ts
 @@ -229,6 +229,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
@@ -298,7 +332,31 @@ index 3149642b3..3499b7cf6 100644
  
        if (extraArgs.length > 0) args.push(...extraArgs);
  
-@@ -745,6 +753,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+@@ -661,6 +669,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+       return args;
+     };
+ 
++    const sessionParamsForFile = (sessionFile: string) => ({
++      sessionId: sessionFile,
++      cwd: effectiveExecutionCwd,
++      ...(workspaceId ? { workspaceId } : {}),
++      ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
++      ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
++      ...(executionTargetIsRemote ? { remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget) } : {}),
++    });
++
+     const runAttempt = async (sessionFile: string) => {
+       const attemptResumedSession = canResumeSession && sessionFile === sessionPath;
+       await hydrateFreshSessionHandoff(ctx, { resumedSession: attemptResumedSession });
+@@ -702,6 +719,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+       if (onMeta) {
+         await onMeta({
+           adapterType: "pi_local",
++          ...(machineOwned ? { sessionParams: sessionParamsForFile(sessionFile) } : {}),
+           command: resolvedCommand,
+           cwd: effectiveExecutionCwd,
+           commandNotes,
+@@ -745,6 +763,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
          onSpawn,
          onRuntimeProgress: ctx.onRuntimeProgress,
          onLog: bufferedOnLog,
@@ -306,6 +364,43 @@ index 3149642b3..3499b7cf6 100644
          runLogTail: paperclipBridge?.runLogTail,
          settleRunDisposition: paperclipBridge?.settleRunDisposition,
        });
+@@ -776,23 +795,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+           timedOut: true,
+           errorMessage: `Timed out after ${timeoutSec}s`,
+           clearSession: clearSessionOnMissingSession,
++          ...(machineOwned && !clearSessionOnMissingSession ? {
++            sessionId: sessionPath, sessionParams: sessionParamsForFile(sessionPath), sessionDisplayId: sessionPath,
++          } : {}),
+         };
+       }
+ 
+       const resolvedSessionId = clearSessionOnMissingSession ? null : sessionPath;
+       const resolvedSessionParams = resolvedSessionId
+-        ? {
+-            sessionId: resolvedSessionId,
+-            cwd: effectiveExecutionCwd,
+-            ...(workspaceId ? { workspaceId } : {}),
+-            ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
+-            ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
+-            ...(executionTargetIsRemote
+-              ? {
+-                  remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
+-                }
+-              : {}),
+-          }
++        ? sessionParamsForFile(resolvedSessionId)
+         : null;
+ 
+       const stderrLine = firstNonEmptyLine(attempt.proc.stderr);
+@@ -838,7 +849,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+         !initial.proc.timedOut && ((initial.proc.exitCode ?? 0) !== 0 || initial.parsed.errors.length > 0);
+ 
+       if (
+-        canResumeSession &&
++        !machineOwned && canResumeSession &&
+         initialFailed &&
+         isPiUnknownSessionError(initial.proc.stdout, initial.rawStderr)
+       ) {
 diff --git a/packages/adapters/pi-local/src/server/index.ts b/packages/adapters/pi-local/src/server/index.ts
 index 9ad14d6f2..b984e7803 100644
 --- a/packages/adapters/pi-local/src/server/index.ts
@@ -614,6 +709,18 @@ index 6d899e083..f98bbf210 100644
  export * from "./skill-source.js";
 +
 +export type { RunCallbackTransport } from "./environment.js";
+diff --git a/packages/shared/src/types/issue.ts b/packages/shared/src/types/issue.ts
+index 727b3e03f..1287fecd4 100644
+--- a/packages/shared/src/types/issue.ts
++++ b/packages/shared/src/types/issue.ts
+@@ -1458,6 +1458,7 @@ export interface RequestItemVerdictsPayload {
+ 
+ export interface RequestConfirmationResult {
+   version: 1;
++  executionConsumption?: { runId: string; consumedAt: string };
+   outcome:
+     | "accepted"
+     | "rejected"
 diff --git a/packages/shared/src/types/plugin.ts b/packages/shared/src/types/plugin.ts
 index 42643d3b0..89c57a041 100644
 --- a/packages/shared/src/types/plugin.ts
@@ -638,6 +745,18 @@ index 42643d3b0..89c57a041 100644
    /** Environment drivers this plugin contributes. Requires `environment.drivers.register` capability. */
    environmentDrivers?: PluginEnvironmentDriverDeclaration[];
    /** Suggested company-scoped agents this plugin can provision and resolve by stable key. */
+diff --git a/packages/shared/src/validators/issue.ts b/packages/shared/src/validators/issue.ts
+index d39f18450..51791506b 100644
+--- a/packages/shared/src/validators/issue.ts
++++ b/packages/shared/src/validators/issue.ts
+@@ -1711,6 +1711,7 @@ export const requestConfirmationSecretProposalResultSchema = z.object({
+ 
+ export const requestConfirmationResultSchema = z.object({
+   version: z.literal(1),
++  executionConsumption: z.object({ runId: z.string().guid(), consumedAt: z.string().datetime({ offset: true }) }).optional(),
+   outcome: z.enum([
+     "accepted",
+     "rejected",
 diff --git a/packages/shared/src/validators/plugin.ts b/packages/shared/src/validators/plugin.ts
 index 002497716..aceccb3b8 100644
 --- a/packages/shared/src/validators/plugin.ts
@@ -1315,6 +1434,43 @@ index eba3d8772..98bfedfd7 100644
    if (environment.status === "archived") {
      throw unprocessable("Environment is archived.");
    }
+diff --git a/server/src/routes/issues.ts b/server/src/routes/issues.ts
+index 8b1543a53..6d685a122 100644
+--- a/server/src/routes/issues.ts
++++ b/server/src/routes/issues.ts
+@@ -1,4 +1,5 @@
+ import { setIssueTitle } from "../services/issue-title.js";
++import { consumePiApproval } from "../services/pi-approval-consumption.js";
+ import { setIssueTitleSchema } from "@paperclipai/shared";
+ import { resolveConfirmationFromComment } from "../services/confirmation-comment-resolution.js";
+ import { createIssueReadTiming } from "../services/issue-read-timing.js";
+@@ -16029,6 +16030,26 @@ export function issueRoutes(
+     },
+   );
+ 
++  router.post(
++    "/issues/:id/interactions/:interactionId/consume",
++    validate(z.object({ key: z.string().regex(/^[a-f0-9]{64}$/) })),
++    async (req, res) => {
++      const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
++      if (!issue) return;
++      if (req.actor.type !== "agent" || !req.actor.agentId || !req.actor.runId) {
++        throw forbidden("Only the scoped agent run may consume a Pi approval");
++      }
++      const receipt = await consumePiApproval(db, { companyId: issue.companyId, issueId: issue.id,
++        interactionId: req.params.interactionId as string, key: req.body.key,
++        agentId: req.actor.agentId, runId: req.actor.runId });
++      if (receipt.consumed) await logActivity(db, { companyId: issue.companyId,
++        actorType: "agent", actorId: req.actor.agentId, agentId: req.actor.agentId, runId: req.actor.runId,
++        action: "issue.pi_approval_consumed", entityType: "issue", entityId: issue.id,
++        details: { interactionId: req.params.interactionId, revisionId: req.body.key } });
++      res.json(receipt);
++    },
++  );
++
+   router.post(
+     "/issues/:id/interactions/:interactionId/accept",
+     validate(acceptIssueThreadInteractionSchema),
 diff --git a/server/src/services/environment-config.ts b/server/src/services/environment-config.ts
 index aab87b273..46a1aa005 100644
 --- a/server/src/services/environment-config.ts
@@ -1564,7 +1720,7 @@ index dec0d847c..5653f3e4d 100644
    return accounting;
  }
 diff --git a/server/src/services/heartbeat.ts b/server/src/services/heartbeat.ts
-index 9e8617e2f..89a3a44c1 100644
+index 9e8617e2f..c2ab7fcb9 100644
 --- a/server/src/services/heartbeat.ts
 +++ b/server/src/services/heartbeat.ts
 @@ -1,4 +1,7 @@
@@ -1771,7 +1927,40 @@ index 9e8617e2f..89a3a44c1 100644
          const githubLaunchers = await prepareHeartbeatGitHubLaunchers({
            native: agent.adapterType === "paperclip_runner",
            githubConfigured: githubSelection.configured,
-@@ -23653,7 +23710,7 @@ export function heartbeatService(
+@@ -23284,7 +23341,7 @@ export function heartbeatService(
+       };
+ 
+       let handle: RunLogHandle | null = null;
+-      const goalCheckpointSession: {
++      const checkpointSession: {
+         current: {
+           params: Record<string, unknown>;
+           displayId: string;
+@@ -23595,6 +23652,23 @@ export function heartbeatService(
+             message: "adapter invocation",
+             payload: meta as unknown as Record<string, unknown>,
+           });
++          // Checkpoint the adapter-selected machine session before launch. A
++          // lost result/restart must not discard the first attempt's context.
++          // This saves context only; execution admission still owns authority.
++          if (agent.adapterType === "pi_local" && taskKey && meta.sessionParams &&
++              executionTarget?.kind === "remote" && executionTarget.transport === "sandbox" &&
++              executionTarget.workspaceRealization?.mode === "in_place") {
++            const sessionId = readNonEmptyString(meta.sessionParams.sessionId);
++            if (!sessionId) throw new Error("Machine Pi session checkpoint is missing its identity");
++            const params = attachPaperclipSessionMetadataToSessionParams(
++              sessionCodec.serialize(meta.sessionParams), configuredModel, sessionConfigMetadata,
++            )!;
++            await upsertTaskSession({ companyId: agent.companyId, agentId: agent.id, adapterType: agent.adapterType,
++              taskKey, sessionParamsJson: params, sessionDisplayId: sessionId, lastRunId: run.id, lastError: null });
++            await db.update(heartbeatRuns).set({ sessionIdAfter: sessionId, updatedAt: new Date() })
++              .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")));
++            checkpointSession.current = { params, displayId: sessionId };
++          }
+         };
+ 
+         const onAdapterEvent = async (event: AdapterRuntimeEvent) => {
+@@ -23653,7 +23727,7 @@ export function heartbeatService(
          const hasInstructionFilesystem = nativeRuntimeResolution.kind !== "native"
            ? adapter.supportsInstructionsBundle === true
            : !["claude_managed_agents_api", "aws_agentcore_harness_api"].includes(nativeRuntimeResolution.profile.backend);
@@ -1780,7 +1969,16 @@ index 9e8617e2f..89a3a44c1 100644
            try {
              // Missing contract fields on a restored session mean the deployed
              // legacy format. New sessions opt into whole-directory persistence.
-@@ -25465,9 +25522,18 @@ export function heartbeatService(
+@@ -24871,7 +24945,7 @@ export function heartbeatService(
+                         lastRunId: run.id,
+                         lastError: null,
+                       });
+-                      goalCheckpointSession.current = { params, displayId };
++                      checkpointSession.current = { params, displayId };
+                     },
+                     onLog,
+                     onEvent: onAdapterEvent,
+@@ -25465,9 +25539,18 @@ export function heartbeatService(
            failedProcessRunCancellations.get(run.id);
          await processCancellation?.settled;
          let outcome: RunSessionOutcome;
@@ -1800,7 +1998,7 @@ index 9e8617e2f..89a3a44c1 100644
          } else if (executionControl.controller.signal.aborted) {
            outcome = "cancelled";
          } else if (adapterResult.nativeFinalization) {
-@@ -25634,7 +25700,7 @@ export function heartbeatService(
+@@ -25634,7 +25717,7 @@ export function heartbeatService(
            mergeRunStopMetadataForAgent(agent, outcome, {
              resultJson: mergeAdapterRecoveryMetadata({
                resultJson: {
@@ -1809,7 +2007,7 @@ index 9e8617e2f..89a3a44c1 100644
                    ? parseObject(latestRun?.resultJson)
                    : {}),
                  ...parseObject(adapterResult.resultJson),
-@@ -26091,6 +26157,10 @@ export function heartbeatService(
+@@ -26091,6 +26174,10 @@ export function heartbeatService(
            wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
          });
        } catch (err) {
@@ -1820,7 +2018,7 @@ index 9e8617e2f..89a3a44c1 100644
          if (err instanceof NativeControllerDetachedForRestartError) {
            nativeSessionResumeScheduled = true;
            return;
-@@ -26212,6 +26282,12 @@ export function heartbeatService(
+@@ -26212,6 +26299,12 @@ export function heartbeatService(
          // A process adapter may throw while its owned Stop is joining the
          // child. Let the cancellation write settle before attempting failure.
          await processRunCancellationSettlements.get(run.id)?.settled;
@@ -1833,7 +2031,7 @@ index 9e8617e2f..89a3a44c1 100644
          const message = redactCurrentUserText(
            err instanceof Error ? err.message : "Unknown adapter failure",
            await getCurrentUserRedactionOptions(),
-@@ -26250,6 +26326,8 @@ export function heartbeatService(
+@@ -26250,6 +26343,8 @@ export function heartbeatService(
            })
            .catch(() => null);
          const failureErrorCode =
@@ -1842,7 +2040,7 @@ index 9e8617e2f..89a3a44c1 100644
            workspaceValidationFailure?.code ??
            configurationIncompleteFailure?.code ??
            nonRetryablePreflightFailureCode(err) ??
-@@ -26377,7 +26455,7 @@ export function heartbeatService(
+@@ -26377,7 +26472,7 @@ export function heartbeatService(
              // exhaustion. Once its durable coordinator has classified a
              // terminal failure, generic issue recovery must not create a
              // replacement retryOfRunId chain for the same provider work.
@@ -1851,7 +2049,33 @@ index 9e8617e2f..89a3a44c1 100644
            });
            await handleIssueReviewPathDisposition(livenessRun);
  
-@@ -26453,6 +26531,8 @@ export function heartbeatService(
+@@ -26397,7 +26492,7 @@ export function heartbeatService(
+ 
+           if (
+             taskKey &&
+-            (goalCheckpointSession.current ||
++            (checkpointSession.current ||
+               previousSessionParams ||
+               previousSessionDisplayId ||
+               taskSession)
+@@ -26408,14 +26503,14 @@ export function heartbeatService(
+               adapterType: agent.adapterType,
+               taskKey,
+               sessionParamsJson:
+-                goalCheckpointSession.current?.params ??
++                checkpointSession.current?.params ??
+                 attachPaperclipSessionMetadataToSessionParams(
+                   previousSessionParams,
+                   configuredModel,
+                   sessionConfigMetadata,
+                 ),
+               sessionDisplayId:
+-                goalCheckpointSession.current?.displayId ??
++                checkpointSession.current?.displayId ??
+                 previousSessionDisplayId,
+               lastRunId: failedRun.id,
+               lastError: message,
+@@ -26453,6 +26548,8 @@ export function heartbeatService(
            eventMessage: "stale execution continuation cancelled before dispatch",
            suppressImmediateRecovery: true,
          });
@@ -1860,7 +2084,7 @@ index 9e8617e2f..89a3a44c1 100644
        } else if (isWorkspaceBusyDeferral(outerErr)) {
          // Expected contention on a shared project workspace, not a
          // failure: park the run as a bounded scheduled retry and leave the
-@@ -26505,6 +26585,8 @@ export function heartbeatService(
+@@ -26505,6 +26602,8 @@ export function heartbeatService(
            nonRetryablePreflightFailureCode(outerErr);
          const workspaceGitScanFailure = isWorkspaceGitScanError(outerErr) ? outerErr : null;
          const setupFailureErrorCode =
@@ -1869,7 +2093,7 @@ index 9e8617e2f..89a3a44c1 100644
            workspaceGitScanFailure?.code ??
            workspaceValidationSetupFailure?.code ??
            configurationIncompleteSetupFailure?.code ??
-@@ -26648,6 +26730,7 @@ export function heartbeatService(
+@@ -26648,6 +26747,7 @@ export function heartbeatService(
            }
            await releaseIssueExecutionAndPromote(livenessRun, {
              suppressImmediateRecovery:
@@ -1877,7 +2101,7 @@ index 9e8617e2f..89a3a44c1 100644
                readNonEmptyString(
                  parseObject(livenessRun.contextSnapshot).goalControlRequestId,
                ) !== null ||
-@@ -26687,6 +26770,7 @@ export function heartbeatService(
+@@ -26687,6 +26787,7 @@ export function heartbeatService(
        await nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
        if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
        let latestRun = await getRun(run.id).catch(() => null);
@@ -1885,7 +2109,7 @@ index 9e8617e2f..89a3a44c1 100644
        try {
          if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
            await db
-@@ -26726,7 +26810,7 @@ export function heartbeatService(
+@@ -26726,7 +26827,7 @@ export function heartbeatService(
            latestRun &&
            !nativeSessionResumeScheduled &&
            !nativeWorkspaceFinalizeScheduled &&
@@ -1894,7 +2118,7 @@ index 9e8617e2f..89a3a44c1 100644
          ) {
            latestRun = await terminalizeRunOnLeaseRelease(latestRun).catch(
              (terminalizeErr) => {
-@@ -26752,7 +26836,7 @@ export function heartbeatService(
+@@ -26752,7 +26853,7 @@ export function heartbeatService(
          if (
            !nativeSessionResumeScheduled &&
            !nativeWorkspaceFinalizeScheduled &&
@@ -1903,7 +2127,7 @@ index 9e8617e2f..89a3a44c1 100644
          ) {
            // Keep launchers during same-run recovery. At a terminal boundary all
            // operations have settled; clean before the remote lease can be stopped.
-@@ -29627,6 +29711,20 @@ export function heartbeatService(
+@@ -29627,6 +29728,20 @@ export function heartbeatService(
      const errorCode = options.errorCode ?? "cancelled";
      const cancellation = requestedRunCancellation(options.resultJson ?? {}, reason);
  
@@ -1924,7 +2148,7 @@ index 9e8617e2f..89a3a44c1 100644
      const pendingProcessCancellation = processRunCancellationSettlements.get(
        run.id,
      );
-@@ -30439,6 +30537,35 @@ export function heartbeatService(
+@@ -30439,6 +30554,35 @@ export function heartbeatService(
      buildRunOutputSilence,
  
      tickTimers: async (now = new Date()) => {
@@ -1973,6 +2197,60 @@ index 64c4c7f2d..d6ad3db51 100644
    // Setup owns the bounded retry budget for temporary workspace scans. Its
    // exhaustion needs workspace repair, not reconciliation of provider actions
    // that the bootstrap evidence proves never started. Keep unknown outcomes held.
+diff --git a/server/src/services/pi-approval-consumption.ts b/server/src/services/pi-approval-consumption.ts
+new file mode 100644
+index 000000000..d3836f10e
+--- /dev/null
++++ b/server/src/services/pi-approval-consumption.ts
+@@ -0,0 +1,48 @@
++import { and, eq } from "drizzle-orm";
++import { heartbeatRuns, issues, issueThreadInteractions, type Db } from "@paperclipai/db";
++import type { RequestConfirmationResult } from "@paperclipai/shared";
++import { conflict, forbidden } from "../errors.js";
++
++/** A human decision is single-use even if the execution host restores a snapshot.
++ * A lost response is a consumed grant, including for the claiming run itself. */
++export async function consumePiApproval(db: Db, input: {
++  companyId: string; issueId: string; interactionId: string; key: string;
++  agentId: string; runId: string;
++}) {
++  return db.transaction(async tx => {
++    const issue = await tx.select().from(issues).where(and(
++      eq(issues.id, input.issueId), eq(issues.companyId, input.companyId),
++    )).for("update").then(rows => rows[0]);
++    if (!issue || issue.assigneeAgentId !== input.agentId || issue.assigneeUserId || ["done", "cancelled"].includes(issue.status)) {
++      throw forbidden("Approval task is closed or reassigned");
++    }
++    const run = await tx.select().from(heartbeatRuns).where(and(
++      eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
++      eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.status, "running"),
++    )).then(rows => rows[0]);
++    if (!run || run.contextSnapshot?.issueId !== input.issueId || run.resultJson?.executionCancellation) {
++      throw forbidden("Approval consumption requires the active assigned task run");
++    }
++    const interaction = await tx.select().from(issueThreadInteractions).where(and(
++      eq(issueThreadInteractions.id, input.interactionId), eq(issueThreadInteractions.issueId, input.issueId),
++      eq(issueThreadInteractions.companyId, input.companyId),
++    )).for("update").then(rows => rows[0]);
++    const payload = interaction?.payload as { target?: { type?: string; key?: string; revisionId?: string } } | undefined;
++    const result = interaction?.result as RequestConfirmationResult | null | undefined;
++    if (!interaction || interaction.kind !== "request_confirmation" || interaction.status !== "accepted" ||
++        interaction.createdByAgentId !== input.agentId || interaction.effectiveResolverPolicy !== "human_only" ||
++        interaction.requestedResolverPolicy !== "human_only" || interaction.continuationPolicy !== "wake_assignee" ||
++        !interaction.resolvedByUserId || interaction.resolvedByAgentId || !interaction.resolvedAt ||
++        interaction.idempotencyKey !== `pi-approval:${input.key}` || payload?.target?.type !== "custom" ||
++        payload.target.key !== "pi-approval" || payload.target.revisionId !== input.key ||
++        result?.version !== 1 || result.outcome !== "accepted") {
++      throw conflict("An exact authenticated human Pi decision is required");
++    }
++    if (result.executionConsumption) return { consumed: false };
++    const consumption = { runId: input.runId, consumedAt: new Date().toISOString() };
++    await tx.update(issueThreadInteractions).set({
++      result: { ...result, executionConsumption: consumption }, updatedAt: new Date(),
++    }).where(eq(issueThreadInteractions.id, interaction.id));
++    return { consumed: true, ...consumption };
++  });
++}
 diff --git a/server/src/services/plugin-run-cancellation.ts b/server/src/services/plugin-run-cancellation.ts
 new file mode 100644
 index 000000000..ad3c7a5ca
