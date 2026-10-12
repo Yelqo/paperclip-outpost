@@ -9,6 +9,7 @@ import WebSocket from 'ws';
 import { createServer } from 'node:http';
 import { createServer as createTCPServer, connect as connectTCP } from 'node:net';
 import { versions as supportedVersions } from '../plugin/versions.ts';
+import { systemdVM } from './fixtures/systemd-vm.mjs';
 
 const root = resolve('.');
 const host = join(root, '.cache/paperclip');
@@ -102,6 +103,75 @@ after(async () => {
     // fails (for example after exhausting temporary storage).
     if(server && server.exitCode!==null) rmSync(join(home,'instances/acceptance/db'),{recursive:true,force:true});
   }
+});
+
+test('selected standalone installation starts under systemd and recovers a real Ubuntu reboot without replay', {
+  skip: process.env.OUTPOST_SYSTEMD_ACCEPTANCE !== '1', timeout:300000,
+}, async t => {
+  const vm = await systemdVM(t, port, supportedVersions.daemon);
+  const privateRoot='/home/worker/.outpost-private';
+  const workerCLI = args => ['runuser','-u','worker','--','/srv/selected-outpost',...args];
+  const registration=JSON.parse(await vm.command(workerCLI(['register','--instance',origin,
+    '--company',company.id,'--name','Systemd Ubuntu worker','--private-dir',privateRoot,
+    '--workspace-root','/home/worker/workspaces','--scratch-root','/home/worker/scratch']),
+    JSON.stringify({operatorAuthorization:`Bearer ${boardToken}`})));
+  const statusPath=`/api/plugins/yelqo.outpost/api/outposts/${registration.outpostId}?companyId=${company.id}`;
+  const installed=JSON.parse(await vm.command(['sh','-c','umask 077; exec "$@"','installer','/srv/selected-outpost','service-install',
+    '--binary','/srv/selected-outpost','--version',supportedVersions.daemon,'--worker','worker','--private-dir',privateRoot]));
+  const durable=`/opt/paperclip-outpost/${supportedVersions.daemon}/outpost`;
+  assert.equal(installed.binary,durable);
+  assert.equal(installed.version,supportedVersions.daemon);
+  assert.equal(installed.worker,'worker');
+  assert.equal((await vm.command(['systemctl','is-enabled','paperclip-outpost.service'])).trim(),'enabled');
+  const unit=await vm.command(['systemctl','cat','paperclip-outpost.service']);
+  assert.ok(unit.includes(`ExecStart=${durable} daemon --private-dir ${privateRoot}`));
+  assert.ok(unit.includes('User=worker'));
+  assert.doesNotMatch(unit,/npx|npm|selected-outpost|Bearer/);
+  await vm.command(['sh','-c',"! command -v go && ! command -v node"]);
+  await vm.command(['rm','/srv/selected-outpost']);
+  await eventually(async () => (await json(statusPath)).executionReady,60000);
+  const installationStatus=JSON.parse(await vm.command([durable,'service-status']));
+  assert.equal(installationStatus.service.activeState,'active');
+  assert.equal(installationStatus.connection.status,'connected');
+  assert.equal(installationStatus.connection.outpostId,registration.outpostId);
+  assert.ok(!JSON.stringify(installationStatus).includes(boardToken));
+  assert.equal((await vm.command(['ps','-o','user=','-p',installationStatus.service.mainPID])).trim(),'worker');
+  await vm.command(['runuser','-u','worker','--','sh','-c',`! test -w '${durable}'`]);
+  await vm.command(['runuser','-u','worker','--','git','-C','/home/worker/workspaces','init']);
+  await vm.command(['runuser','-u','worker','--','git','-C','/home/worker/workspaces','-c','user.name=Fixture',
+    '-c','user.email=fixture@outpost.test','commit','--allow-empty','-m','Persistent history']);
+  const history=(await vm.command(['git','-c','safe.directory=*','-C','/home/worker/workspaces','rev-parse','HEAD'])).trim();
+  const agent=await json(`/api/companies/${company.id}/agents`,{
+    name:'Systemd reboot command',role:'engineer',adapterType:'process',defaultEnvironmentId:registration.environmentId,
+    adapterConfig:{command:'/bin/sh',args:['-c','echo effect >> launches; echo before-reboot; sleep 180'],cwd:'/home/worker/workspaces',timeoutSec:240},
+  });
+  const run=await json(`/api/agents/${agent.id}/heartbeat/invoke`,{});
+  await eventually(async () => {
+    const response=await api(`/api/heartbeat-runs/${run.id}/log`);
+    return response.ok && (await response.json()).content.includes('before-reboot');
+  },60000);
+  const boot=(await vm.command(['cat','/proc/sys/kernel/random/boot_id'])).trim();
+  await vm.command(['reboot','-f']).catch(() => {});
+  await eventually(async () => !(await json(statusPath)).connected,30000);
+  await vm.connect();
+  assert.notEqual((await vm.command(['cat','/proc/sys/kernel/random/boot_id'])).trim(),boot);
+  let recovered;
+  await eventually(async () => {
+    const status=await json(statusPath);
+    recovered=status.executionHistory.find(record=>record.runId===run.id);
+    return status.executionReady && recovered?.status==='interrupted';
+  },60000);
+  assert.equal(recovered.outcome.interrupted,true);
+  assert.equal((await vm.command(['cat','/home/worker/workspaces/launches'])).trim(),'effect');
+  assert.equal((await vm.command(['git','-c','safe.directory=*','-C','/home/worker/workspaces','rev-parse','HEAD'])).trim(),history);
+  const rebootStatus=JSON.parse(await vm.command([durable,'service-status']));
+  assert.equal(rebootStatus.version,supportedVersions.daemon);
+  assert.equal(rebootStatus.service.activeState,'active');
+  assert.equal(rebootStatus.connection.status,'connected');
+  assert.equal(rebootStatus.connection.outpostId,registration.outpostId);
+  assert.equal(JSON.parse(await vm.command([durable,'version'])).daemon,supportedVersions.daemon);
+  assert.equal((await terminalRun(run,20000)).status,'failed');
+  assert.equal((await json(statusPath)).executionHistory.filter(record=>record.runId===run.id).length,1);
 });
 
 test('operator registers a distinct outpost and selects its named environment', async () => {

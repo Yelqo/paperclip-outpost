@@ -79,5 +79,12 @@ jobs:
           src/__tests__/environment-execution-target-duplex.test.ts
           src/__tests__/plugin-environment-driver-seam.test.ts
 
+      - name: Prepare disposable Ubuntu systemd and reboot acceptance VM
+        run: |
+          pnpm build:release
+          docker build -t outpost-systemd-acceptance:local tests/fixtures/systemd
+
       - name: Test public host, plugin, and daemon workflow
+        env:
+          OUTPOST_SYSTEMD_ACCEPTANCE: '1'
         run: pnpm test

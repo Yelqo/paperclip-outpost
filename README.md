@@ -29,8 +29,8 @@ buffer; exhaustion stops the process tree and preserves an explicit failure.
 The required Paperclip host/SDK extension is carried as a reproducible patch
 against a pinned upstream commit. [Pi integration](docs/pi.md) uses machine-owned
 runtime assets, scoped callbacks and human approval continuation with session
-reuse. Release/service installation remains a
-subsequent milestone.
+reuse. [Standalone installation and a durable worker-account systemd service](docs/service.md)
+support boot startup and recovery without replay.
 
 The design was reconstructed with the operator on 2026-10-06. Its documents
 distinguish accepted decisions from source findings and proposed integration
