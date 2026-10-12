@@ -47,10 +47,11 @@ work; they do not claim completed live deployment acceptance.
 - [Machine-owned workspaces and credentials](docs/adr/0003-machine-ownership.md)
 - [Recovery without replay](docs/adr/0004-recovery-without-replay.md)
 
-The intended installation flow is a versioned global npm installation or a
-standalone Go binary, optional connection configuration, operator registration,
-and installation of a systemd service under the worker account. Updates are
-operator managed. Cloudflare Access is an optional connection requirement;
+Install a [pinned release](docs/releases.md) through the single
+`@yelqo/paperclip-outpost` npm package, optional npx management, or a standalone
+Linux binary. Each route supports connection configuration, operator registration
+and a durable systemd service under the worker account. Updates are operator
+managed. Cloudflare Access is an optional connection requirement;
 Outpost does not provision Cloudflare resources or target machines.
 
 ## Contributing

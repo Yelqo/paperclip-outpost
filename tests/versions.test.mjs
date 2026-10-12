@@ -9,7 +9,7 @@ import { versions } from '../plugin/versions.ts';
 
 test('standalone binary reports its selected release without connection state or a compiler', () => {
   const reported=execFileSync(resolve('bin/outpost'),['version'],{encoding:'utf8',env:{PATH:'/nonexistent'}});
-  assert.deepEqual(JSON.parse(reported),versions);
+  assert.deepEqual(JSON.parse(reported),{...versions,shared:'0.3.1'});
 });
 
 test('changing release and upstream pins requires regeneration before checks pass', async () => {
@@ -17,7 +17,9 @@ test('changing release and upstream pins requires regeneration before checks pas
   const fixture = mkdtempSync(join(tmpdir(), 'outpost-versions-'));
   for (const path of ['scripts', 'plugin', 'internal/outpost', 'upstream']) mkdirSync(join(fixture, path), {recursive:true});
   for (const path of ['scripts/generate-versions.mjs', 'package.json', 'upstream/paperclip.lock.json',
-    'upstream/plugin-transport.patch', 'plugin/versions.ts', 'internal/outpost/versions.go']) {
+    'upstream/plugin-transport.patch', 'upstream/pi-config.lock.json', 'upstream/pi-config.patch',
+    'plugin/versions.ts', 'internal/outpost/versions.go', 'release/compatibility.json']) {
+    mkdirSync(join(fixture, path, '..'), {recursive:true});
     copyFileSync(join(root, path), join(fixture, path));
   }
   const generate = (...args) => execFileSync(process.execPath, [join(fixture, 'scripts/generate-versions.mjs'), ...args], {stdio:'pipe'});
@@ -29,6 +31,7 @@ test('changing release and upstream pins requires regeneration before checks pas
   const lock = JSON.parse(readFileSync(join(fixture, 'upstream/paperclip.lock.json'), 'utf8'));
   lock.commit = 'a'.repeat(40);
   lock.sdk = '9.0.0+fixture';
+  lock.shared = '9.0.1';
   lock.transport++;
   writeFileSync(join(fixture, 'upstream/paperclip.lock.json'), JSON.stringify(lock));
   assert.throws(() => generate('--check'), error => /Stale compatibility declarations/.test(error.stderr.toString()));
@@ -36,5 +39,5 @@ test('changing release and upstream pins requires regeneration before checks pas
   generate('--check');
 
   const {versions} = await import(pathToFileURL(join(fixture, 'plugin/versions.ts')));
-  assert.deepEqual(versions, {host:lock.commit, sdk:lock.sdk, plugin:release.version, daemon:release.version, protocol:lock.transport});
+  assert.deepEqual(versions, {host:lock.commit, sdk:lock.sdk, shared:lock.shared, plugin:release.version, daemon:release.version, protocol:lock.transport});
 });

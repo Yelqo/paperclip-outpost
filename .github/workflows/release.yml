@@ -1,4 +1,4 @@
-name: Standalone release
+name: Versioned release
 
 on:
   push:
@@ -17,11 +17,33 @@ jobs:
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5
         with:
           version: '2026.8.6'
-      - name: Verify selected tag and build standalone binaries
+      - name: Verify selected tag
         run: |
           node --input-type=module -e 'import fs from "node:fs"; const {version}=JSON.parse(fs.readFileSync("package.json")); if(process.env.GITHUB_REF_NAME !== `v${version}`) throw new Error("Release tag must match package version");'
+          node scripts/generate-versions.mjs --check
+      - name: Prepare pinned host and bundled plugin dependencies
+        run: |
+          pnpm prepare:host
+          pnpm install --frozen-lockfile
+          pnpm check
+      - name: Build and accept selected release artifacts
+        run: |
           node scripts/build-release.mjs
+          node --test tests/distribution.test.mjs
       - name: Publish selected release assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/releases/* --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+        run: >-
+          gh release create "$GITHUB_REF_NAME" dist/releases/*
+          --verify-tag --title "$GITHUB_REF_NAME"
+          --notes-file docs/releases.md
+      - name: Publish the same selected package to npm
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          test -n "$NPM_TOKEN"
+          npm_config_userconfig="$RUNNER_TEMP/outpost.npmrc"
+          export npm_config_userconfig
+          printf '//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n' > "$npm_config_userconfig"
+          trap 'rm -f "$npm_config_userconfig"' EXIT
+          npm publish dist/releases/yelqo-paperclip-outpost-*.tgz --access public --ignore-scripts

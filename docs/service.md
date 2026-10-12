@@ -1,5 +1,8 @@
 # Standalone installation and systemd
 
+See [all three versioned installation routes](releases.md) for the single npm
+package, optional npx management, and supported integration matrix.
+
 The operator selects a standalone Linux release and installs a **system service**
 with `User=worker`. The worker is an existing dedicated, unprivileged account on
 a prepared machine. There is no user login or linger requirement. A Go compiler,
@@ -14,10 +17,10 @@ the instance's plugin and pinned patched Paperclip host. Release publication
 starts when a maintainer pushes the matching `vVERSION` tag; adding this workflow
 does not publish a release by itself.
 
-For example, after release `v0.8.0` has been published:
+For example, after release `v0.9.0` has been published:
 
 ```sh
-release=0.8.0
+release=0.9.0
 arch=amd64 # use arm64 for a Linux ARM64 worker
 asset="outpost-$release-linux-$arch"
 base="https://github.com/Yelqo/paperclip-outpost/releases/download/v$release"
@@ -47,19 +50,19 @@ stay in the same protected directory across installation and reboot.
 After registration, confirm the connection as the worker before installation:
 
 ```sh
-sudo -H -u worker /absolute/download/outpost-0.8.0-linux-amd64 check \
+sudo -H -u worker /absolute/download/outpost-0.9.0-linux-amd64 check \
   --private-dir /home/worker/.outpost-private
-sudo /absolute/download/outpost-0.8.0-linux-amd64 service-install \
-  --binary /absolute/download/outpost-0.8.0-linux-amd64 \
-  --version 0.8.0 --worker worker \
+sudo /absolute/download/outpost-0.9.0-linux-amd64 service-install \
+  --binary /absolute/download/outpost-0.9.0-linux-amd64 \
+  --version 0.9.0 --worker worker \
   --private-dir /home/worker/.outpost-private
-sudo /opt/paperclip-outpost/0.8.0/outpost service-status
+sudo /opt/paperclip-outpost/0.9.0/outpost service-status
 ```
 
 Root is required for installation and system service status. Binary release
 verification and protected registration validation subprocesses run as the worker.
 The installer copies the binary into
-`/opt/paperclip-outpost/0.8.0/outpost`, writes the system unit and installation
+`/opt/paperclip-outpost/0.9.0/outpost`, writes the system unit and installation
 metadata, reloads systemd and enables/starts the service. The binary and its
 parent directories must be root-owned and not writable by the worker. Installation
 paths must be canonical and contain only letters, digits, dot, underscore,
@@ -99,7 +102,7 @@ WorkingDirectory=/home/worker
 Environment=HOME=/home/worker
 Environment=PATH=/home/worker/.local/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=-/home/worker/.outpost-private/service.env
-ExecStart=/opt/paperclip-outpost/0.8.0/outpost daemon --private-dir /home/worker/.outpost-private
+ExecStart=/opt/paperclip-outpost/0.9.0/outpost daemon --private-dir /home/worker/.outpost-private
 Restart=on-failure
 RestartSec=5s
 KillMode=control-group
@@ -142,7 +145,7 @@ Download and verify the explicit selected release as above. Invoke management
 from an installed or downloaded standalone binary, with root authority:
 
 ```sh
-sudo /opt/paperclip-outpost/0.8.0/outpost service-upgrade \
+sudo /opt/paperclip-outpost/0.9.0/outpost service-upgrade \
   --binary /absolute/download/selected-outpost --version SELECTED_VERSION
 ```
 
@@ -166,12 +169,12 @@ remain installed; selecting the same version explicitly reinstalls it. Workspace
 local provider credentials, protected connection state, buffered output and
 execution/approval history are retained.
 
-Compatibility currently requires exact matching host, SDK, protocol and
+Compatibility currently requires exact matching host, SDK, shared, protocol and
 plugin/daemon release pins. When changing the instance-side release too, drain
 **before** updating that plugin/host:
 
 ```sh
-sudo /opt/paperclip-outpost/0.8.0/outpost service-drain
+sudo /opt/paperclip-outpost/0.9.0/outpost service-drain
 # Install the selected matching Outpost plugin and supported Paperclip host.
 sudo /absolute/download/selected-outpost service-upgrade \
   --binary /absolute/download/selected-outpost --version SELECTED_VERSION
@@ -189,7 +192,7 @@ it does not shorten an active run's original limits. Inspect `service-status`
 and Paperclip history, then retry. To abandon a drain, run:
 
 ```sh
-sudo -H -u worker /opt/paperclip-outpost/0.8.0/outpost resume \
+sudo -H -u worker /opt/paperclip-outpost/0.9.0/outpost resume \
   --private-dir /home/worker/.outpost-private
 ```
 
@@ -206,9 +209,9 @@ group. Affected operations record interruption even if their launcher exits
 before the daemon handles its own signal; completed history remains unchanged.
 
 ```sh
-sudo /opt/paperclip-outpost/0.8.0/outpost service-stop --force
+sudo /opt/paperclip-outpost/0.9.0/outpost service-stop --force
 # Or select a replacement and explicitly interrupt rather than drain:
-sudo /opt/paperclip-outpost/0.8.0/outpost service-upgrade --force \
+sudo /opt/paperclip-outpost/0.9.0/outpost service-upgrade --force \
   --binary /absolute/download/selected-outpost --version SELECTED_VERSION
 ```
 
@@ -233,8 +236,8 @@ It is a local observation; Paperclip's outpost API remains authoritative for
 server-side connection, execution readiness and recovered history.
 
 ```sh
-sudo /opt/paperclip-outpost/0.8.0/outpost service-status
-sudo -H -u worker /opt/paperclip-outpost/0.8.0/outpost status \
+sudo /opt/paperclip-outpost/0.9.0/outpost service-status
+sudo -H -u worker /opt/paperclip-outpost/0.9.0/outpost status \
   --private-dir /home/worker/.outpost-private
 sudo journalctl -u paperclip-outpost.service --boot
 ```
@@ -263,7 +266,7 @@ To run the same test locally after the development build:
 pnpm build:release
 docker build -t outpost-systemd-acceptance:local tests/fixtures/systemd
 OUTPOST_SYSTEMD_ACCEPTANCE=1 node --test \
-  --test-name-pattern='selected standalone installation' tests/workflow.test.mjs
+  --test-name-pattern='selected standalone installation|pinned global npm and npx install' tests/workflow.test.mjs
 ```
 
 The test removes the downloaded binary, observes the durable service under the
@@ -276,7 +279,7 @@ The public Pi workflow exercises callbacks during draining. This verifies local
 Linux installation and lifecycle acceptance; it does not claim live
 deployed-instance or Cloudflare acceptance.
 
-Local acceptance on 2026-10-12 passed this workflow with the static `0.8.0`
+Local acceptance on 2026-10-12 passed this workflow with the static `0.9.0`
 Linux amd64 artifact, the pinned authenticated Paperclip host and actual plugin.
 The VM changed boot identity, restarted the worker service without login or
 Internet access, reported the run interrupted, retained its Git commit and

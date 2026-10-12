@@ -1,0 +1,13 @@
+{
+  "host": "f858207161ba29c01c82f4674aef83d91b74480f",
+  "sdk": "1.0.0+outpost.9",
+  "shared": "0.3.1",
+  "plugin": "0.9.0",
+  "daemon": "0.9.0",
+  "protocol": 9,
+  "pi": "1.0.3",
+  "piConfig": "8f3a5726a254909a3100d8f719febc868237cd27",
+  "node": "22.22.1",
+  "hostPatchSHA256": "5aba145c5bf9f014791f9e827fdef090ebe0bd16103ae3e13f340feafdfdbdee",
+  "piConfigPatchSHA256": "13a0e019848281fe40312485ca7002ad7f099f9ef2ab64be80346af23b542342"
+}

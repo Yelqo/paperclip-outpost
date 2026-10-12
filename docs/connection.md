@@ -198,13 +198,17 @@ An outpost credential is not registered as an operator token or agent API key
 and is rejected by ordinary board and work-agent APIs.
 
 The plugin authenticates the outpost, checks revocation and exact host commit,
-SDK transport revision, plugin version, daemon version and protocol version,
+SDK transport revision, installed shared-package version, plugin version, daemon
+version and protocol version,
 then returns the bound identity. The daemon validates that identity and the
 same version tuple before declaring itself connected. Packaged hosts must carry
 Paperclip's build commit stamp. Compatibility is a pinned declaration, not
 cryptographic attestation of the machine's executable.
 
-Maintain host, SDK and protocol pins in `upstream/paperclip.lock.json`, and the
+See [versioned release installation](releases.md) for the npm/npx and standalone
+operator routes and supported integration matrix.
+
+Maintain host, SDK, shared and protocol pins in `upstream/paperclip.lock.json`, and the
 Outpost release version in `package.json`. The plugin and daemon ship together
 with that release version. `pnpm generate:versions` generates their committed
 TypeScript/Go constants and updates the carried host's SDK/transport declarations.
