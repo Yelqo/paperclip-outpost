@@ -8,6 +8,7 @@ const runtime=resolve(root,'.cache/pi-config');
 const host=resolve(root,'.cache/paperclip');
 const lock=JSON.parse(readFileSync(resolve(root,'upstream/pi-config.lock.json'),'utf8'));
 const patch=resolve(root,'upstream',lock.patch);
+execFileSync(process.execPath,[resolve(root,'scripts/generate-versions.mjs'),'--check'],{stdio:'inherit'});
 const run=(command,args,cwd=runtime)=>execFileSync(command,args,{cwd,stdio:'inherit'});
 mkdirSync(resolve(root,'.cache'),{recursive:true});
 if(!existsSync(resolve(runtime,'.git'))) {
@@ -45,4 +46,5 @@ mkdirSync(resolve(runtime,'runtime'),{recursive:true});
 const source=execFileSync(process.execPath,['--import',resolve(host,'server/node_modules/tsx/dist/loader.mjs'),
   '--input-type=module','-e',`import {getSandboxCallbackBridgeServerSource} from ${JSON.stringify(resolve(host,'packages/adapter-utils/src/sandbox-callback-bridge.ts'))}; process.stdout.write(getSandboxCallbackBridgeServerSource());`],{cwd:root,encoding:'utf8'});
 writeFileSync(resolve(runtime,'runtime/callback-bridge.mjs'),source);
+writeFileSync(resolve(runtime,'runtime/outpost-compatibility.json'),readFileSync(resolve(root,'release/compatibility.json')));
 run('mise',['exec',`node@${lock.node}`,`pnpm@${lock.pnpm}`,'--','pnpm','check']);

@@ -1,8 +1,8 @@
 diff --git a/scripts/paperclip-pi.ts b/scripts/paperclip-pi.ts
-index 97cdee6..e5f6b75 100644
+index 97cdee6..75c8c77 100644
 --- a/scripts/paperclip-pi.ts
 +++ b/scripts/paperclip-pi.ts
-@@ -1,13 +1,19 @@
+@@ -1,17 +1,34 @@
  import { spawn } from "node:child_process";
 -import { lstat, readFile, realpath } from "node:fs/promises";
 -import { resolve } from "node:path";
@@ -16,6 +16,8 @@ index 97cdee6..e5f6b75 100644
 +import { loadRunTransport, loadWorkerConfig, paperclipRevision } from "../src/paperclip.ts";
  import { Store } from "../src/store.ts";
  
++const outpostRuntimeVersions = {"host":"f858207161ba29c01c82f4674aef83d91b74480f","piConfig":"8f3a5726a254909a3100d8f719febc868237cd27","pi":"1.0.3","node":"22.22.1"};
++
 +let gateway: ReturnType<typeof spawn> | undefined;
 +let finalizedTransport: string | undefined;
 +async function cleanup(): Promise<void> {
@@ -24,8 +26,22 @@ index 97cdee6..e5f6b75 100644
 +}
  async function main(): Promise<void> {
    const args = process.argv.slice(2);
-   if (process.version !== "v22.22.1" || VERSION !== "1.0.3") throw new Error("Worker Node/Pi versions do not match the pinned runtime");
-@@ -27,6 +33,30 @@ async function main(): Promise<void> {
+-  if (process.version !== "v22.22.1" || VERSION !== "1.0.3") throw new Error("Worker Node/Pi versions do not match the pinned runtime");
+   const packageRoot = fileURLToPath(new URL("../", import.meta.url));
++  try {
++    const prepared = JSON.parse(await readFile(resolve(packageRoot, "runtime/outpost-compatibility.json"), "utf8"));
++    if (process.version !== `v${outpostRuntimeVersions.node}` || VERSION !== outpostRuntimeVersions.pi ||
++        paperclipRevision !== outpostRuntimeVersions.host ||
++        !Object.entries(outpostRuntimeVersions).every(([key, version]) => prepared[key] === version)) throw new Error("Unsupported prepared runtime");
++  } catch {
++    process.stderr.write("Pi runtime is incompatible; prepare the selected supported Pi/pi-config assets before work\n");
++    process.exitCode = 1;
++    return;
++  }
+   const extension = resolve(packageRoot, "extensions/approval.ts");
+   // The built-in adapter can keep its normal JSON/print/session/skill args.
+   // Additional extension code must be an explicit operator change to this wrapper.
+@@ -27,6 +44,30 @@ async function main(): Promise<void> {
    const cwd = await realpath(process.cwd());
    const policy = await loadPolicy(policyPath, cwd, state);
    if ([policy.projectRoot, ...policy.scratchRoots].some(root => within(packageRoot, root))) throw new Error("Install the gate outside writable project/scratch paths");
@@ -56,7 +72,7 @@ index 97cdee6..e5f6b75 100644
    const { config } = await loadWorkerConfig(workerPath, policy);
    await new Store(state, [policy.projectRoot, ...policy.scratchRoots]).init();
    const agentDir = await physical(getAgentDir());
-@@ -64,7 +94,8 @@ async function main(): Promise<void> {
+@@ -64,7 +105,8 @@ async function main(): Promise<void> {
    { cwd, env: process.env, stdio: ["ignore", "inherit", "inherit"], detached: true });
    for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) process.on(signal, () => { try { process.kill(-child.pid!, signal); } catch {} });
    child.on("error", () => { process.stderr.write("Pinned Pi failed to start\n"); process.exitCode = 1; });

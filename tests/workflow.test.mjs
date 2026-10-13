@@ -11,6 +11,7 @@ import { createServer as createTCPServer, connect as connectTCP } from 'node:net
 import { versions as supportedVersions } from '../plugin/versions.ts';
 import { systemdVM } from './fixtures/systemd-vm.mjs';
 import { lifecycleRelease } from './fixtures/lifecycle-release.mjs';
+import { npmTools } from './fixtures/npm-tools.mjs';
 
 const root = resolve('.');
 const host = join(root, '.cache/paperclip');
@@ -74,6 +75,10 @@ async function startHost() {
     if (server.exitCode !== null) throw new Error(`Host exited: ${logs.slice(-5000)}`);
     try { return (await fetch(origin + '/api/health')).ok; } catch { return false; }
   }, 90000);
+  if (company) await eventually(async () => {
+    const response = await api(`/api/plugins/yelqo.outpost/api/outposts/missing?companyId=${company.id}`);
+    return response.status === 404;
+  }, 30000);
 }
 
 before(async () => {
@@ -93,8 +98,8 @@ before(async () => {
   const key = await json('/api/board-api-keys', {name:'Outpost fixture operator', requestedCompanyId:company.id});
   boardToken = key.token;
   mkdirSync(pluginPackage);
-  cpSync(join(root,'dist'),join(pluginPackage,'dist'),{recursive:true});
-  cpSync(join(root,'package.json'),join(pluginPackage,'package.json'));
+  execFileSync('tar',['-xzf',join(root,`dist/releases/yelqo-paperclip-outpost-${supportedVersions.plugin}.tgz`),
+    '-C',pluginPackage,'--strip-components=1']);
   const installed = await json('/api/plugins/install', {packageName:pluginPackage, isLocalPath:true});
   assert.ok(installed);
 }, {timeout:120000});
@@ -108,6 +113,59 @@ after(async () => {
     // fails (for example after exhausting temporary storage).
     if(server && server.exitCode!==null) rmSync(join(home,'instances/acceptance/db'),{recursive:true,force:true});
   }
+});
+
+test('pinned global npm and npx install durable systemd services that survive cache removal offline', {
+  skip: process.env.OUTPOST_SYSTEMD_ACCEPTANCE !== '1', timeout:600000,
+}, async t => {
+  for (const route of ['global', 'npx']) await t.test(route, {timeout:300000}, async t => {
+    const vm = await systemdVM(t, port, supportedVersions.daemon);
+    await npmTools(vm, home);
+    const privateRoot = '/home/worker/.outpost-private';
+    const packagePath = `/srv/yelqo-paperclip-outpost-${supportedVersions.daemon}.tgz`;
+    await vm.copy(join(root, `dist/releases/yelqo-paperclip-outpost-${supportedVersions.daemon}.tgz`), packagePath);
+    const environment = worker => ['env', '--chdir=/home/worker', 'PATH=/srv/node/bin:/usr/local/bin:/usr/bin:/bin',
+      `npm_config_cache=${worker ? '/home/worker/npm-cache' : '/srv/npm-cache'}`,
+      'npm_config_registry=http://127.0.0.1:1', 'npm_config_offline=true', 'NODE_OPTIONS=--jitless'];
+    if (route === 'global') await vm.command([...environment(false), 'npm', 'install', '--global',
+      '--prefix', '/srv/global', '--ignore-scripts', '--no-audit', '--no-fund', packagePath]);
+    const manage = (args, worker = false, input) => vm.command([
+      ...(worker ? ['runuser', '-u', 'worker', '--'] : []), ...environment(worker),
+      ...(route === 'global' ? ['/srv/global/bin/outpost'] : ['npx', '--yes', '--ignore-scripts', `--package=${packagePath}`, 'outpost']),
+      ...args,
+    ], input);
+    assert.deepEqual(JSON.parse(await manage(['version'], true)), supportedVersions);
+    await vm.command(['sh', '-c', '! command -v go']);
+    assert.equal(JSON.parse(await manage(['configure', '--private-dir', privateRoot, '--instance', origin,
+      '--workspace-root', '/home/worker/workspaces', '--scratch-root', '/home/worker/scratch'], true,
+      JSON.stringify({headers:{}}))).status, 'configured');
+    const registration = JSON.parse(await manage(['register', '--company', company.id, '--name', `Pinned ${route} worker`,
+      '--private-dir', privateRoot], true, JSON.stringify({operatorAuthorization:`Bearer ${boardToken}`})));
+    assert.match(await manage(['check', '--private-dir', privateRoot], true), /connected/);
+    const installed = JSON.parse(await manage(['service-install', '--worker', 'worker', '--private-dir', privateRoot]));
+    const durable = `/opt/paperclip-outpost/${supportedVersions.daemon}/outpost`;
+    assert.equal(installed.binary, durable);
+    assert.equal(installed.version, supportedVersions.daemon);
+    const statusPath = `/api/plugins/yelqo.outpost/api/outposts/${registration.outpostId}?companyId=${company.id}`;
+    await eventually(async () => (await json(statusPath)).executionReady, 60000);
+    const before = JSON.parse(await manage(['service-status']));
+    assert.equal(before.connection.outpostId, registration.outpostId);
+    const unit = await vm.command(['systemctl', 'cat', 'paperclip-outpost.service']);
+    assert.ok(unit.includes(`ExecStart=${durable} daemon --private-dir ${privateRoot}`));
+    assert.doesNotMatch(unit, /npx|npm|node|\/srv\//);
+    // Remove both npm caches, the global installation and every setup artifact.
+    // The guest's network cannot reach a registry or release download service.
+    await vm.command(['rm', '-rf', '/srv/npm-cache', '/home/worker/npm-cache', '/srv/global', '/srv/node',
+      packagePath, '/srv/selected-outpost']);
+    await vm.command(['systemctl', 'restart', 'paperclip-outpost.service']);
+    await eventually(async () => (await json(statusPath)).executionReady, 60000);
+    const after = JSON.parse(await vm.command([durable, 'service-status']));
+    assert.equal(after.version, supportedVersions.daemon);
+    assert.notEqual(after.service.mainPID, before.service.mainPID);
+    assert.equal(after.connection.outpostId, registration.outpostId);
+    assert.equal((await vm.command(['readlink', `/proc/${after.service.mainPID}/exe`])).trim(), durable);
+    assert.deepEqual(JSON.parse(await vm.command([durable, 'version'])), supportedVersions);
+  });
 });
 
 test('selected standalone installation starts under systemd and recovers a real Ubuntu reboot without replay', {
@@ -1845,9 +1903,43 @@ test('machine credentials authorize only their registered company transport', as
 });
 
 test('every supported version pin is checked before the transport accepts work', async () => {
-  for (const field of ['host','sdk','plugin','daemon','protocol']) {
+  for (const field of ['host','sdk','shared','plugin','daemon','protocol']) {
     assert.equal(await rejected(transport(connection(),{[field]:field==='protocol'?supportedVersions.protocol+1:'incompatible'})),426,field);
   }
+});
+
+test('host rejects an unsupported installed shared package before work and accepts the restored pin', {timeout:180000}, async () => {
+  const selectedPrivate = join(home, 'shared-version-private');
+  const workspace = join(home, 'shared-version-workspace');
+  const scratch = join(home, 'shared-version-scratch');
+  mkdirSync(workspace);
+  mkdirSync(scratch);
+  const registration = JSON.parse(cli(['register', '--instance', origin, '--company', company.id,
+    '--name', 'Shared compatibility worker', '--private-dir', selectedPrivate,
+    '--workspace-root', workspace, '--scratch-root', scratch], {operatorAuthorization:`Bearer ${boardToken}`}));
+  assert.match(cli(['connect', '--private-dir', selectedPrivate]), /connected/);
+  const metadata = join(host, 'packages/shared/package.json');
+  const saved = readFileSync(metadata, 'utf8');
+  const stop = async () => {
+    if (server.exitCode !== null || server.signalCode !== null) return;
+    const exited = new Promise(resolve => server.once('exit', resolve));
+    server.kill('SIGTERM');
+    await exited;
+  };
+  try {
+    await stop();
+    writeFileSync(metadata, JSON.stringify({...JSON.parse(saved), version:'9.8.7-unsupported'}));
+    await startHost();
+    assert.throws(() => cli(['connect', '--private-dir', selectedPrivate]),
+      error => /outpost connection rejected/.test(error.stderr));
+    const status = await json(`/api/plugins/yelqo.outpost/api/outposts/${registration.outpostId}?companyId=${company.id}`);
+    assert.equal(status.executionReady, false);
+  } finally {
+    await stop();
+    writeFileSync(metadata, saved);
+    await startHost();
+  }
+  assert.match(cli(['connect', '--private-dir', selectedPrivate]), /connected/);
 });
 
 test('core bounds frames and closes the connection without leaving plugin-owned state', async () => {

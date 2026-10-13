@@ -4,8 +4,9 @@ package outpost
 
 var supported = Versions{
 	Host:     "f858207161ba29c01c82f4674aef83d91b74480f",
-	SDK:      "1.0.0+outpost.8",
-	Plugin:   "0.8.0",
-	Daemon:   "0.8.0",
-	Protocol: 8,
+	SDK:      "1.0.0+outpost.9",
+	Shared:   "0.3.1",
+	Plugin:   "0.9.0",
+	Daemon:   "0.9.0",
+	Protocol: 9,
 }

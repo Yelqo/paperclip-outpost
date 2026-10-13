@@ -13,20 +13,21 @@ runtime assets and workspace before dispatch.
 | Component | Supported version |
 | --- | --- |
 | Paperclip host and Pi adapter | `f858207161ba29c01c82f4674aef83d91b74480f` with `upstream/plugin-transport.patch` |
-| Plugin SDK / Outpost transport | `1.0.0+outpost.8` / `8` |
-| Outpost plugin and daemon | `0.5.0` |
+| Plugin SDK / Outpost transport | `1.0.0+outpost.9` / `9` |
+| Paperclip shared | `0.3.1` |
+| Outpost plugin and daemon | `0.9.0` |
 | Pi | `1.0.3` (`@earendil-works/pi-coding-agent`) |
 | pi-config | `8f3a5726a254909a3100d8f719febc868237cd27` with `upstream/pi-config.patch` |
 | Worker Node / pi-config pnpm | `22.22.1` / `11.9.0` |
 
 `pnpm prepare:host` and `pnpm prepare:pi` reproduce the patched integrations for
 development. Pi preparation installs the actual pinned Paperclip callback
-gateway as an operator-owned asset at `runtime/callback-bridge.mjs` inside the
+gateway as an operator-owned asset at `runtime/callback-bridge.mjs` with `runtime/outpost-compatibility.json` inside the
 pi-config checkout. Use that prepared checkout's `scripts/paperclip-pi` as the
 adapter command. Installation and updates are explicit operator actions; runs
 consume the installed assets.
 
-Transport 5 requires the paired 0.5.0 plugin/daemon and the matching carried
+Transport 9 requires the paired 0.9.0 plugin/daemon and the matching carried
 host patch. Prepare the host again when upgrading. The pins reject older
 combinations before work is admitted; transport 4's workspace queues and
 smaller reply frames are not compatible with this approval workflow.

@@ -85,7 +85,7 @@ export function createOutpostWorkflows(ctx:PluginContext) {
   });
   const validateVersions = (input:PluginWebSocketOpen) => Effect.gen(function* () {
     const client = yield* Effect.try({try:() => JSON.parse(input.headers.versions ?? ""),catch:() => new IncompatibleVersions()});
-    if (ctx.manifest.version !== versions.plugin || input.host.commit !== versions.host || input.host.sdk !== versions.sdk || input.host.transport !== versions.protocol || !validVersions(client))
+    if (ctx.manifest.version !== versions.plugin || input.host.commit !== versions.host || input.host.sdk !== versions.sdk || input.host.shared !== versions.shared || input.host.transport !== versions.protocol || !validVersions(client))
       return yield* Effect.fail(new IncompatibleVersions());
   });
   const open = (input:PluginWebSocketOpen):Effect.Effect<PluginWebSocketAdmission,OutpostError> => Effect.gen(function* () {

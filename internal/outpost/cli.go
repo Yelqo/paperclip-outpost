@@ -21,6 +21,7 @@ import (
 type Versions struct {
 	Host     string `json:"host"`
 	SDK      string `json:"sdk"`
+	Shared   string `json:"shared"`
 	Plugin   string `json:"plugin"`
 	Daemon   string `json:"daemon"`
 	Protocol int    `json:"protocol"`

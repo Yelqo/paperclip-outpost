@@ -424,7 +424,7 @@ index 9ad14d6f2..b984e7803 100644
    },
    getDisplayId(params: Record<string, unknown> | null) {
 diff --git a/packages/plugins/sdk/src/define-plugin.ts b/packages/plugins/sdk/src/define-plugin.ts
-index 947a67cbb..2756d2020 100644
+index 947a67cbb..ae28e7ee0 100644
 --- a/packages/plugins/sdk/src/define-plugin.ts
 +++ b/packages/plugins/sdk/src/define-plugin.ts
 @@ -54,6 +54,8 @@ import type { PluginContext } from "./types.js";
@@ -444,7 +444,7 @@ index 947a67cbb..2756d2020 100644
 +  connectionId: string; routeKey: string; companyId: string;
 +  query: Record<string, string>;
 +  headers: { authorization?: string; versions?: string };
-+  host: { commit: string; sdk: string; transport: number };
++  host: { commit: string; sdk: string; shared: string; transport: number };
 +}
 +export interface PluginWebSocketEvent {
 +  connectionId: string; routeKey: string; companyId: string; principalId: string;
@@ -478,7 +478,7 @@ index 947a67cbb..2756d2020 100644
      params: PluginEnvironmentExecuteParams,
    ): Promise<PluginEnvironmentExecuteResult>;
 diff --git a/packages/plugins/sdk/src/index.ts b/packages/plugins/sdk/src/index.ts
-index 57f862811..41fd1c4b5 100644
+index 57f862811..ba6b016e8 100644
 --- a/packages/plugins/sdk/src/index.ts
 +++ b/packages/plugins/sdk/src/index.ts
 @@ -49,6 +49,9 @@
@@ -486,7 +486,7 @@ index 57f862811..41fd1c4b5 100644
  // ---------------------------------------------------------------------------
  
 +export type { PluginWebSocketOpen, PluginWebSocketEvent, PluginWebSocketReply, PluginWebSocketAdmission } from "./define-plugin.js";
-+export const PLUGIN_WEBSOCKET_SDK_VERSION = "1.0.0+outpost.8";
++export const PLUGIN_WEBSOCKET_SDK_VERSION = "1.0.0+outpost.9";
 +
  export { definePlugin } from "./define-plugin.js";
  export { createTestHarness, createEnvironmentTestHarness, createFakeEnvironmentDriver, filterEnvironmentEvents, assertEnvironmentEventOrder, assertLeaseLifecycle, assertWorkspaceRealizationLifecycle, assertExecutionLifecycle, assertEnvironmentError } from "./testing.js";
@@ -1266,11 +1266,12 @@ index 684e7cc13..8985f9c3a 100644
    // "set-cookie" is normally a response header; keep the request-side
 diff --git a/server/src/realtime/plugin-ws.ts b/server/src/realtime/plugin-ws.ts
 new file mode 100644
-index 000000000..da398fbfa
+index 000000000..5270824ba
 --- /dev/null
 +++ b/server/src/realtime/plugin-ws.ts
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,138 @@
 +import { execFileSync } from "node:child_process";
++import { readFileSync } from "node:fs";
 +import { randomUUID } from "node:crypto";
 +import type { Server } from "node:http";
 +import { fileURLToPath } from "node:url";
@@ -1290,7 +1291,12 @@ index 000000000..da398fbfa
 +  try { commit = execFileSync("git", ["rev-parse", "HEAD"], {
 +    cwd: fileURLToPath(new URL("../../../", import.meta.url)), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1000,
 +  }).trim(); } catch { /* Packaged hosts must carry the build commit stamp. */ }
-+  const host = { commit, sdk: PLUGIN_WEBSOCKET_SDK_VERSION, transport: 8 };
++  let shared = "";
++  try {
++    const entry = import.meta.resolve("@paperclipai/shared");
++    shared = JSON.parse(readFileSync(new URL("../package.json", entry), "utf8")).version;
++  } catch { /* Missing package metadata must reject compatibility before work. */ }
++  const host = { commit, sdk: PLUGIN_WEBSOCKET_SDK_VERSION, shared, transport: 9 };
 +  let admitted = 0, opening = 0, stopping = false;
 +  const pending = new Set<import("node:stream").Duplex>();
 +  server.on("upgrade", (req, socket, head) => {
